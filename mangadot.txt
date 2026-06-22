@@ -1,4 +1,4 @@
-# MangaDot.net Batch Uploader version 1.0.1 [https://mangadot.net]
+# MangaDot.net Batch Uploader version 1.0.2 [https://mangadot.net]
 import os
 import re
 import sys
@@ -408,11 +408,18 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
 
     if chapter_naming == "custom" and custom_regex:
         try:
-            c_match = re.search(custom_regex, name_without_ext)
-            if c_match:
-                title = c_match.group(1).strip() if c_match.groups() else c_match.group(0).strip()
+            if "->" in custom_regex:
+                # --- NEW FIND & REPLACE MODE ---
+                find_pat, replace_pat = custom_regex.split("->", 1)
+                title = re.sub(find_pat.strip(), replace_pat.strip(), name_without_ext).strip()
                 return num, title
-            else: print_warning(f"Custom regex did not match '{filename}'. Falling back to Auto-detect.")
+            else:
+                # Original Match/Extract Mode
+                c_match = re.search(custom_regex, name_without_ext)
+                if c_match:
+                    title = c_match.group(1).strip() if c_match.groups() else c_match.group(0).strip()
+                    return num, title
+                else: print_warning(f"Custom regex did not match '{filename}'. Falling back to Auto-detect.")
         except re.error as e: print_warning(f"Invalid regex '{custom_regex}' ({e}). Falling back to Auto-detect.")
 
     if chapter_naming == "preset" and num is not None: return num, f"Chapter {num:g}"

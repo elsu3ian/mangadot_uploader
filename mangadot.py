@@ -1,4 +1,4 @@
-# MangaDot.net Batch Uploader version 1.0.1 [https://mangadot.net]
+# MangaDot.net Batch Uploader version 1.0.2 [https://mangadot.net]
 import os
 import re
 import sys
@@ -111,23 +111,16 @@ _UA_CACHE = {}
 
 
 def _clean_version(raw):
-    """Extract the first dotted version number from any string."""
-    if not raw:
-        return None
+    if not raw: return None
     m = re.search(r'(\d+(?:\.\d+)*)', str(raw))
     return m.group(1) if m else None
 
-
 def _detect_windows_arch():
-    """Return the architecture token used in Windows User-Agents."""
     machine = platform.machine().lower()
-    if machine in ('amd64', 'x86_64'):
-        return 'Win64; x64'
+    if machine in ('amd64', 'x86_64'): return 'Win64; x64'
     return ''
 
-
 def _detect_macos_ver():
-    """Return an underscore-joined macOS version, e.g. '14_4_1' or '10_15_7'."""
     try:
         ver = platform.mac_ver()[0]
         if ver and ver != '':
@@ -137,13 +130,10 @@ def _detect_macos_ver():
                 if len(parts) >= 3 and parts[2]:
                     base += f"_{parts[2]}"
                 return base
-    except Exception:
-        pass
+    except Exception: pass
     return "10_15_7"
 
-
 def _read_windows_registry(browser):
-    """Return installed browser version from the Windows registry, or None."""
     try:
         import winreg
         paths = {
@@ -165,17 +155,12 @@ def _read_windows_registry(browser):
                 with winreg.OpenKey(hive, path) as k:
                     val, _ = winreg.QueryValueEx(k, key)
                     v = _clean_version(val)
-                    if v:
-                        return v
-            except OSError:
-                continue
-    except Exception:
-        return None
+                    if v: return v
+            except OSError: continue
+    except Exception: return None
     return None
 
-
 def _read_mac_plist(browser):
-    """Return installed browser version from a macOS .app Info.plist, or None."""
     try:
         import plistlib
         paths = {
@@ -187,18 +172,14 @@ def _read_mac_plist(browser):
             "vivaldi": "/Applications/Vivaldi.app/Contents/Info.plist",
         }
         path = paths.get(browser)
-        if not path or not os.path.exists(path):
-            return None
+        if not path or not os.path.exists(path): return None
         with open(path, 'rb') as f:
             plist = plistlib.load(f)
             raw = plist.get('KSVersion') or plist.get('CFBundleShortVersionString')
             return _clean_version(raw)
-    except Exception:
-        return None
-
+    except Exception: return None
 
 def _read_linux_version(browser):
-    """Return installed browser version by running `<binary> --version` on Linux."""
     cmds = {
         "chrome":  ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"],
         "edge":    ["microsoft-edge", "microsoft-edge-stable"],
@@ -209,112 +190,62 @@ def _read_linux_version(browser):
     }
     for cmd in cmds.get(browser, []):
         try:
-            out = subprocess.run(
-                [cmd, "--version"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if out.returncode == 0 and out.stdout:
-                return _clean_version(out.stdout)
-        except (OSError, subprocess.SubprocessError):
-            continue
+            out = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=5)
+            if out.returncode == 0 and out.stdout: return _clean_version(out.stdout)
+        except (OSError, subprocess.SubprocessError): continue
     return None
 
-
 def _fetch_web_version(browser, timeout=5):
-    """Fetch the latest stable version from the official vendor API."""
     try:
         if browser == "firefox":
             r = requests.get(_WEB_VERSION_APIS["firefox"], timeout=timeout)
-            if r.status_code == 200:
-                return _clean_version(r.json().get("LATEST_FIREFOX_VERSION"))
+            if r.status_code == 200: return _clean_version(r.json().get("LATEST_FIREFOX_VERSION"))
         elif browser in ("chrome", "edge"):
             r = requests.get(_WEB_VERSION_APIS["chrome"], timeout=timeout)
             if r.status_code == 200:
                 data = r.json()
                 versions = data.get("versions") or []
-                if versions:
-                    return _clean_version(versions[0].get("version"))
-    except Exception:
-        return None
+                if versions: return _clean_version(versions[0].get("version"))
+    except Exception: return None
     return None
 
 def _build_user_agent(browser, version):
-    """Build a platform-aware User-Agent string from browser + version."""
-    if not version:
-        return DEFAULT_USER_AGENTS.get(browser, DEFAULT_USER_AGENTS["firefox"])
-
+    if not version: return DEFAULT_USER_AGENTS.get(browser, DEFAULT_USER_AGENTS["firefox"])
     major = version.split('.')[0]
-
+    
     if sys.platform == 'win32':
         arch = _detect_windows_arch()
         nt = "Windows NT 10.0"
         arch_clause = f"{nt}; {arch}" if arch else nt
-        if browser == "firefox":
-            return f"Mozilla/5.0 ({arch_clause}; rv:{major}.0) Gecko/20100101 Firefox/{major}.0"
-        if browser == "edge":
-            return (f"Mozilla/5.0 ({arch_clause}) AppleWebKit/537.36 (KHTML, like Gecko) "
-                    f"Chrome/{major}.0.0.0 Safari/537.36 Edg/{major}.0.0.0")
-        if browser == "opera":
-            return (f"Mozilla/5.0 ({arch_clause}) AppleWebKit/537.36 (KHTML, like Gecko) "
-                    f"Chrome/{major}.0.0.0 Safari/537.36 OPR/{major}.0.0.0")
-        if browser == "vivaldi":
-            return (f"Mozilla/5.0 ({arch_clause}) AppleWebKit/537.36 (KHTML, like Gecko) "
-                    f"Chrome/{major}.0.0.0 Safari/537.36 Vivaldi/{major}.0.0.0")
-        return (f"Mozilla/5.0 ({arch_clause}) AppleWebKit/537.36 (KHTML, like Gecko) "
-                f"Chrome/{major}.0.0.0 Safari/537.36")
-
+        if browser == "firefox": return f"Mozilla/5.0 ({arch_clause}; rv:{major}.0) Gecko/20100101 Firefox/{major}.0"
+        if browser == "edge": return f"Mozilla/5.0 ({arch_clause}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 Edg/{major}.0.0.0"
+        if browser == "opera": return f"Mozilla/5.0 ({arch_clause}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 OPR/{major}.0.0.0"
+        if browser == "vivaldi": return f"Mozilla/5.0 ({arch_clause}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 Vivaldi/{major}.0.0.0"
+        return f"Mozilla/5.0 ({arch_clause}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+        
     if sys.platform == 'darwin':
         mac_ver = _detect_macos_ver()
-        if browser == "firefox":
-            return (f"Mozilla/5.0 (Macintosh; Intel Mac OS X {mac_ver}; rv:{major}.0) "
-                    f"Gecko/20100101 Firefox/{major}.0")
-        if browser == "edge":
-            return (f"Mozilla/5.0 (Macintosh; Intel Mac OS X {mac_ver}) AppleWebKit/537.36 "
-                    f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 Edg/{major}.0.0.0")
-        if browser == "opera":
-            return (f"Mozilla/5.0 (Macintosh; Intel Mac OS X {mac_ver}) AppleWebKit/537.36 "
-                    f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 OPR/{major}.0.0.0")
-        if browser == "vivaldi":
-            return (f"Mozilla/5.0 (Macintosh; Intel Mac OS X {mac_ver}) AppleWebKit/537.36 "
-                    f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 Vivaldi/{major}.0.0.0")
-        return (f"Mozilla/5.0 (Macintosh; Intel Mac OS X {mac_ver}) AppleWebKit/537.36 "
-                f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36")
-
-    if browser == "firefox":
-        return (f"Mozilla/5.0 (X11; Linux x86_64; rv:{major}.0) "
-                f"Gecko/20100101 Firefox/{major}.0")
-    if browser == "edge":
-        return (f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                f"Chrome/{major}.0.0.0 Safari/537.36 Edg/{major}.0.0.0")
-    if browser == "opera":
-        return (f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                f"Chrome/{major}.0.0.0 Safari/537.36 OPR/{major}.0.0.0")
-    if browser == "vivaldi":
-        return (f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                f"Chrome/{major}.0.0.0 Safari/537.36 Vivaldi/{major}.0.0.0")
-    return (f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-            f"Chrome/{major}.0.0.0 Safari/537.36")
-
+        if browser == "firefox": return f"Mozilla/5.0 (Macintosh; Intel Mac OS X {mac_ver}; rv:{major}.0) Gecko/20100101 Firefox/{major}.0"
+        if browser == "edge": return f"Mozilla/5.0 (Macintosh; Intel Mac OS X {mac_ver}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 Edg/{major}.0.0.0"
+        if browser == "opera": return f"Mozilla/5.0 (Macintosh; Intel Mac OS X {mac_ver}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 OPR/{major}.0.0.0"
+        if browser == "vivaldi": return f"Mozilla/5.0 (Macintosh; Intel Mac OS X {mac_ver}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 Vivaldi/{major}.0.0.0"
+        return f"Mozilla/5.0 (Macintosh; Intel Mac OS X {mac_ver}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+        
+    if browser == "firefox": return f"Mozilla/5.0 (X11; Linux x86_64; rv:{major}.0) Gecko/20100101 Firefox/{major}.0"
+    if browser == "edge": return f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 Edg/{major}.0.0.0"
+    if browser == "opera": return f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 OPR/{major}.0.0.0"
+    if browser == "vivaldi": return f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 Vivaldi/{major}.0.0.0"
+    return f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
 
 def get_dynamic_user_agent(browser):
-    """Return a User-Agent that matches the locally installed browser version."""
-    if browser in _UA_CACHE:
-        return _UA_CACHE[browser]
-
+    if browser in _UA_CACHE: return _UA_CACHE[browser]
     version = None
     try:
-        if sys.platform == 'win32':
-            version = _read_windows_registry(browser)
-        elif sys.platform == 'darwin':
-            version = _read_mac_plist(browser)
-        else:
-            version = _read_linux_version(browser)
-    except Exception:
-        version = None
-
-    if not version and browser in ("chrome", "edge", "firefox"):
-        version = _fetch_web_version(browser)
-
+        if sys.platform == 'win32': version = _read_windows_registry(browser)
+        elif sys.platform == 'darwin': version = _read_mac_plist(browser)
+        else: version = _read_linux_version(browser)
+    except Exception: version = None
+    if not version and browser in ("chrome", "edge", "firefox"): version = _fetch_web_version(browser)
     ua = _build_user_agent(browser, version)
     _UA_CACHE[browser] = ua
     return ua
@@ -335,7 +266,14 @@ class UIRenderer:
         self.sorted_keys = chapter_keys
         self.total_chapters = len(chapter_keys)
         self.completed_chapters = 0
-        self.status = {key: {"status": "Queued", "progress": 0.0} for key in chapter_keys}
+        self.status = {key: {
+            "status": "Queued", 
+            "progress": 0.0, 
+            "current": 0, 
+            "total": 0, 
+            "speed": 0.0,
+            "eta": 0.0
+        } for key in chapter_keys}
         self.height = 0
         self.page_size = 25
         self.view_start_index = 0
@@ -363,18 +301,43 @@ class UIRenderer:
             bar = f"[{bar_color}{'#' * int(progress * 20):<20}{Colors.RESET}]"
             status_color = Colors.OKGREEN if "✅" in status_text else (Colors.FAIL if "❌" in status_text else "")
             
-            line = f"  {key:<30.30}: {status_color}{padded_status}{Colors.RESET} {bar} {progress*100:3.0f}%"
+            curr_mb = info["current"] / 1048576
+            tot_mb = info["total"] / 1048576
+            speed = info["speed"]
+            eta_seconds = info["eta"]
+            
+            speed_str = f"{speed / 1048576:.2f} MB/s" if speed > 1048576 else f"{speed / 1024:.2f} KB/s"
+            
+            if eta_seconds > 0:
+                m, s = divmod(int(eta_seconds), 60)
+                h, m = divmod(m, 60)
+                eta_str = f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+            else:
+                eta_str = "--:--"
+                
+            stats = ""
+            if info["total"] > 0:
+                if progress >= 1.0:
+                    stats = f"  ({tot_mb:.1f} MB)"
+                elif progress > 0.0:
+                    stats = f"  ({curr_mb:.1f}MB / {tot_mb:.1f}MB) | {speed_str} | ETA: {eta_str}"
+            
+            line = f"  {key:<30.30}: {status_color}{padded_status}{Colors.RESET} {bar} {progress*100:3.0f}%{stats}"
             sys.stdout.write(f"{line}\033[K\n")
             
         self.height = 1 + len(chapters_to_display)
         sys.stdout.flush()
 
-    def update_chapter_status(self, chap_key, status, progress=None):
+    def update_chapter_status(self, chap_key, status, progress=None, current=None, total=None, speed=None, eta=None):
         with self.lock:
             if chap_key not in self.status: return
             self.status[chap_key]["status"] = status
-            if progress is not None:
-                self.status[chap_key]["progress"] = progress
+            if progress is not None: self.status[chap_key]["progress"] = progress
+            if current is not None: self.status[chap_key]["current"] = current
+            if total is not None: self.status[chap_key]["total"] = total
+            if speed is not None: self.status[chap_key]["speed"] = speed
+            if eta is not None: self.status[chap_key]["eta"] = eta
+            
             if self.status[chap_key]["progress"] >= 1.0 and "✅" in status:
                 self.completed_chapters += 1
                 self._check_and_scroll_view()
@@ -385,16 +348,13 @@ class UIRenderer:
         visible_keys = self.sorted_keys[self.view_start_index:end_index]
         if all(self.status[key]["progress"] == 1.0 for key in visible_keys):
             next_incomplete_index = next((i for i, k in enumerate(self.sorted_keys) if self.status[k]["progress"] < 1.0), -1)
-            if next_incomplete_index != -1:
-                self.view_start_index = next_incomplete_index
-            else:
-                self.view_start_index = max(0, self.total_chapters - self.page_size)
+            if next_incomplete_index != -1: self.view_start_index = next_incomplete_index
+            else: self.view_start_index = max(0, self.total_chapters - self.page_size)
 
     def start(self):
         self.height = 1 + min(self.total_chapters, self.page_size)
         sys.stdout.write("\n" * self.height)
-        with self.lock:
-            self._render()
+        with self.lock: self._render()
 
 # --- Helper Functions ---
 def print_success(msg): print(f"{Colors.OKGREEN}[+]{Colors.RESET} {msg}")
@@ -403,17 +363,13 @@ def print_warning(msg): print(f"{Colors.WARNING}[!]{Colors.RESET} {msg}")
 def print_error(msg): print(f"{Colors.FAIL}[-]{Colors.RESET} {msg}")
 
 def flush_input_buffer():
-    """Cross-platform utility to clean stray threads and leftover newline entries out of standard input."""
     try:
         import msvcrt
-        while msvcrt.kbhit():
-            msvcrt.getch()
+        while msvcrt.kbhit(): msvcrt.getch()
     except ImportError:
         import termios
-        try:
-            termios.tcflush(sys.stdin, termios.TCIFLUSH)
-        except Exception:
-            pass
+        try: termios.tcflush(sys.stdin, termios.TCIFLUSH)
+        except Exception: pass
 
 def prompt(text, default=None, required=True):
     while True:
@@ -439,68 +395,56 @@ def encode_tus_metadata(meta_dict):
 
 def parse_filename_details(filename, upload_type="chapter", chapter_naming="extract", custom_regex=None):
     name_without_ext = re.sub(r'\.(cbz|zip)$', '', filename, flags=re.IGNORECASE)
-    
-    if upload_type == "volume":
-        match = re.search(r'(?:volume|vol\.?|v)\s*(\d+(?:\.\d+)?)', name_without_ext, re.IGNORECASE)
-    else:
-        match = re.search(r'(?:chapter|ch\.?|c)\s*(\d+(?:\.\d+)?)', name_without_ext, re.IGNORECASE)
+    if upload_type == "volume": match = re.search(r'(?:volume|vol\.?|v)\s*(\d+(?:\.\d+)?)', name_without_ext, re.IGNORECASE)
+    else: match = re.search(r'(?:chapter|ch\.?|c)\s*(\d+(?:\.\d+)?)', name_without_ext, re.IGNORECASE)
         
     num = float(match.group(1)) if match else None
-    
     if num is None:
         match = re.search(r'(\d+(?:\.\d+)?)', name_without_ext)
         num = float(match.group(1)) if match else None
 
-    if num is None:
-        return None, None
-
-    if upload_type == "volume" and num is not None:
-        title = f"Vol. {num:.2f}"
-        return num, title
+    if num is None: return None, None
+    if upload_type == "volume" and num is not None: return num, f"Vol. {num:.2f}"
 
     if chapter_naming == "custom" and custom_regex:
         try:
-            c_match = re.search(custom_regex, name_without_ext)
-            if c_match:
-                title = c_match.group(1).strip() if c_match.groups() else c_match.group(0).strip()
+            if "->" in custom_regex:
+                # --- NEW FIND & REPLACE MODE ---
+                find_pat, replace_pat = custom_regex.split("->", 1)
+                title = re.sub(find_pat.strip(), replace_pat.strip(), name_without_ext).strip()
                 return num, title
             else:
-                print_warning(f"Custom regex did not match '{filename}'. Falling back to Auto-detect.")
-        except re.error as e:
-            print_warning(f"Invalid regex '{custom_regex}' ({e}). Falling back to Auto-detect.")
+                # Original Match/Extract Mode
+                c_match = re.search(custom_regex, name_without_ext)
+                if c_match:
+                    title = c_match.group(1).strip() if c_match.groups() else c_match.group(0).strip()
+                    return num, title
+                else: print_warning(f"Custom regex did not match '{filename}'. Falling back to Auto-detect.")
+        except re.error as e: print_warning(f"Invalid regex '{custom_regex}' ({e}). Falling back to Auto-detect.")
 
-    if chapter_naming == "preset" and num is not None:
-        return num, f"Chapter {num:g}"
+    if chapter_naming == "preset" and num is not None: return num, f"Chapter {num:g}"
 
     title = None
     parts = name_without_ext.split(' - ', 1)
-    
     if len(parts) > 1:
         split_idx = name_without_ext.find(' - ')
         part0_has_num = match.start() < split_idx if match else False
-            
-        if part0_has_num:
-            title = parts[1].strip()
+        if part0_has_num: title = parts[1].strip()
         else:
             title = parts[0].strip()
             if match:
                 remaining = parts[1].replace(match.group(0), '').strip(' -_')
-                if remaining:
-                    title = f"{title} - {remaining}"
+                if remaining: title = f"{title} - {remaining}"
     else:
         if match:
             title = name_without_ext.replace(match.group(0), '').strip(' -_')
-            if not title: 
-                title = None
-        else:
-            title = None
-
+            if not title: title = None
+        else: title = None
     return num, title
 
 def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_regex=None):
     valid_extensions = ('.cbz', '.zip')
     files_data = []
-    
     for filename in os.listdir(directory):
         if not filename.lower().endswith(valid_extensions): continue
         filepath = os.path.join(directory, filename)
@@ -512,13 +456,8 @@ def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_re
             continue
             
         files_data.append({
-            "filepath": filepath,
-            "filename": filename,
-            "number": num,
-            "title": title,
-            "size": os.path.getsize(filepath)
+            "filepath": filepath, "filename": filename, "number": num, "title": title, "size": os.path.getsize(filepath)
         })
-        
     files_data.sort(key=lambda x: x["number"])
     return files_data
 
@@ -550,12 +489,9 @@ def run_dry_run():
 
     while True:
         prompt_txt = "Enter the directory path containing your .cbz/.zip files"
-        if os.path.isdir(DEFAULT_CHAPTERS_DIR):
-            directory = prompt(prompt_txt, default=DEFAULT_CHAPTERS_DIR)
-        else:
-            directory = prompt(prompt_txt)
-        if os.path.isdir(directory):
-            break
+        if os.path.isdir(DEFAULT_CHAPTERS_DIR): directory = prompt(prompt_txt, default=DEFAULT_CHAPTERS_DIR)
+        else: directory = prompt(prompt_txt)
+        if os.path.isdir(directory): break
         print_error("Directory does not exist. Please try again.")
 
     upload_type_choice = prompt("Upload type? (1) Chapter  (2) Volume", default="1")
@@ -565,8 +501,7 @@ def run_dry_run():
     custom_regex = None
     if upload_type == "chapter":
         naming_choice = prompt("Chapter naming format? (1) Auto-detect title  (2) Force 'Chapter X'  (3) Custom regex", default="2")
-        if naming_choice == "2":
-            chapter_naming = "preset"
+        if naming_choice == "2": chapter_naming = "preset"
         elif naming_choice == "3":
             chapter_naming = "custom"
             print_info("Regex Tip: If your regex has parentheses (Group 1), that group becomes the title. Otherwise, the whole match is used.")
@@ -586,15 +521,12 @@ def run_dry_run():
     missing = []
     if len(int_numbers) > 1:
         for i in range(len(int_numbers) - 1):
-            if int_numbers[i+1] - int_numbers[i] > 1:
-                missing.extend(range(int_numbers[i] + 1, int_numbers[i+1]))
+            if int_numbers[i+1] - int_numbers[i] > 1: missing.extend(range(int_numbers[i] + 1, int_numbers[i+1]))
                 
     if missing:
         term = "chapters" if upload_type == "chapter" else "volumes"
-        if len(missing) <= 15:
-            print_warning(f"Missing {term} detected in sequence: {', '.join(map(str, missing))}")
-        else:
-            print_warning(f"Missing {term} detected: {len(missing)} {term} are missing between {missing[0]} and {missing[-1]}.")
+        if len(missing) <= 15: print_warning(f"Missing {term} detected in sequence: {', '.join(map(str, missing))}")
+        else: print_warning(f"Missing {term} detected: {len(missing)} {term} are missing between {missing[0]} and {missing[-1]}.")
         print_warning("Please verify this is intentional before proceeding.\n")
 
     print(f"{Colors.OKGREEN}[Dry run complete — no files were uploaded.]{Colors.RESET}")
@@ -605,8 +537,7 @@ def validate_session(session):
     res = session.get(f"{BASE_URL}/api/profile", timeout=30)
     if res.status_code == 200:
         data = res.json()
-        if "profile" in data and "email" in data["profile"]:
-            return data['profile']['email']
+        if "profile" in data and "email" in data["profile"]: return data['profile']['email']
     return None
 
 def search_manga(query, session):
@@ -627,11 +558,9 @@ def search_manga(query, session):
                         key_str = arr[key_idx]
                         val = arr[v] if isinstance(v, int) and v < len(arr) else v
                         decoded[key_str] = val
-                else:
-                    decoded[k] = v
+                else: decoded[k] = v
             if "id" in decoded and "title" in decoded and isinstance(decoded["id"], int):
-                if "photo" in decoded or "status" in decoded:
-                    mangas.append(decoded)
+                if "photo" in decoded or "status" in decoded: mangas.append(decoded)
                     
     seen = set()
     return [m for m in mangas if not (m["id"] in seen or seen.add(m["id"]))]
@@ -642,8 +571,7 @@ def search_groups(query, session):
     try: return res.json().get("groups", [])
     except: return []
 
-class SessionExpiredError(Exception):
-    pass
+class SessionExpiredError(Exception): pass
 
 def authenticate_session(req_session, current_browser="firefox"):
     supported_browsers = {
@@ -667,13 +595,10 @@ def authenticate_session(req_session, current_browser="firefox"):
             if get_cookies_fn:
                 browser_cookies = get_cookies_fn(domains=["mangadot.net", ".mangadot.net"])
                 if browser_cookies:
-                    for cookie in browser_cookies:
-                        req_session.cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'])
+                    for cookie in browser_cookies: req_session.cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'])
                     extracted_successfully = True
-                else:
-                    print_warning(f"No Mangadot.net cookies found in {current_browser.title()}.")
-            else:
-                print_error(f"Internal Error: browser mapping not found.")
+                else: print_warning(f"No Mangadot.net cookies found in {current_browser.title()}.")
+            else: print_error(f"Internal Error: browser mapping not found.")
         except Exception as e:
             print_warning(f"Failed to extract cookies from {current_browser.title()}: {e}")
             print_warning(f"Note: If using {current_browser.title()}, make sure the browser is fully CLOSED before running this script.")
@@ -698,8 +623,7 @@ def authenticate_session(req_session, current_browser="firefox"):
         if choice == 'q':
             print_info("Exiting script.")
             sys.exit(0)
-        elif choice in supported_browsers:
-            current_browser = supported_browsers[choice][0]
+        elif choice in supported_browsers: current_browser = supported_browsers[choice][0]
         else:
             print_error("Invalid selection. Defaulting back to Firefox.")
             current_browser = "firefox"
@@ -746,11 +670,12 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids, up
             if attempt < MAX_RETRIES - 1:
                 renderer.update_chapter_status(filename, f"Create Err... Retrying", 0.0)
                 time.sleep(RETRY_DELAY)
-            else:
-                return {"key": filename, "success": False, "error": f"Init failed: {str(e)[:30]}"}
+            else: return {"key": filename, "success": False, "error": f"Init failed: {str(e)[:30]}"}
 
-    chunk_size = int(20 * 1024 * 1024)
+    chunk_size = int(7 * 1024 * 1024)
     offset = 0
+    last_speed = 0.0
+    eta = 0.0
     
     try:
         with open(filepath, 'rb') as f:
@@ -767,43 +692,34 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids, up
                 }
                 
                 try:
-                    renderer.update_chapter_status(filename, "Uploading...", offset/size)
+                    renderer.update_chapter_status(filename, "Uploading...", offset/size, current=offset, total=size, speed=last_speed, eta=eta)
+                    
+                    t0 = time.time()
                     patch_res = session.patch(upload_location, headers=patch_headers, data=chunk, timeout=60)
+                    t1 = time.time()
                     
                     if patch_res.status_code in (401, 403): raise SessionExpiredError()
                     elif patch_res.status_code == 204:
+                        elapsed = t1 - t0
+                        last_speed = len(chunk) / elapsed if elapsed > 0.001 else 0
                         offset += len(chunk)
+                        
+                        remaining_bytes = size - offset
+                        eta = remaining_bytes / last_speed if last_speed > 0 else 0
                         continue 
-                    elif patch_res.status_code in RETRYABLE_STATUSES:
-                        raise requests.exceptions.HTTPError(f"HTTP {patch_res.status_code}")
-                    else:
-                        return {"key": filename, "success": False, "error": f"HTTP {patch_res.status_code}"}
+                    elif patch_res.status_code in RETRYABLE_STATUSES: raise requests.exceptions.HTTPError(f"HTTP {patch_res.status_code}")
+                    else: return {"key": filename, "success": False, "error": f"HTTP {patch_res.status_code}"}
                 except SessionExpiredError: raise
-                except Exception:
-                    resynced = False
-                    for attempt in range(MAX_RETRIES):
-                        if abort_event.is_set(): return {"key": filename, "success": False, "error": "Aborted"}
-                        renderer.update_chapter_status(filename, "Network Err... Resyncing", offset/size)
-                        time.sleep(RETRY_DELAY)
-                        try:
-                            head_res = session.head(upload_location, headers={"Tus-Resumable": "1.0.0"}, timeout=30)
-                            if head_res.status_code in (401, 403): raise SessionExpiredError()
-                            if head_res.status_code == 200:
-                                server_offset = int(head_res.headers.get("Upload-Offset", 0))
-                                offset = server_offset
-                                resynced = True
-                                break
-                        except SessionExpiredError: raise
-                        except Exception: pass 
-                            
-                    if not resynced:
-                        return {"key": filename, "success": False, "error": "Chunk failed & unable to resync offset"}
+                except Exception as e:
+                    # --- TUS RESUMABILITY TEMPORARILY DISABLED ---
+                    # If a network error occurs mid-upload, we immediately abort this file
+                    # to prevent file corruption from incorrect offset resyncing.
+                    return {"key": filename, "success": False, "error": "Network Err (Resync Disabled)"}
                             
     except SessionExpiredError: raise
-    except Exception as e:
-        return {"key": filename, "success": False, "error": str(e)[:30]}
-        
-    renderer.update_chapter_status(filename, "✅ Uploaded", 1.0)
+    except Exception as e: return {"key": filename, "success": False, "error": str(e)[:30]}
+                
+    renderer.update_chapter_status(filename, "✅ Uploaded", 1.0, current=size, total=size, speed=0.0, eta=0.0)
     return {"key": filename, "success": True}
 
 def process_uploads(files_to_upload, req_session, manga_id, group_ids, upload_type, language, scanlator_name, thread_count):
@@ -883,14 +799,12 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids, upload_ty
         if batch_id and not session_expired:
             try:
                 comp_res = req_session.post(f"{BASE_URL}/api/uploads/batch/{batch_id}/complete", timeout=600)
-                if comp_res.status_code in (401, 403):
-                    session_expired = True
+                if comp_res.status_code in (401, 403): session_expired = True
                 else: comp_res.raise_for_status()
             except Exception: pass
             
     sys.stdout.write("\n" * 2)
     sys.stdout.flush()
-    
     return failed_chapters, session_expired    
 
 def main():
@@ -950,8 +864,7 @@ def main():
             sel_idx = int(sel) - 1
             manga_id = results[sel_idx]['id']
             print_success(f"Selected Manga: {results[sel_idx]['title']} (ID: {manga_id})")
-        except (ValueError, IndexError): 
-            print_error("Invalid numerical selection.")
+        except (ValueError, IndexError): print_error("Invalid numerical selection.")
 
     req_session.headers.update({"Referer": f"{BASE_URL}/manga/{manga_id}/upload"})
 
@@ -965,7 +878,7 @@ def main():
         if naming_choice == "2": chapter_naming = "preset"
         elif naming_choice == "3":
             chapter_naming = "custom"
-            print_info("Regex Tip: If your regex has parentheses (Group 1), that group becomes the title. Otherwise, the whole match is used.")
+            print_info("Regex Tip: Enter just a pattern to extract a title OR use 'Pattern -> Replacement' to rename files.")
             custom_regex = prompt("Enter your regex pattern")
 
     language = prompt("Language code", default="en")
@@ -1108,8 +1021,7 @@ def main():
             print("-" * 50)
             print(f"  {Colors.OKGREEN}{Colors.BOLD}Direct Link:{Colors.RESET} {manga_url}")
             print("=" * 50 + "\n")
-        else:
-            print(f"\n{Colors.OKCYAN}[*]{Colors.RESET} You can view your manga here: {manga_url}\n")
+        else: print(f"\n{Colors.OKCYAN}[*]{Colors.RESET} You can view your manga here: {manga_url}\n")
             
     except Exception as e:
         print_warning(f"Could not parse embedded metadata: {e}")
