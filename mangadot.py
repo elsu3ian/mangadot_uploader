@@ -1,4 +1,4 @@
-# MangaDot.net Batch Uploader version 1.0.2 [https://mangadot.net]
+# MangaDot.net Batch Uploader version 1.0.3 [https://mangadot.net]
 import os
 import re
 import sys
@@ -719,6 +719,44 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids, up
     except SessionExpiredError: raise
     except Exception as e: return {"key": filename, "success": False, "error": str(e)[:30]}
                 
+    # --- PROOF OF LIFE VERIFICATION LOOP ---
+    found = False
+    duration = 0
+    
+    while not found:
+        if abort_event.is_set(): return {"key": filename, "success": False, "error": "Aborted"}
+        renderer.update_chapter_status(filename, f"Verifying... ({duration}s)", 1.0, current=size, total=size, speed=0.0, eta=0.0)
+
+        time.sleep(RETRY_DELAY)
+        duration += RETRY_DELAY
+
+        if duration > 300: # 5 minutes max wait
+            return {"key": filename, "success": False, "error": "Ghosted (Not found after 5m)"}
+
+        try:
+            fetch_check = session.get(f"{BASE_URL}/api/manga/{manga_id}/chapters/list", timeout=30)
+            if fetch_check.status_code in (401, 403): raise SessionExpiredError()
+            
+            if fetch_check.status_code == 200:
+                chap_list = fetch_check.json()
+                for item in chap_list:
+                    is_match = False
+                    if upload_type == "volume" and item.get("volume_number") == file_info["number"]:
+                        is_match = True
+                    elif upload_type == "chapter" and item.get("chapter_number") == file_info["number"]:
+                        is_match = True
+
+                    if is_match:
+                        if group_ids and len(group_ids) > 0 and item.get("group_id") in group_ids:
+                            found = True
+                            break
+                        elif scanlator_name and item.get("scanlator_name") == scanlator_name:
+                            found = True
+                            break
+                            
+        except SessionExpiredError: raise
+        except Exception: continue
+
     renderer.update_chapter_status(filename, "✅ Uploaded", 1.0, current=size, total=size, speed=0.0, eta=0.0)
     return {"key": filename, "success": True}
 
