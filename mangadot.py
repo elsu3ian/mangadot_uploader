@@ -726,41 +726,67 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids, up
     except SessionExpiredError: raise
     except Exception as e: return {"key": filename, "success": False, "error": str(e)[:30]}
                 
-    # --- PROOF OF LIFE VERIFICATION LOOP ---
+    # --- POST-UPLOAD VERIFICATION ---
+    # Check and wait for server response to catch up, avoiding ghost chapters
     found = False
     duration = 0
-    
+
+    # Use the correct API endpoint based on upload type
+    if upload_type == "volume":
+        check_url = f"{BASE_URL}/api/manga/{manga_id}/volumes"
+    else:
+        check_url = f"{BASE_URL}/api/manga/{manga_id}/chapters/list"
+
     while not found:
         if abort_event.is_set(): return {"key": filename, "success": False, "error": "Aborted"}
-        renderer.update_chapter_status(filename, f"Verifying... ({duration}s)", 1.0, current=size, total=size, speed=0.0, eta=0.0)
+        renderer.update_chapter_status(filename, f"Verifying upload...({duration}s)", 1.0, current=size, total=size, speed=0.0, eta=0.0)
 
         time.sleep(RETRY_DELAY)
         duration += RETRY_DELAY
 
-        if duration > 300: # 5 minutes max wait
-            return {"key": filename, "success": False, "error": "Ghosted (Not found after 5m)"}
+        if duration > 60 * 5:
+            return {"key": filename, "success": False, "error": "Upload not found after 5 minutes"}
 
         try:
-            fetch_check = session.get(f"{BASE_URL}/api/manga/{manga_id}/chapters/list", timeout=30)
+            fetch_check = session.get(check_url, timeout=30)
             if fetch_check.status_code in (401, 403): raise SessionExpiredError()
-            
             if fetch_check.status_code == 200:
-                chap_list = fetch_check.json()
-                for item in chap_list:
-                    is_match = False
-                    if upload_type == "volume" and item.get("volume_number") == file_info["number"]:
-                        is_match = True
-                    elif upload_type == "chapter" and item.get("chapter_number") == file_info["number"]:
-                        is_match = True
+                items_list = fetch_check.json()
+                # Handle if the API returns a dict with a "volumes" or "chapters" key, or just a raw list
+                if isinstance(items_list, dict):
+                    items_list = items_list.get("volumes", items_list.get("chapters", []))
 
-                    if is_match:
-                        if group_ids and len(group_ids) > 0 and item.get("group_id") in group_ids:
-                            found = True
-                            break
+                for item in items_list:
+                    # Match based on upload type first (using float for safe decimal comparison)
+                    try:
+                        if upload_type == "volume":
+                            match = float(item.get("volume_number", -1)) == float(file_info["number"])
+                        else:
+                            match = float(item.get("chapter_number", -1)) == float(file_info["number"])
+                    except (ValueError, TypeError):
+                        match = False
+
+                    # If the number matches, verify it belongs to the correct group/scanlator
+                    if match:
+                        # Gather all possible group IDs from the item (handles both "group_id" and "groups" array)
+                        item_group_ids = []
+                        if item.get("group_id"):
+                            item_group_ids.append(item.get("group_id"))
+
+                        item_groups = item.get("groups", [])
+                        for g in item_groups:
+                            if isinstance(g, dict):
+                                if g.get("id"): item_group_ids.append(g.get("id"))
+                            elif isinstance(g, int):
+                                item_group_ids.append(g)
+
+                        if group_ids and len(group_ids) > 0:
+                            if any(gid in item_group_ids for gid in group_ids):
+                                found = True
+                                break
                         elif scanlator_name and item.get("scanlator_name") == scanlator_name:
                             found = True
                             break
-                            
         except SessionExpiredError: raise
         except Exception: continue
 
