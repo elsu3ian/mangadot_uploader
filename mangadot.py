@@ -1,4 +1,23 @@
-# MangaDot.net Batch Uploader version 1.0.4 [https://mangadot.net]
+# MangaDot.net Batch Uploader version 1.1.0 [https://mangadot.net]
+"""
+==============================================================================
+🚀 MANGADOT BATCH UPLOADER - ADVANCED FEATURES & USAGE
+==============================================================================
+Command Line Flags:
+  python mangadot.py --dry-run   : Scans directory, parses names, and flags missing chapters without uploading.
+  python mangadot.py --debug     : Dumps all HTTP traffic to 'api_requests.log' for troubleshooting.
+
+Advanced Naming (Custom Regex):
+  - Extraction Mode: Use a regex with a capture group '()'. The captured group becomes the chapter title.
+  - Rename Mode: Use 'FindPattern -> ReplacePattern' syntax to quickly rename files during the parsing phase.
+
+Smart Protections:
+  - Auto-Session Recovery: If your Cloudflare token or login expires mid-batch, the script pauses and waits for you to refresh your browser instead of crashing.
+  - Missing Chapter Detection: Automatically scans your file sequence and warns you if there are numerical gaps before starting the upload.
+  - Ghost Chapter Prevention: Verifies the server actually registered the file to your specific scanlator/group before marking it '✅ Uploaded'.
+  - Failure State Recovery: Automatically saves failed uploads to 'failed.txt' and lets you rerun the script exclusively for the failed batch.
+==============================================================================
+"""
 import os
 import re
 import sys
@@ -11,6 +30,7 @@ import argparse
 import importlib.metadata
 import subprocess
 import platform
+import logging
 from pathlib import Path
 
 # ==============================================================================
@@ -90,7 +110,7 @@ BATCH_INIT_ENDPOINT = f"{BASE_URL}/api/uploads/batch/init"
 MAX_BATCH_SIZE = 100
 MAX_RETRIES = 3
 RETRY_DELAY = 5
-RETRYABLE_STATUSES = [500, 502, 503, 504, 524]
+RETRYABLE_STATUSES = [429, 500, 502, 503, 504, 524]
 DEFAULT_CHAPTERS_DIR = "chapters"
 
 DEFAULT_USER_AGENTS = {
@@ -258,6 +278,37 @@ class Colors:
     FAIL = '\033[91m'
     RESET = Style.RESET_ALL
     BOLD = '\033[1m'
+
+def log_request_response(response, *args, **kwargs):
+    req = response.request
+    logging.debug(f"=== HTTP {req.method} {req.url} ===")
+    logging.debug("--- REQUEST HEADERS ---")
+    for k, v in req.headers.items():
+        logging.debug(f"{k}: {v}")
+    if req.body:
+        try:
+            body_len = len(req.body)
+            logging.debug(f"--- REQUEST BODY (Size: {body_len} bytes) ---")
+            if body_len < 2000 and not isinstance(req.body, bytes):
+                logging.debug(req.body)
+            elif isinstance(req.body, bytes):
+                logging.debug("<Binary Data / File Chunk>")
+        except Exception:
+            logging.debug("--- REQUEST BODY (Size: Unknown) ---")
+    logging.debug(f"--- RESPONSE STATUS: {response.status_code} {response.reason} ---")
+    logging.debug("--- RESPONSE HEADERS ---")
+    for k, v in response.headers.items():
+        logging.debug(f"{k}: {v}")
+    logging.debug("--- RESPONSE BODY ---")
+    try:
+        resp_text = response.text
+        if len(resp_text) > 1000:
+            logging.debug(f"{resp_text[:1000]}... (truncated)")
+        else:
+            logging.debug(resp_text)
+    except Exception:
+        logging.debug("<Binary or Unreadable Response>")
+    logging.debug("===============================================================\n")
 
 # --- UI Renderer ---
 class UIRenderer:
@@ -495,8 +546,10 @@ def run_dry_run():
         prompt_txt = "Enter the directory path containing your .cbz/.zip files"
         if os.path.isdir(DEFAULT_CHAPTERS_DIR): directory = prompt(prompt_txt, default=DEFAULT_CHAPTERS_DIR)
         else: directory = prompt(prompt_txt)
+        directory = directory.strip().rstrip('\\').strip('"\'')
         if os.path.isdir(directory): break
         print_error("Directory does not exist. Please try again.")
+    flush_input_buffer()
 
     upload_type_choice = prompt("Upload type? (1) Chapter  (2) Volume", default="1")
     upload_type = "volume" if upload_type_choice == "2" else "chapter"
@@ -679,7 +732,7 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids, up
                 time.sleep(RETRY_DELAY)
             else: return {"key": filename, "success": False, "error": f"Init failed: {str(e)[:30]}"}
 
-    chunk_size = int(7 * 1024 * 1024)
+    chunk_size = int(5 * 1024 * 1024)
     offset = 0
     last_speed = 0.0
     eta = 0.0
@@ -881,9 +934,18 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids, upload_ty
 def main():
     parser = argparse.ArgumentParser(description="MangaDot.net Batch Uploader")
     parser.add_argument("--dry-run", action="store_true", help="Scan a directory and preview parsed chapters without logging in or uploading anything.")
+    parser.add_argument("--debug", action="store_true", help="Enable detailed API logging to api_requests.log")
     args, _ = parser.parse_known_args()
 
     if args.dry_run: run_dry_run()
+
+    if args.debug:
+        logging.basicConfig(
+            filename='api_requests.log',
+            level=logging.DEBUG,
+            format='%(asctime)s [%(levelname)s] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
 
     print(f"{Colors.HEADER}{Colors.BOLD}")
     print("========================================")
@@ -892,8 +954,9 @@ def main():
     print(f"{Colors.RESET}")
 
     req_session = requests.Session()
+    if args.debug:
+        req_session.hooks['response'].append(log_request_response)
     req_session.headers.update({ "Origin": BASE_URL, "Referer": f"{BASE_URL}/" })
-
     no_retry_adapter = HTTPAdapter(max_retries=0)
     req_session.mount("https://", no_retry_adapter)
     req_session.mount("http://", no_retry_adapter)
@@ -906,8 +969,10 @@ def main():
         prompt_txt = "Enter the directory path containing your .cbz/.zip files"
         if os.path.isdir(DEFAULT_CHAPTERS_DIR): directory = prompt(prompt_txt, default=DEFAULT_CHAPTERS_DIR)
         else: directory = prompt(prompt_txt)
+        directory = directory.strip().rstrip('\\').strip('"\'')
         if os.path.isdir(directory): break
         print_error("Directory does not exist. Please try again.")
+    flush_input_buffer()
 
     guessed_title = Path(directory).name if directory else ""
 
@@ -1043,16 +1108,20 @@ def main():
 
         if not failed_chapters:
             print(f"{Colors.OKGREEN}✅ All chapters were processed successfully!")
-            if os.path.exists("failed.txt"): os.remove("failed.txt")
             break
 
         print(f"{Colors.FAIL}⚠️ {len(failed_chapters)} chapters failed to upload after all retries.{Colors.RESET}")
+        
+        import datetime
+        safe_id = str(manga_id) if manga_id else "unknown"
+        failed_log_name = f"failed_manga_{safe_id}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        
         try:
-            with open("failed.txt", "w", encoding="utf-8") as f:
+            with open(failed_log_name, "w", encoding="utf-8") as f:
                 for chap in sorted(failed_chapters, key=natural_sort_key): f.write(f"{chap}\n")
-            print(f"A list of failed chapters has been saved to {Colors.OKCYAN}`failed.txt`{Colors.RESET}.")
+            print(f"A list of failed chapters has been saved to {Colors.OKCYAN}`{failed_log_name}`{Colors.RESET}.")
         except Exception as e:
-            print(f"{Colors.FAIL}Could not write to `failed.txt`: {e}")
+            print(f"{Colors.FAIL}Could not write to `{failed_log_name}`: {e}")
             break
 
         retry_choice = prompt("Would you like to rerun the upload script for ONLY these failed entries? (y/n)", default="y").lower()
