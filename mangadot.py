@@ -306,8 +306,10 @@ class UIRenderer:
             speed = info["speed"]
             eta_seconds = info["eta"]
             
-            speed_str = f"{speed / 1048576:.2f} MB/s" if speed > 1048576 else f"{speed / 1024:.2f} KB/s"
-            
+            if speed > 1048576:
+                speed_str = f"{speed / 1048576:>5.2f} MB/s"
+            else:
+                speed_str = f"{speed / 1024:>5.2f} KB/s"
             if eta_seconds > 0:
                 m, s = divmod(int(eta_seconds), 60)
                 h, m = divmod(m, 60)
@@ -318,9 +320,11 @@ class UIRenderer:
             stats = ""
             if info["total"] > 0:
                 if progress >= 1.0:
-                    stats = f"  ({tot_mb:.1f} MB)"
+                    # Pad total MB to 6 characters right-aligned
+                    stats = f"  ({tot_mb:>6.1f} MB)"
                 elif progress > 0.0:
-                    stats = f"  ({curr_mb:.1f}MB / {tot_mb:.1f}MB) | {speed_str} | ETA: {eta_str}"
+                    # Pad current MB and total MB to 6 characters right-aligned
+                    stats = f"  ({curr_mb:>6.1f}MB / {tot_mb:>6.1f}MB) | {speed_str:>11} | ETA: {eta_str:>5}"
             
             line = f"  {key:<30.30}: {status_color}{padded_status}{Colors.RESET} {bar} {progress*100:3.0f}%{stats}"
             sys.stdout.write(f"{line}\033[K\n")
