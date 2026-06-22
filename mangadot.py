@@ -1,4 +1,4 @@
-# MangaDot.net Batch Uploader version 1.0.3 [https://mangadot.net]
+# MangaDot.net Batch Uploader version 1.0.4 [https://mangadot.net]
 import os
 import re
 import sys
@@ -665,6 +665,9 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids, up
             renderer.update_chapter_status(filename, "Creating upload...", 0.0)
             res = session.post(TUS_ENDPOINT, headers=headers, timeout=30)
             if res.status_code in (401, 403): raise SessionExpiredError()
+            if res.status_code == 409:
+                renderer.update_chapter_status(filename, "✅ Already Exists", 1.0, current=size, total=size)
+                return {"key": filename, "success": True}
             res.raise_for_status()
             upload_location = res.headers.get("Location")
             if not upload_location: raise ValueError("No Location header")
