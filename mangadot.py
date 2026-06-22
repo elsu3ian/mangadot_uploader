@@ -1,3 +1,4 @@
+#From Protearsdropper and Elsu version 0.0.1 by Protearsdropper, Elsu, Moon, and others
 import os
 import re
 import sys
