@@ -1,4 +1,4 @@
-# MangaDot.net Batch Uploader version 1.0.0 [https://mangadot.net]
+# MangaDot.net Batch Uploader version 1.0.1 [https://mangadot.net]
 import os
 import re
 import sys
@@ -355,15 +355,11 @@ class UIRenderer:
             info = self.status[key]
             status_text, progress = info["status"], info["progress"]
             
-            visual_len = len(status_text)
-            if "✅" in status_text or "❌" in status_text:
-                visual_len += 1
-                
-            padding = 25 - visual_len
-            if padding < 0: padding = 0
+            visual_len = len(status_text) + 1 if "✅" in status_text or "❌" in status_text else len(status_text)
+            padding = 25 - visual_len if 25 - visual_len > 0 else 0
             padded_status = f"{status_text}{' ' * padding}"
             
-            bar_color = Colors.OKGREEN if progress == 1.0 and ("✅" in status_text) else (Colors.FAIL if "❌" in status_text else Colors.WARNING)
+            bar_color = Colors.OKGREEN if progress == 1.0 and "✅" in status_text else (Colors.FAIL if "❌" in status_text else Colors.WARNING)
             bar = f"[{bar_color}{'#' * int(progress * 20):<20}{Colors.RESET}]"
             status_color = Colors.OKGREEN if "✅" in status_text else (Colors.FAIL if "❌" in status_text else "")
             
@@ -526,178 +522,29 @@ def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_re
     files_data.sort(key=lambda x: x["number"])
     return files_data
 
-def validate_session(session):
-    res = session.get(f"{BASE_URL}/api/profile", timeout=30)
-    if res.status_code == 200:
-        data = res.json()
-        if "profile" in data and "email" in data["profile"]:
-            return data['profile']['email']
-    return None
-
-def search_manga(query, session):
-    url = f"{BASE_URL}/search.data?search={query}"
-    res = session.get(url, timeout=30)
-    if res.status_code != 200: return []
-    try: arr = res.json()
-    except: return []
-        
-    mangas = []
-    for item in arr:
-        if isinstance(item, dict):
-            decoded = {}
-            for k, v in item.items():
-                if k.startswith('_') and k[1:].isdigit():
-                    key_idx = int(k[1:])
-                    if key_idx < len(arr):
-                        key_str = arr[key_idx]
-                        val = arr[v] if isinstance(v, int) and v < len(arr) else v
-                        decoded[key_str] = val
-                else: decoded[k] = v
-            
-            if "id" in decoded and "title" in decoded and isinstance(decoded["id"], int):
-                if "photo" in decoded or "status" in decoded: mangas.append(decoded)
-                    
-    seen = set()
-    return [m for m in mangas if not (m["id"] in seen or seen.add(m["id"]))]
-
-def search_groups(query, session):
-    res = session.get(f"{BASE_URL}/api/groups?q={query}&limit=25", timeout=30)
-    if res.status_code != 200: return []
-    try: return res.json().get("groups", [])
-    except: return []
-
-# --- Worker Function for TUS ---
-def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids, upload_type, batch_id, language, scanlator_name):
-    filename = file_info["filename"]
-    filepath = file_info["filepath"]
-    size = file_info["size"]
-    
-    tus_metadata = {
-        "manga_id": manga_id,
-        "chapter_number": "0" if upload_type == "volume" else file_info["number"],
-        "language": language,
-        "group_ids": group_ids,
-        "group_id": group_ids[0] if group_ids else 0,
-        "upload_type": upload_type,
-        "batch_id": batch_id,
-        "name": filename,
-        "type": "application/zip",
-        "filetype": "application/zip",
-        "filename": filename
-    }
-    
-    if upload_type == "volume": tus_metadata["volume_number"] = file_info["number"]
-    if file_info.get("title"): tus_metadata["chapter_title"] = file_info["title"]
-    if scanlator_name: tus_metadata["scanlator_name"] = scanlator_name
-
-    encoded_metadata = encode_tus_metadata(tus_metadata)
-    headers = {"Tus-Resumable": "1.0.0", "Upload-Length": str(size), "Upload-Metadata": encoded_metadata}
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            renderer.update_chapter_status(filename, "Creating upload...", 0.0)
-            res = session.post(TUS_ENDPOINT, headers=headers, timeout=30)
-            res.raise_for_status()
-            upload_location = res.headers.get("Location")
-            if not upload_location: raise ValueError("No Location header")
-            break
-        except Exception as e:
-            if attempt < MAX_RETRIES - 1:
-                renderer.update_chapter_status(filename, f"Create Err... Retrying", 0.0)
-                time.sleep(RETRY_DELAY)
-            else:
-                return {"key": filename, "success": False, "error": f"Init failed: {str(e)[:30]}"}
-
-    chunk_size = int(20 * 1024 * 1024)
-    offset = 0
-    
-    try:
-        with open(filepath, 'rb') as f:
-            while offset < size:
-                f.seek(offset)
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                
-                patch_headers = {
-                    "Tus-Resumable": "1.0.0",
-                    "Upload-Offset": str(offset),
-                    "Content-Type": "application/offset+octet-stream",
-                }
-                
-                try:
-                    renderer.update_chapter_status(filename, "Uploading...", offset/size)
-                    patch_res = session.patch(upload_location, headers=patch_headers, data=chunk, timeout=60)
-                    
-                    if patch_res.status_code == 204:
-                        offset += len(chunk)
-                        continue
-                    elif patch_res.status_code in RETRYABLE_STATUSES:
-                        raise requests.exceptions.HTTPError(f"HTTP {patch_res.status_code}")
-                    else:
-                        return {"key": filename, "success": False, "error": f"HTTP {patch_res.status_code}"}
-                except Exception:
-                    resynced = False
-                    for attempt in range(MAX_RETRIES):
-                        renderer.update_chapter_status(filename, "Network Err... Resyncing", offset/size)
-                        time.sleep(RETRY_DELAY)
-                        try:
-                            head_res = session.head(upload_location, headers={"Tus-Resumable": "1.0.0"}, timeout=30)
-                            if head_res.status_code == 200:
-                                server_offset = int(head_res.headers.get("Upload-Offset", 0))
-                                offset = server_offset
-                                resynced = True
-                                break
-                        except Exception:
-                            pass
-                            
-                    if not resynced:
-                        return {"key": filename, "success": False, "error": "Chunk failed & unable to resync offset"}
-                            
-    except Exception as e:
-        return {"key": filename, "success": False, "error": str(e)[:30]}
-        
-    renderer.update_chapter_status(filename, "✅ Uploaded", 1.0)
-    return {"key": filename, "success": True}
-
 def print_files_table(files, upload_type):
     total_size = sum(f["size"] for f in files)
     size_mb = total_size / (1024 * 1024)
-
     print_success(f"Found {len(files)} file(s)  ({size_mb:.1f} MB total)\n")
 
     col_file  = max((len(f["filename"]) for f in files), default=8)
     col_file  = max(col_file, 8)
-    col_num   = 10
-    col_title = 30
-
-    header = (
-        f"  {'Filename':<{col_file}}  "
-        f"{'Number':<{col_num}}  "
-        f"{'Title':<{col_title}}  "
-        f"{'Size':>10}"
-    )
+    header = f"  {'Filename':<{col_file}}  {'Number':<10}  {'Title':<30}  {'Size':>10}"
     print(f"{Colors.OKCYAN}{header}{Colors.RESET}")
-    print(f"  {'-' * col_file}  {'-' * col_num}  {'-' * col_title}  {'-' * 10}")
+    print(f"  {'-' * col_file}  {'-' * 10}  {'-' * 30}  {'-' * 10}")
 
     for f in files:
         num_str   = str(f["number"])
         title_str = f["title"] if f["title"] else "-"
         sz_str    = f"{f['size'] / (1024 * 1024):.2f} MB"
-        print(
-            f"  {f['filename']:<{col_file}}  "
-            f"{num_str:<{col_num}}  "
-            f"{title_str:<{col_title}}  "
-            f"{sz_str:>10}"
-        )
+        print(f"  {f['filename']:<{col_file}}  {num_str:<10}  {title_str:<30}  {sz_str:>10}")
     print("")
-
 
 def run_dry_run():
     print(f"{Colors.HEADER}{Colors.BOLD}")
     print("========================================")
     print("   MangaDot.net Batch Uploader          ")
-    print("   *** DRY RUN MODE (no upload) ***     ")
+    print("   *** DRY RUN MODE (no upload) *** ")
     print("========================================")
     print(f"{Colors.RESET}")
 
@@ -724,8 +571,6 @@ def run_dry_run():
             chapter_naming = "custom"
             print_info("Regex Tip: If your regex has parentheses (Group 1), that group becomes the title. Otherwise, the whole match is used.")
             custom_regex = prompt("Enter your regex pattern")
-        else:
-            chapter_naming = "extract"
 
     print("\n" + "-"*40 + "\n")
     print_info("Scanning directory for files...")
@@ -738,7 +583,6 @@ def run_dry_run():
 
     numbers = [f["number"] for f in files]
     int_numbers = sorted(list(set(int(n) for n in numbers if n == int(n))))
-    
     missing = []
     if len(int_numbers) > 1:
         for i in range(len(int_numbers) - 1):
@@ -748,8 +592,7 @@ def run_dry_run():
     if missing:
         term = "chapters" if upload_type == "chapter" else "volumes"
         if len(missing) <= 15:
-            missing_str = ", ".join(map(str, missing))
-            print_warning(f"Missing {term} detected in sequence: {missing_str}")
+            print_warning(f"Missing {term} detected in sequence: {', '.join(map(str, missing))}")
         else:
             print_warning(f"Missing {term} detected: {len(missing)} {term} are missing between {missing[0]} and {missing[-1]}.")
         print_warning("Please verify this is intentional before proceeding.\n")
@@ -758,95 +601,51 @@ def run_dry_run():
     input(f"\n{Colors.WARNING}Press Enter to exit...{Colors.RESET}")
     sys.exit(0)
 
-def process_uploads(files_to_upload, req_session, manga_id, group_ids, upload_type, language, scanlator_name, thread_count):
-    chunks = [files_to_upload[i:i + MAX_BATCH_SIZE] for i in range(0, len(files_to_upload), MAX_BATCH_SIZE)]
-    
-    file_keys = [f["filename"] for f in files_to_upload]
-    renderer = UIRenderer(file_keys)
-    renderer.start()
-    
-    failed_chapters = []
+def validate_session(session):
+    res = session.get(f"{BASE_URL}/api/profile", timeout=30)
+    if res.status_code == 200:
+        data = res.json()
+        if "profile" in data and "email" in data["profile"]:
+            return data['profile']['email']
+    return None
 
-    for chunk_idx, chunk in enumerate(chunks, 1):
-        chapters_payload = []
-        for f in chunk:
-            chapters_payload.append({
-                "chapter_number": f["number"] if upload_type == "chapter" else 0,
-                "volume_number": f["number"] if upload_type == "volume" else None,
-                "chapter_title": f["title"]
-            })
-            
-        init_payload = {
-            "manga_id": manga_id,
-            "language": language,
-            "group_ids": group_ids,
-            "type": upload_type,
-            "scanlator_name": scanlator_name,
-            "chapters": chapters_payload
-        }
+def search_manga(query, session):
+    url = f"{BASE_URL}/search.data?search={query}"
+    res = session.get(url, timeout=30)
+    if res.status_code != 200: return []
+    try: arr = res.json()
+    except: return []
         
-        try:
-            res = req_session.post(BATCH_INIT_ENDPOINT, json=init_payload, timeout=600)
-            res.raise_for_status()
-            batch_data = res.json()
-            if not batch_data.get("success"): raise Exception(str(batch_data))
-            batch_id = batch_data["batch_id"]
-        except Exception as e:
-            for f in chunk: 
-                renderer.update_chapter_status(f["filename"], f"❌ Batch Init Failed", 1.0)
-                failed_chapters.append(f["filename"])
-            continue
+    mangas = []
+    for item in arr:
+        if isinstance(item, dict):
+            decoded = {}
+            for k, v in item.items():
+                if k.startswith('_') and k[1:].isdigit():
+                    key_idx = int(k[1:])
+                    if key_idx < len(arr):
+                        key_str = arr[key_idx]
+                        val = arr[v] if isinstance(v, int) and v < len(arr) else v
+                        decoded[key_str] = val
+                else:
+                    decoded[k] = v
+            if "id" in decoded and "title" in decoded and isinstance(decoded["id"], int):
+                if "photo" in decoded or "status" in decoded:
+                    mangas.append(decoded)
+                    
+    seen = set()
+    return [m for m in mangas if not (m["id"] in seen or seen.add(m["id"]))]
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=thread_count) as executor:
-            futures = [executor.submit(
-                upload_file_tus_worker, req_session, renderer, f, manga_id, group_ids, upload_type, batch_id, language, scanlator_name
-            ) for f in chunk]
-            
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                if not result['success']:
-                    renderer.update_chapter_status(result['key'], f"❌ {result['error']}", 1.0)
-                    failed_chapters.append(result['key'])
+def search_groups(query, session):
+    res = session.get(f"{BASE_URL}/api/groups?q={query}&limit=25", timeout=30)
+    if res.status_code != 200: return []
+    try: return res.json().get("groups", [])
+    except: return []
 
-        try:
-            comp_res = req_session.post(f"{BASE_URL}/api/uploads/batch/{batch_id}/complete", timeout=600)
-            comp_res.raise_for_status()
-        except Exception as e:
-            pass
-            
-    sys.stdout.write("\n" * 2)
-    sys.stdout.flush()
-    
-    return failed_chapters    
+class SessionExpiredError(Exception):
+    pass
 
-def main():
-    parser = argparse.ArgumentParser(description="MangaDot.net Batch Uploader")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Scan a directory and preview parsed chapters without logging in or uploading anything."
-    )
-    args, _ = parser.parse_known_args()
-
-    if args.dry_run:
-        run_dry_run()
-
-    print(f"{Colors.HEADER}{Colors.BOLD}")
-    print("========================================")
-    print("      MangaDot.net Batch Uploader       ")
-    print("========================================")
-    print(f"{Colors.RESET}")
-
-    req_session = requests.Session()
-    req_session.headers.update({
-        "Origin": BASE_URL,
-        "Referer": f"{BASE_URL}/"
-    })
-
-    no_retry_adapter = HTTPAdapter(max_retries=0)
-    req_session.mount("https://", no_retry_adapter)
-    req_session.mount("http://", no_retry_adapter)
-    
+def authenticate_session(req_session, current_browser="firefox"):
     supported_browsers = {
         "1": ("chrome", rookiepy.chrome),
         "2": ("firefox", rookiepy.firefox),
@@ -856,42 +655,38 @@ def main():
         "6": ("vivaldi", rookiepy.vivaldi)
     }
     
-    current_browser = "firefox"
-    
-    # ── COOKIE RE-EXTRACTION SYSTEM ──
-    def extract_and_validate_session(browser_name):
-        print_info(f"Attempting to extract cookies from {browser_name.title()}...")
-        selected_ua = get_dynamic_user_agent(browser_name)
+    while True:
+        print_info(f"Attempting to extract cookies from {current_browser.title()}...")
+        selected_ua = get_dynamic_user_agent(current_browser)
         req_session.headers.update({"User-Agent": selected_ua})
         
+        extracted_successfully = False
         try:
             req_session.cookies.clear()
-            get_cookies_fn = next((fn for name, fn in supported_browsers.values() if name == browser_name), None)
-            
+            get_cookies_fn = next((fn for name, fn in supported_browsers.values() if name == current_browser), None)
             if get_cookies_fn:
                 browser_cookies = get_cookies_fn(domains=["mangadot.net", ".mangadot.net"])
                 if browser_cookies:
                     for cookie in browser_cookies:
                         req_session.cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'])
-                    
-                    print_info("Validating session with Mangadot...")
-                    email = validate_session(req_session)
-                    if email:
-                        print_success(f"Successfully authenticated as: {email}")
-                        return True
-                    else:
-                        print_warning("Cookies extracted, but session validation failed (expired/unauthorized).")
+                    extracted_successfully = True
                 else:
-                    print_warning(f"No Mangadot.net cookies found in {browser_name.title()}.")
+                    print_warning(f"No Mangadot.net cookies found in {current_browser.title()}.")
+            else:
+                print_error(f"Internal Error: browser mapping not found.")
         except Exception as e:
-            print_warning(f"Failed to extract cookies from {browser_name.title()}: {e}")
-            print_warning(f"Note: Make sure the browser is fully CLOSED before continuing.")
-        return False
-
-    # First Authentication Execution
-    while True:
-        if extract_and_validate_session(current_browser):
-            break
+            print_warning(f"Failed to extract cookies from {current_browser.title()}: {e}")
+            print_warning(f"Note: If using {current_browser.title()}, make sure the browser is fully CLOSED before running this script.")
+            
+        if extracted_successfully:
+            print_info("Validating session with Mangadot...")
+            email = validate_session(req_session)
+            if email:
+                print_success(f"Successfully authenticated as: {email}")
+                return current_browser
+            else:
+                print_warning("Cookies extracted, but session validation failed (unauthorized or expired).")
+                print_warning("Ensure you have passed the Cloudflare check and are logged in on your browser.")
         
         print_info("\nAuthentication failed. Please select an option to retry:")
         for key, (name, _) in supported_browsers.items():
@@ -909,42 +704,244 @@ def main():
             print_error("Invalid selection. Defaulting back to Firefox.")
             current_browser = "firefox"
 
+# --- Worker Function for TUS ---
+def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids, upload_type, batch_id, language, scanlator_name, abort_event):
+    filename = file_info["filename"]
+    filepath = file_info["filepath"]
+    size = file_info["size"]
+    
+    tus_metadata = {
+        "manga_id": manga_id,
+        "chapter_number": "0" if upload_type == "volume" else file_info["number"],
+        "language": language,
+        "group_ids": group_ids,
+        "group_id": group_ids[0] if group_ids else 0,
+        "upload_type": upload_type,
+        "batch_id": batch_id,
+        "name": filename,
+        "type": "application/zip",
+        "filetype": "application/zip",
+        "filename": filename
+    }
+    
+    if upload_type == "volume": tus_metadata["volume_number"] = file_info["number"]
+    if file_info.get("title"): tus_metadata["chapter_title"] = file_info["title"]
+    if scanlator_name: tus_metadata["scanlator_name"] = scanlator_name
+
+    encoded_metadata = encode_tus_metadata(tus_metadata)
+    headers = {"Tus-Resumable": "1.0.0", "Upload-Length": str(size), "Upload-Metadata": encoded_metadata}
+
+    for attempt in range(MAX_RETRIES):
+        if abort_event.is_set(): return {"key": filename, "success": False, "error": "Aborted"}
+        try:
+            renderer.update_chapter_status(filename, "Creating upload...", 0.0)
+            res = session.post(TUS_ENDPOINT, headers=headers, timeout=30)
+            if res.status_code in (401, 403): raise SessionExpiredError()
+            res.raise_for_status()
+            upload_location = res.headers.get("Location")
+            if not upload_location: raise ValueError("No Location header")
+            break
+        except SessionExpiredError: raise
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                renderer.update_chapter_status(filename, f"Create Err... Retrying", 0.0)
+                time.sleep(RETRY_DELAY)
+            else:
+                return {"key": filename, "success": False, "error": f"Init failed: {str(e)[:30]}"}
+
+    chunk_size = int(20 * 1024 * 1024)
+    offset = 0
+    
+    try:
+        with open(filepath, 'rb') as f:
+            while offset < size:
+                if abort_event.is_set(): return {"key": filename, "success": False, "error": "Aborted"}
+                f.seek(offset)
+                chunk = f.read(chunk_size)
+                if not chunk: break
+                
+                patch_headers = {
+                    "Tus-Resumable": "1.0.0",
+                    "Upload-Offset": str(offset),
+                    "Content-Type": "application/offset+octet-stream",
+                }
+                
+                try:
+                    renderer.update_chapter_status(filename, "Uploading...", offset/size)
+                    patch_res = session.patch(upload_location, headers=patch_headers, data=chunk, timeout=60)
+                    
+                    if patch_res.status_code in (401, 403): raise SessionExpiredError()
+                    elif patch_res.status_code == 204:
+                        offset += len(chunk)
+                        continue 
+                    elif patch_res.status_code in RETRYABLE_STATUSES:
+                        raise requests.exceptions.HTTPError(f"HTTP {patch_res.status_code}")
+                    else:
+                        return {"key": filename, "success": False, "error": f"HTTP {patch_res.status_code}"}
+                except SessionExpiredError: raise
+                except Exception:
+                    resynced = False
+                    for attempt in range(MAX_RETRIES):
+                        if abort_event.is_set(): return {"key": filename, "success": False, "error": "Aborted"}
+                        renderer.update_chapter_status(filename, "Network Err... Resyncing", offset/size)
+                        time.sleep(RETRY_DELAY)
+                        try:
+                            head_res = session.head(upload_location, headers={"Tus-Resumable": "1.0.0"}, timeout=30)
+                            if head_res.status_code in (401, 403): raise SessionExpiredError()
+                            if head_res.status_code == 200:
+                                server_offset = int(head_res.headers.get("Upload-Offset", 0))
+                                offset = server_offset
+                                resynced = True
+                                break
+                        except SessionExpiredError: raise
+                        except Exception: pass 
+                            
+                    if not resynced:
+                        return {"key": filename, "success": False, "error": "Chunk failed & unable to resync offset"}
+                            
+    except SessionExpiredError: raise
+    except Exception as e:
+        return {"key": filename, "success": False, "error": str(e)[:30]}
+        
+    renderer.update_chapter_status(filename, "✅ Uploaded", 1.0)
+    return {"key": filename, "success": True}
+
+def process_uploads(files_to_upload, req_session, manga_id, group_ids, upload_type, language, scanlator_name, thread_count):
+    chunks = [files_to_upload[i:i + MAX_BATCH_SIZE] for i in range(0, len(files_to_upload), MAX_BATCH_SIZE)]
+    
+    file_keys = [f["filename"] for f in files_to_upload]
+    renderer = UIRenderer(file_keys)
+    renderer.start()
+    
+    failed_chapters = []
+    session_expired = False
+    abort_event = threading.Event()
+
+    for chunk_idx, chunk in enumerate(chunks, 1):
+        if session_expired:
+            for f in chunk:
+                if f["filename"] not in failed_chapters:
+                    renderer.update_chapter_status(f["filename"], "⏸️ Paused (Session)", 0.0)
+                    failed_chapters.append(f["filename"])
+            continue
+
+        chapters_payload = []
+        for f in chunk:
+            chapters_payload.append({
+                "chapter_number": f["number"] if upload_type == "chapter" else 0,
+                "volume_number": f["number"] if upload_type == "volume" else None,
+                "chapter_title": f["title"]
+            })
+            
+        init_payload = {
+            "manga_id": manga_id,
+            "language": language,
+            "group_ids": group_ids,
+            "type": upload_type,
+            "scanlator_name": scanlator_name,
+            "chapters": chapters_payload
+        }
+        
+        batch_id = None
+        try:
+            res = req_session.post(BATCH_INIT_ENDPOINT, json=init_payload, timeout=600)
+            if res.status_code in (401, 403):
+                session_expired = True
+                abort_event.set()
+                for f in chunk: 
+                    renderer.update_chapter_status(f["filename"], "⏸️ Paused (Auth)", 0.0)
+                    failed_chapters.append(f["filename"])
+                continue
+            res.raise_for_status()
+            batch_data = res.json()
+            if not batch_data.get("success"): raise Exception(str(batch_data))
+            batch_id = batch_data["batch_id"]
+        except Exception as e:
+            for f in chunk: 
+                renderer.update_chapter_status(f["filename"], f"❌ Batch Init Failed", 1.0)
+                failed_chapters.append(f["filename"])
+            continue
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=thread_count) as executor:
+            futures = {executor.submit(
+                upload_file_tus_worker, req_session, renderer, f, manga_id, group_ids, upload_type, batch_id, language, scanlator_name, abort_event
+            ): f for f in chunk}
+            
+            for future in concurrent.futures.as_completed(futures):
+                f_info = futures[future]
+                try:
+                    result = future.result()
+                    if not result['success']:
+                        renderer.update_chapter_status(result['key'], f"❌ {result['error']}", 1.0)
+                        if result['key'] not in failed_chapters: failed_chapters.append(result['key'])
+                except SessionExpiredError:
+                    session_expired = True
+                    abort_event.set()
+                    renderer.update_chapter_status(f_info["filename"], "⏸️ Paused (Auth)", 1.0)
+                    if f_info["filename"] not in failed_chapters: failed_chapters.append(f_info["filename"])
+
+        if batch_id and not session_expired:
+            try:
+                comp_res = req_session.post(f"{BASE_URL}/api/uploads/batch/{batch_id}/complete", timeout=600)
+                if comp_res.status_code in (401, 403):
+                    session_expired = True
+                else: comp_res.raise_for_status()
+            except Exception: pass
+            
+    sys.stdout.write("\n" * 2)
+    sys.stdout.flush()
+    
+    return failed_chapters, session_expired    
+
+def main():
+    parser = argparse.ArgumentParser(description="MangaDot.net Batch Uploader")
+    parser.add_argument("--dry-run", action="store_true", help="Scan a directory and preview parsed chapters without logging in or uploading anything.")
+    args, _ = parser.parse_known_args()
+
+    if args.dry_run: run_dry_run()
+
+    print(f"{Colors.HEADER}{Colors.BOLD}")
+    print("========================================")
+    print("      MangaDot.net Batch Uploader       ")
+    print("========================================")
+    print(f"{Colors.RESET}")
+
+    req_session = requests.Session()
+    req_session.headers.update({ "Origin": BASE_URL, "Referer": f"{BASE_URL}/" })
+
+    no_retry_adapter = HTTPAdapter(max_retries=0)
+    req_session.mount("https://", no_retry_adapter)
+    req_session.mount("http://", no_retry_adapter)
+    
+    current_browser = authenticate_session(req_session, "firefox")
+
     print("\n" + "-"*40 + "\n")
 
     while True:
         prompt_txt = "Enter the directory path containing your .cbz/.zip files"
-        if os.path.isdir(DEFAULT_CHAPTERS_DIR):
-            directory = prompt(prompt_txt, default=DEFAULT_CHAPTERS_DIR)
-        else:
-            directory = prompt(prompt_txt)
-            
+        if os.path.isdir(DEFAULT_CHAPTERS_DIR): directory = prompt(prompt_txt, default=DEFAULT_CHAPTERS_DIR)
+        else: directory = prompt(prompt_txt)
         if os.path.isdir(directory): break
         print_error("Directory does not exist. Please try again.")
 
-    # ── METADATA AUTO-SCAN & PRE-POPULATION SYSTEM ──
-    # Extract just the parent folder name from the input path to use as a fallback guess
     guessed_title = Path(directory).name if directory else ""
 
     manga_id = None
     while not manga_id:
         m_input = prompt("Search Manga by Title, or enter ID directly", default=guessed_title)
         
-        # If it's a numeric value, parse directly as the Target Manga ID
         if m_input.isdigit():
             manga_id = int(m_input)
             break
             
-        # Treat as search query strings
         print_info(f"Searching MangaDot for title matches: '{m_input}'...")
         results = search_manga(m_input, req_session)
         if not results:
             print_warning("No matching manga titles found on MangaDot. Try another search query.")
-            guessed_title = None # Force raw input requirements if guess was bad
+            guessed_title = None
             continue
             
-        for i, m in enumerate(results): 
-            print(f"  [{i+1}] {m['title']} (ID: {m['id']})")
-            
+        for i, m in enumerate(results): print(f"  [{i+1}] {m['title']} (ID: {m['id']})")
         sel = prompt(f"Select a number 1-{len(results)} (or type 's' to search again)", default="1")
         if sel.lower() == 's': 
             guessed_title = None
@@ -965,17 +962,16 @@ def main():
     custom_regex = None
     if upload_type == "chapter":
         naming_choice = prompt("Chapter naming format? (1) Auto-detect title  (2) Force 'Chapter X'  (3) Custom regex", default="2")
-        if naming_choice == "2":
-            chapter_naming = "preset"
+        if naming_choice == "2": chapter_naming = "preset"
         elif naming_choice == "3":
             chapter_naming = "custom"
+            print_info("Regex Tip: If your regex has parentheses (Group 1), that group becomes the title. Otherwise, the whole match is used.")
             custom_regex = prompt("Enter your regex pattern")
-        else:
-            chapter_naming = "extract"
 
     language = prompt("Language code", default="en")
 
     is_group = prompt("Upload as a Group? (y/n)", default="y").lower().startswith('y')
+    group_id = 0
     group_ids = []
     scanlator_name = None
 
@@ -990,17 +986,15 @@ def main():
             if not results:
                 print_warning("No groups found. Try another search.")
                 continue
-            for i, g in enumerate(results): 
-                print(f"  [{i+1}] {g['name']} (ID: {g['id']})")
-                
+            for i, g in enumerate(results): print(f"  [{i+1}] {g['name']} (ID: {g['id']})")
             sel = prompt(f"Select a number 1-{len(results)} (or type 's' to search again)", default="1")
             if sel.lower() == 's': continue
             try:
                 sel_idx = int(sel) - 1
-                group_ids = [results[sel_idx]['id']]
-                print_success(f"Selected Group: {results[sel_idx]['name']} (ID: {group_ids[0]})")
-            except (ValueError, IndexError): 
-                print_error("Invalid numerical selection.")
+                group_id = results[sel_idx]['id']
+                group_ids = [group_id]
+                print_success(f"Selected Group: {results[sel_idx]['name']} (ID: {group_id})")
+            except (ValueError, IndexError): print_error("Invalid selection.")
     else:
         scanlator_name = prompt("Enter your individual Scanlator Name")
 
@@ -1021,6 +1015,19 @@ def main():
 
     print_files_table(files, upload_type)
 
+    numbers = [f["number"] for f in files]
+    int_numbers = sorted(list(set(int(n) for n in numbers if n == int(n))))
+    missing = []
+    if len(int_numbers) > 1:
+        for i in range(len(int_numbers) - 1):
+            if int_numbers[i+1] - int_numbers[i] > 1: missing.extend(range(int_numbers[i] + 1, int_numbers[i+1]))
+                
+    if missing:
+        term = "chapters" if upload_type == "chapter" else "volumes"
+        if len(missing) <= 15: print_warning(f"Missing {term} detected in sequence: {', '.join(map(str, missing))}")
+        else: print_warning(f"Missing {term} detected: {len(missing)} {term} are missing between {missing[0]} and {missing[-1]}.")
+        print_warning("Please verify this is intentional before proceeding.\n")
+
     confirm = prompt("Proceed with upload? (y/n)", default="y").lower()
     if not confirm.startswith('y'):
         print_info("Upload aborted by user.")
@@ -1028,61 +1035,49 @@ def main():
 
     current_files_to_upload = files
     
-    # ── RESILIENT RUNTIME RETRY STATE ──
+    # --- Upload & Retry Loop ---
     while True:
-        failed_chapters = process_uploads(
+        failed_chapters, session_expired = process_uploads(
             current_files_to_upload, req_session, manga_id, group_ids, upload_type, language, scanlator_name, thread_count
         )
         
-        print(f"{Colors.OKCYAN}--- Operations step complete. ---{Colors.RESET}")
-
-        if not failed_chapters:
-            print(f"{Colors.OKGREEN}✅ All chapters were processed successfully!")
-            if os.path.exists("failed.txt"):
-                os.remove("failed.txt")
-            break
-
-        print(f"{Colors.FAIL}⚠️ {len(failed_chapters)} chapters failed or timed out.{Colors.RESET}")
-        try:
-            with open("failed.txt", "w", encoding="utf-8") as f:
-                for chap in sorted(failed_chapters, key=natural_sort_key):
-                    f.write(f"{chap}\n")
-            print(f"Failed list updated in `failed.txt`.")
-        except Exception as e:
-            print(f"{Colors.FAIL}Could not write to `failed.txt`: {e}")
-
-        # Hot-swap tracker storage array to scale exclusively on residual failures
-        current_files_to_upload = [f for f in current_files_to_upload if f["filename"] in failed_chapters]
-
-        print(f"\n{Colors.WARNING}🚨 UPLOAD PAUSED: Session token expired or closed out mid-upload.{Colors.RESET}")
-        print("1. Open your browser and cleanly refresh/log into MangaDot.net to fetch a clean token.")
-        print("2. CRITICAL: Close the browser window entirely so disk lock hooks are released.")
-        
-        # Let dying threads settle completely before parsing prompt
-        time.sleep(1.5)
-        flush_input_buffer()
-        
-        retry_choice = prompt("Ready to load fresh browser database cookies and resume remaining items? (y/n)", default="y").lower()
-        if not retry_choice.startswith('y'):
-            print_info("Exiting execution block. Remaining files are cataloged.")
-            break
-            
-        print_info("Re-verifying updated runtime data cookies...")
-        while True:
-            if extract_and_validate_session(current_browser):
-                print_success("Fresh storage session context established! Continuing batch upload operations...")
-                break
-            
-            print_warning("No authorized active cookie dataset recognized yet from browser profile history.")
+        if session_expired:
+            print(f"\n{Colors.FAIL}⚠️ UPLOAD PAUSED: Session token expired or unauthorized.{Colors.RESET}")
+            print(f"{Colors.WARNING}Please refresh your login/Cloudflare check in your browser, then return here.{Colors.RESET}")
             
             time.sleep(1.5)
             flush_input_buffer()
             
-            action = prompt("Type 'r' to try extracting cookies again, or 'q' to quit", default="r").lower()
-            if action == 'q':
-                sys.exit(0)
+            input(f"{Colors.OKCYAN}Press Enter to re-authenticate and resume...{Colors.RESET}")
+            
+            current_browser = authenticate_session(req_session, current_browser)
+            current_files_to_upload = [f for f in current_files_to_upload if f["filename"] in failed_chapters]
+            print_info(f"\nResuming upload for {len(current_files_to_upload)} failed/paused chapter(s)...")
+            continue
+        
+        print(f"{Colors.OKCYAN}--- 🎉 All operations complete. ---{Colors.RESET}")
 
-    # ── EMBEDDED METADATA DASHBOARD RENDER ──
+        if not failed_chapters:
+            print(f"{Colors.OKGREEN}✅ All chapters were processed successfully!")
+            if os.path.exists("failed.txt"): os.remove("failed.txt")
+            break
+
+        print(f"{Colors.FAIL}⚠️ {len(failed_chapters)} chapters failed to upload after all retries.{Colors.RESET}")
+        try:
+            with open("failed.txt", "w", encoding="utf-8") as f:
+                for chap in sorted(failed_chapters, key=natural_sort_key): f.write(f"{chap}\n")
+            print(f"A list of failed chapters has been saved to {Colors.OKCYAN}`failed.txt`{Colors.RESET}.")
+        except Exception as e:
+            print(f"{Colors.FAIL}Could not write to `failed.txt`: {e}")
+            break
+
+        retry_choice = prompt("Would you like to rerun the upload script for ONLY these failed entries? (y/n)", default="y").lower()
+        if not retry_choice.startswith('y'): break
+            
+        current_files_to_upload = [f for f in current_files_to_upload if f["filename"] in failed_chapters]
+        print_info(f"\nRetrying {len(current_files_to_upload)} failed chapter(s)...")
+
+    # --- Post-Upload Metadata Dashboard ---
     manga_url = f"{BASE_URL}/manga/{manga_id}"
     print(f"\n{Colors.OKCYAN}[*]{Colors.RESET} Fetching upload confirmation details...")
     
@@ -1123,8 +1118,7 @@ def main():
     input(f"{Colors.WARNING}Press Enter to exit...{Colors.RESET}")
 
 if __name__ == "__main__":
-    try:
-        main()
+    try: main()
     except KeyboardInterrupt:
         print("\n\n" + Colors.WARNING + "[!] Script interrupted by user." + Colors.RESET)
         sys.exit(0)
