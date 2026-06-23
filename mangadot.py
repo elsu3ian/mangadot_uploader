@@ -1,4 +1,4 @@
-# MangaDot.net Batch Uploader version 1.1.1 [https://mangadot.net]
+# MangaDot.net Batch Uploader version 1.1.2 [https://mangadot.net]
 """
 ==============================================================================
 🚀 MANGADOT BATCH UPLOADER - ADVANCED FEATURES & USAGE
@@ -47,14 +47,26 @@ REQUIRED_PACKAGES = {
     "colorama": "0.4.6"
 }
 
+# FIX #3: New helper — safely parse version strings that may contain non-numeric
+# suffixes such as '2.34.2.post1' or '2.7.0rc1'. The old bare tuple(map(int, ...))
+# would crash on those strings, then fall into the except handler and incorrectly
+# flag a perfectly valid package as "not installed".
+def _parse_version_tuple(version_str):
+    """Extract the leading numeric part of a version string and return it as an int tuple."""
+    match = re.match(r'(\d+(?:\.\d+)*)', str(version_str))
+    if not match:
+        return (0,)
+    return tuple(map(int, match.group(1).split('.')))
+
 def check_dependencies():
     missing_or_outdated = []
-    
+
     for pkg, min_version in REQUIRED_PACKAGES.items():
         try:
             installed_version = importlib.metadata.version(pkg)
-            installed_tuple = tuple(map(int, installed_version.split('.')))
-            min_tuple = tuple(map(int, min_version.split('.')))
+            # FIX #3: use _parse_version_tuple instead of bare tuple(map(int, ...))
+            installed_tuple = _parse_version_tuple(installed_version)
+            min_tuple       = _parse_version_tuple(min_version)
             if installed_tuple < min_tuple:
                 missing_or_outdated.append((pkg, min_version, installed_version))
         except importlib.metadata.PackageNotFoundError:
@@ -105,10 +117,12 @@ BASE_URL = "https://mangadot.net"
 TUS_ENDPOINT = f"{BASE_URL}/api/tus/"
 BATCH_INIT_ENDPOINT = f"{BASE_URL}/api/uploads/batch/init"
 
-MAX_BATCH_SIZE = 100
-MAX_RETRIES = 3
-RETRY_DELAY = 5
-RETRYABLE_STATUSES = [429, 500, 502, 503, 504, 524]
+MAX_BATCH_SIZE      = 100
+MAX_RETRIES         = 3
+RETRY_DELAY         = 5
+RETRYABLE_STATUSES  = [429, 500, 502, 503, 504, 524]
+FATAL_SIZE_STATUSES = [413, 415]
+MAX_VERIFY_SECONDS  = 60          # FIX #4: was 300 (5 min); reduced to 60 (1 min)
 DEFAULT_CHAPTERS_DIR = "chapters"
 
 DEFAULT_USER_AGENTS = {
@@ -854,28 +868,61 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
                     "Upload-Offset": str(offset),
                     "Content-Type":  "application/offset+octet-stream",
                 }
-                try:
-                    renderer.update_chapter_status(
-                        filename, "Uploading...", offset / size,
-                        current=offset, total=size, speed=last_speed, eta=eta
-                    )
-                    t0        = time.time()
-                    patch_res = session.patch(upload_location, headers=patch_headers, data=chunk, timeout=60)
-                    elapsed   = time.time() - t0
 
-                    if patch_res.status_code in (401, 403): raise SessionExpiredError()
-                    elif patch_res.status_code == 204:
-                        last_speed  = len(chunk) / elapsed if elapsed > 0.001 else 0
-                        offset     += len(chunk)
-                        eta         = (size - offset) / last_speed if last_speed > 0 else 0
-                        continue
-                    elif patch_res.status_code in RETRYABLE_STATUSES:
-                        raise requests.exceptions.HTTPError(f"HTTP {patch_res.status_code}")
-                    else:
-                        return {"key": filename, "success": False, "error": f"HTTP {patch_res.status_code}"}
-                except SessionExpiredError: raise
-                except Exception:
-                    return {"key": filename, "success": False, "error": "Network Err (Resync Disabled)"}
+                # FIX #2: wrap each chunk send in its own retry loop so that
+                # RETRYABLE_STATUSES (429, 502, 503, 504 …) and transient network
+                # errors actually retry instead of immediately failing.
+                # Previously the RETRYABLE branch raised an HTTPError that was
+                # immediately caught by the bare `except Exception` below it,
+                # bypassing all retry logic and returning "Network Err (Resync Disabled)".
+                chunk_done = False
+                for patch_attempt in range(MAX_RETRIES):
+                    try:
+                        renderer.update_chapter_status(
+                            filename, "Uploading...", offset / size,
+                            current=offset, total=size, speed=last_speed, eta=eta
+                        )
+                        t0        = time.time()
+                        patch_res = session.patch(upload_location, headers=patch_headers, data=chunk, timeout=60)
+                        elapsed   = time.time() - t0
+
+                        if patch_res.status_code in (401, 403):
+                            raise SessionExpiredError()
+                        elif patch_res.status_code == 204:
+                            last_speed = len(chunk) / elapsed if elapsed > 0.001 else 0
+                            offset    += len(chunk)
+                            eta        = (size - offset) / last_speed if last_speed > 0 else 0
+                            chunk_done = True
+                            break
+                        elif patch_res.status_code in FATAL_SIZE_STATUSES:
+                            return {"key": filename, "success": False, "error": f"HTTP {patch_res.status_code} (File Too Large/Bad Type)"}
+                        elif patch_res.status_code in RETRYABLE_STATUSES:
+                            if patch_attempt < MAX_RETRIES - 1:
+                                renderer.update_chapter_status(
+                                    filename, f"Retrying chunk... ({patch_attempt + 1})",
+                                    offset / size, current=offset, total=size
+                                )
+                                time.sleep(RETRY_DELAY)
+                            else:
+                                return {"key": filename, "success": False, "error": f"HTTP {patch_res.status_code} (Max Retries)"}
+                        else:
+                            return {"key": filename, "success": False, "error": f"HTTP {patch_res.status_code}"}
+
+                    except SessionExpiredError:
+                        raise
+                    except Exception as e:
+                        if patch_attempt < MAX_RETRIES - 1:
+                            renderer.update_chapter_status(
+                                filename, f"Net Err, Retrying... ({patch_attempt + 1})",
+                                offset / size, current=offset, total=size
+                            )
+                            time.sleep(RETRY_DELAY)
+                        else:
+                            return {"key": filename, "success": False, "error": f"Network Err: {str(e)[:30]}"}
+
+                if not chunk_done:
+                    # Safety net — all real failure paths return above, but guard anyway
+                    return {"key": filename, "success": False, "error": "Chunk upload failed"}
 
     except SessionExpiredError: raise
     except Exception as e:
@@ -887,23 +934,27 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
         if upload_type == "volume"
         else f"{BASE_URL}/api/manga/{manga_id}/chapters/list"
     )
-    found    = False
-    duration = 0
+    found        = False
+    # FIX #4: replace integer-counter duration tracking with wall-clock time so the
+    # cap is accurate even when requests are slow. Timeout reduced from 300s → 60s
+    # (MAX_VERIFY_SECONDS). Request timeout tightened from 30s → 10s.
+    verify_start = time.time()
 
     while not found:
         if abort_event.is_set(): return {"key": filename, "success": False, "error": "Aborted"}
+
+        elapsed_verify = int(time.time() - verify_start)
+        if elapsed_verify >= MAX_VERIFY_SECONDS:
+            return {"key": filename, "success": False, "error": "Not found after 1min (cache?)"}
+
         renderer.update_chapter_status(
-            filename, f"Verifying... ({duration}s)", 1.0,
+            filename, f"Verifying... ({elapsed_verify}s)", 1.0,
             current=size, total=size, speed=0.0, eta=0.0
         )
         time.sleep(RETRY_DELAY)
-        duration += RETRY_DELAY
-
-        if duration > 300:
-            return {"key": filename, "success": False, "error": "Not found after 5min (cache?)"}
 
         try:
-            fetch_check = session.get(f"{base_check_url}?_t={int(time.time())}", timeout=30)
+            fetch_check = session.get(f"{base_check_url}?_t={int(time.time())}", timeout=10)
             if fetch_check.status_code in (401, 403): raise SessionExpiredError()
             if fetch_check.status_code != 200:
                 # Server may be slow — keep retrying until timeout
@@ -1027,16 +1078,27 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                     renderer.update_chapter_status(f_info["filename"], "⏸️ Paused (Auth)", 1.0)
                     if f_info["filename"] not in failed_chapters: failed_chapters.append(f_info["filename"])
 
+        # FIX #5: batch complete now retries up to MAX_RETRIES times instead of
+        # silently swallowing all failures with a bare `except Exception: pass`.
+        # Timeout also reduced from 600s → 30s (the complete endpoint is a lightweight call).
         if batch_id and not session_expired:
-            try:
-                comp_res = req_session.post(
-                    f"{BASE_URL}/api/uploads/batch/{batch_id}/complete", timeout=600
-                )
-                if comp_res.status_code in (401, 403):
-                    session_expired = True
-                else:
+            for comp_attempt in range(MAX_RETRIES):
+                try:
+                    comp_res = req_session.post(
+                        f"{BASE_URL}/api/uploads/batch/{batch_id}/complete", timeout=30
+                    )
+                    if comp_res.status_code in (401, 403):
+                        session_expired = True
+                        break
                     comp_res.raise_for_status()
-            except Exception: pass
+                    break  # success — exit retry loop
+                except Exception as e:
+                    if comp_attempt < MAX_RETRIES - 1:
+                        time.sleep(RETRY_DELAY)
+                    else:
+                        logging.warning(
+                            f"Batch {batch_id} complete call failed after {MAX_RETRIES} attempts: {e}"
+                        )
 
     # FIX: clear abort_event so retry runs after re-auth don't immediately bail
     abort_event.clear()
