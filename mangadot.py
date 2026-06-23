@@ -1,4 +1,4 @@
-# MangaDot.net Batch Uploader version 1.1.2 [https://mangadot.net]
+# MangaDot.net Batch Uploader version 1.1.3 [https://mangadot.net]
 """
 ==============================================================================
 🚀 MANGADOT BATCH UPLOADER - ADVANCED FEATURES & USAGE
@@ -376,6 +376,13 @@ class UIRenderer:
         self.view_start_index = 0
 
     def _render(self):
+        try:
+            import ctypes
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd and ctypes.windll.user32.IsIconic(hwnd):
+                return
+        except Exception:
+            pass
         if self.height > 0:
             sys.stdout.write(f"\033[{self.height}A")
 
