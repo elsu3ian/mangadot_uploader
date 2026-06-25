@@ -19,6 +19,7 @@ This tool automatically extracts your session cookies directly from your web bro
 - **Dynamic User-Agent Spoofing:** Queries your local registry, plist, or CLI to build a User-Agent string from your actual installed browser version.
 - **Parallel Processing Safety:** Dynamic error logging with rotating file support allows multiple instances to run simultaneously without log conflicts.
 - **Advanced Naming:** Custom regex extraction and renaming modes for messy filenames.
+- **Optional Routing Proxy:** Supports passing a custom network tunnel directly via the command line to cleanly bypass restrictive regional ISPs or server-side IP blocks.
 
 ## The Two Versions
 
@@ -88,6 +89,7 @@ py -3.12 mangadot_v1.1.3.py
 | `--debug` | Dumps all HTTP traffic to `api_requests.log` using a rotating 10MB file system (3-file backup limit). |
 | `--library <path>` | Opens the interactive manga picker directly inside your parent library folder instead of typing a path manually. |
 | `--verify-timeout <seconds>` | Overrides how long the script waits for the server to confirm a successful upload before marking it as timed out (default: 60 seconds). |
+| `--proxy <url>` | *(Optional)* Tunnel all HTTP/HTTPS traffic through a specific custom proxy server to bypass regional ISP restrictions or server-side Cloudflare blocks. |
 
 ## Troubleshooting Cookies (Windows)
 
