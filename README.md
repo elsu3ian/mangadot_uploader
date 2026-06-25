@@ -24,7 +24,7 @@ This tool automatically extracts your session cookies directly from your web bro
 
 Both scripts run on the exact same core engine and contain identical bug fixes and network logic. The only difference is the terminal rendering methodology:
 
-- **`mangadot_ui.py`** — The advanced UI build. Uses `rich.progress` and `rich.live` to render a flicker-free dashboard with animated progress bars, and natively handles dynamic transfer speed and ETA calculations via rich's built-in columns.
+- **`mangadot.py`** — The advanced UI build. Uses `rich.progress` and `rich.live` to render a flicker-free dashboard with animated progress bars, and natively handles dynamic transfer speed and ETA calculations via rich's built-in columns.
 - **`mangadot_basic.py`** — The static UI build. Uses `rich.table` to draw a basic, static layout and manually calculates upload speeds and progress metrics in the background. Note: This version still requires the `rich` dependency to function.
 
 ## Prerequisites
@@ -67,7 +67,7 @@ pip install --upgrade requests rookiepy questionary rich
 2. Run your preferred version of the script:
 
 ```bash
-py -3.12 mangadot_ui.py
+py -3.12 mangadot.py
 ```
 
 or
