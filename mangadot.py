@@ -116,9 +116,14 @@ def check_dependencies():
             for pkg, req, inst in outdated_pip:
                 print(f"    ✗  {pkg}  (have {inst}, need >= {req})")
         to_install = missing_pip + [p for p, _, _ in outdated_pip]
-        print(f"\n  Fix:")
-        print(f"    pip install --upgrade {' '.join(to_install)}")
-        print()
+        print(f"\n  🔧 Auto-installing missing/outdated packages: {' '.join(to_install)}...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade"] + to_install)
+            print("  ✅ All dependencies verified and updated.\n")
+            ok = True
+        except subprocess.CalledProcessError:
+            print("  ❌ Auto-install failed. You'll need to run pip manually.")
+            print(f"    pip install --upgrade {' '.join(to_install)}\n")
 
     if shutil.which("chafa") is None:
         _sys = platform.system()
@@ -1278,11 +1283,6 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
     base_check_url = f"{BASE_URL}/api/manga/{manga_id}/volumes" if upload_type == "volume" else f"{BASE_URL}/api/manga/{manga_id}/chapters/list"
     found        = False
     verify_start = time.time()
-    # Number-only fallback: if the right chapter/volume number shows up but the
-    # server response carries no group/scanlator identity we can match against,
-    # accept it after a couple of polls rather than failing a real upload.
-    number_only_polls = 0
-    NUMBER_ONLY_THRESHOLD = 2
 
     while not found:
         if abort_event.is_set(): return {"key": filename, "success": False, "error": "Aborted"}
@@ -1300,7 +1300,6 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
             if isinstance(items_list, dict): items_list = items_list.get("volumes", items_list.get("chapters", []))
             if not isinstance(items_list, list): continue
 
-            number_match_no_identity = False
             for item in items_list:
                 try:
                     if upload_type == "volume":
@@ -1323,18 +1322,6 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
                         if item_scanlator == scanlator_name:
                             found = True; break
 
-                    # The server may return the chapter with no usable identity fields
-                    # (no group_id, no groups list, no scanlator_name). In that case we
-                    # cannot prove it's ours, but we also cannot rule it out — flag for
-                    # the number-only fallback rather than blocking forever.
-                    if not item_group_ids and not item_scanlator:
-                        number_match_no_identity = True
-
-            if not found and number_match_no_identity:
-                number_only_polls += 1
-                if number_only_polls >= NUMBER_ONLY_THRESHOLD:
-                    logging.warning("Verifying '%s' by number only — server returned no group/scanlator identity to match.", filename)
-                    found = True
         except SessionExpiredError:
             raise
         except Exception:
