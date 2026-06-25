@@ -10,7 +10,7 @@ env/
 api_requests.log
 failed.txt
 cookies.txt
-
+failed_manga_*.txt
 # Ignore chapter files inside the chapters folder, but keep the folder itself
 chapters/*
 !chapters/.gitkeep
@@ -22,3 +22,4 @@ Thumbs.db
 # IDEs
 .vscode/
 .idea/
+tempCodeRunnerFile.py
