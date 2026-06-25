@@ -24,8 +24,10 @@ This tool automatically extracts your session cookies directly from your web bro
 
 Both scripts run on the exact same core engine and contain identical bug fixes and network logic. The only difference is the terminal rendering methodology:
 
-- **`mangadot.py`** — The advanced UI build. Uses `rich.progress` and `rich.live` to render a flicker-free dashboard with animated progress bars, and natively handles dynamic transfer speed and ETA calculations via rich's built-in columns.
-- **`mangadot_basic.py`** — The static UI build. Uses `rich.table` to draw a basic, static layout and manually calculates upload speeds and progress metrics in the background. Note: This version still requires the `rich` dependency to function.
+## Repository Structure
+
+- **`mangadot.py`** — The main production release (v1.2.0). It features the full interactive `rich` dashboard, live progress bars, automated dependency checks, and the hardened network layer.
+- **`mangadot_v1.1.3.py`** — An archived, legacy backup of the stable v1.1.3 build. It uses the old manual ANSI console logger and lacks the advanced v1.2.0 automation features, preserved strictly for regression testing.
 
 ## Prerequisites
 
@@ -73,7 +75,7 @@ py -3.12 mangadot.py
 or
 
 ```bash
-py -3.12 mangadot_basic.py
+py -3.12 mangadot_v1.1.3.py
 ```
 
 3. Follow the on-screen prompts to select your browser, search for the target manga, assign scanlator groups, and start the upload.
