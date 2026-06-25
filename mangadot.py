@@ -1152,6 +1152,7 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
     worker_session = requests.Session()
     worker_session.headers.update(session.headers)
     worker_session.cookies.update(session.cookies)
+    if session.proxies: worker_session.proxies.update(session.proxies)
     if session.hooks.get('response'): worker_session.hooks['response'] = session.hooks['response']
     
     # Instantiate isolated, high-capacity pools per worker to prevent socket discarding
@@ -1667,6 +1668,7 @@ def build_arg_parser():
     parser.add_argument("--debug", action="store_true", help="Dump all HTTP traffic to api_requests.log.")
     parser.add_argument("--verify-timeout", type=int, default=MAX_VERIFY_SECONDS, metavar="SECONDS", help=f"How long to wait for validation confirmation (default: {MAX_VERIFY_SECONDS}s).")
     parser.add_argument("--library", default=DEFAULT_LIBRARY_DIR or None, metavar="DIR", help="Parent folder of manga subfolders; pick one interactively instead of typing a path.")
+    parser.add_argument("--proxy", default=None, help="Tunnel all HTTP/HTTPS requests through a specific proxy server.")
     return parser
 
 def main():
@@ -1697,6 +1699,9 @@ def main():
 
     req_session = requests.Session()
     if args.debug: req_session.hooks['response'].append(log_request_response)
+    if args.proxy:
+        req_session.proxies = {"http": args.proxy, "https": args.proxy}
+        console.print(f"[yellow][PROXY] Routing all traffic through: {args.proxy}[/yellow]")
     req_session.headers.update({"Origin": BASE_URL, "Referer": f"{BASE_URL}/"})
     no_retry_adapter = HTTPAdapter(max_retries=0)
     req_session.mount("https://", no_retry_adapter)
