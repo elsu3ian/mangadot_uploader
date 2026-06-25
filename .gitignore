@@ -23,3 +23,6 @@ Thumbs.db
 .vscode/
 .idea/
 tempCodeRunnerFile.py
+tempCoderRunnerFile.py
+failed_manga_*.txt
+logs/
