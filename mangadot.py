@@ -1,4 +1,4 @@
-# MangaDot.net Batch Uploader version 1.2.0 [https://mangadot.net]
+# MangaDot.net Batch Uploader version 1.2.2 [https://mangadot.net]
 # [Interactive UI, Synchronized Color Theme & High-Fidelity Inline Art Update applied]
 
 """
@@ -9,25 +9,30 @@
 WHAT THIS SCRIPT DOES:
   A multi-threaded batch uploader for .cbz/.zip files to MangaDot.net. 
   It extracts active browser cookies (Chrome, Firefox, Edge, Brave, Opera, Vivaldi) 
-  to natively bypass Cloudflare and authenticate sessions. Uploads 
-  are handled via the resumable TUS protocol in 5MB chunks.
-
-COMMAND LINE FLAGS:
-  python mangadot_ui.py --dry-run        : Scans directory, parses names, and flags missing chapters without uploading.
-  python mangadot_ui.py --debug          : Dumps HTTP traffic to 'api_requests.log' with circular file rotation.
-  python mangadot_ui.py --library <path> : Opens the interactive picker directly in your parent manga folder.
-  python mangadot_ui.py --verify-timeout : Overrides the default 60s timeout for verifying server-side chapter ingestion.
+  and dynamically spoofs your exact User-Agent to natively bypass Cloudflare. 
+  Uploads are handled via the resumable TUS protocol in 5MB chunks with optional proxy tunneling.
 
 ADVANCED NAMING & UI:
-  - Bracket Detection: Automatically detects and assigns release groups from [Bracket] tags in filenames.
-  - Custom Regex: Use 'Pattern -> Replace' syntax to quickly rename files, or '()' to extract chapter titles.
-  - Terminal Dashboard: Renders high-fidelity cover art directly in the terminal (requires 'chafa' installed).
+  - Bracket Detection: Automatically detects and assigns release groups from [Bracket] tags.
+  - Mixed-Group Batching: Seamlessly uploads and assigns multiple release groups in a single run.
+  - Custom Regex: Use 'Pattern -> Replace' syntax to quickly rename files, or '()' to extract titles.
+  - Terminal Dashboard: Renders high-fidelity cover art directly in the terminal (requires 'chafa').
 
 SMART PROTECTIONS:
-  - Auto-Session Recovery: If your token expires mid-batch, the script pauses, allowing you to refresh the browser instead of crashing.
-  - Missing Chapter Detection: Automatically scans the file sequence and flags numerical gaps before starting the upload.
-  - Ghost Chapter Prevention: Verifies the server successfully mapped the upload to your specific Scanlator Name or Group ID.
-  - Failure State Recovery: Saves failed uploads to a timestamped 'failed_manga_[id].txt' log and allows immediate isolated retries.
+  - Auto-Session Recovery: Pauses if your token expires mid-batch, allowing browser refreshes.
+  - TUS Conflict Resolution: Automatically queries server offsets to rescue stalled or dropped chunks.
+  - Ghost Chapter Prevention: Strictly verifies server ingestion to your specific Scanlator Name/Group ID.
+  - API Schema Detection: Warns you immediately if MangaDot changes its search payload structure.
+  - Failure State Recovery: Saves failures to 'failed_manga_[id].txt' for immediate isolated retries.
+
+COMMAND LINE FLAGS:
+  py -3.12 mangadot.py -h                 : Shows the help menu with all available arguments.
+  py -3.12 mangadot.py --dry-run          : Scans directory, parses names, and flags missing chapters without uploading.
+  py -3.12 mangadot.py --debug            : Dumps HTTP traffic to 'api_requests.log' with circular file rotation.
+  py -3.12 mangadot.py --library <path>   : Opens the interactive picker directly in your parent manga folder.
+  py -3.12 mangadot.py --verify-timeout X : Overrides the default 60s timeout for verifying server-side chapter ingestion.
+  py -3.12 mangadot.py --proxy <url>      : Routes all HTTP traffic through a specified proxy.
+  py -3.12 mangadot.py --proxy-no-verify  : Disables SSL certificate verification (use only if your proxy intercepts TLS).
 ==============================================================================
 """
 import os
@@ -326,7 +331,7 @@ def _get_chromium_version_for_browser(browser):
     }
     for cmd in cli_map.get(browser, []):
         try:
-            out = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=5)
+            out = subprocess.run([cmd, "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
             if out.returncode == 0 and out.stdout:
                 m = re.search(r'Chromium[/ ](\d+\.\d+\.\d+(?:\.\d+)?)', out.stdout, re.IGNORECASE)
                 if m: return _clean_version(m.group(1))
@@ -361,7 +366,6 @@ def _build_user_agent(browser, version, chromium_version=None):
         return f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_major}.0.0.0 Safari/537.36"
 
 def get_dynamic_user_agent(browser):
-    if browser in _UA_CACHE: return _UA_CACHE[browser]
     with _UA_CACHE_LOCK:
         if browser in _UA_CACHE: return _UA_CACHE[browser]
         version = None
@@ -611,7 +615,10 @@ def _render_cover(image_url: str, session: requests.Session, silent: bool = Fals
             # preserving full-colour palette and high-res crispness.
             subprocess.run(['chafa', '--size=20x30', tmp.name])
         finally:
-            os.unlink(tmp.name)
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass  # Windows may lock the file briefly after chafa exits
     except Exception as e:
         if not silent:
             print_warning(f"Could not display cover art: {e}")
@@ -725,7 +732,7 @@ def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_re
     files_data = []
     for filename in os.listdir(directory):
         if not filename.lower().endswith(valid_extensions): continue
-        filepath = os.path.join(directory, filename)
+        filepath = os.path.normcase(os.path.normpath(os.path.join(directory, filename)))
         if not os.path.isfile(filepath): continue
         num, title, file_groups = parse_filename_details(filename, upload_type, chapter_naming, custom_regex, strip_groups=strip_groups)
         if num is None:
@@ -745,10 +752,15 @@ def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_re
     return files_data
 
 def fmt_size(bytes_: int) -> str:
+    if bytes_ == 0:
+        return "0 B"
     gb = bytes_ / (1024 ** 3)
     if gb >= 1:
         return f"{gb:.2f} GB"
-    return f"{bytes_ / (1024 ** 2):.2f} MB"
+    mb = bytes_ / (1024 ** 2)
+    if mb >= 1:
+        return f"{mb:.2f} MB"
+    return f"{bytes_ / 1024:.2f} KB"
 
 def fmt_duration(seconds) -> str:
     seconds = int(seconds)
@@ -799,6 +811,8 @@ def _check_missing(files, upload_type):
         try:
             if n == int(n):
                 int_numbers.append(int(n))
+            # Decimal chapters (e.g. 13.5) are intentionally excluded from gap
+            # detection since they are not gaps — they are bonus chapters.
         except (ValueError, OverflowError):
             pass
     int_numbers = sorted(set(int_numbers))
@@ -847,6 +861,8 @@ def _remember_library(lib):
     if cfg.get("library") != lib:
         cfg["library"] = lib
         save_config(cfg)
+
+
 
 def _count_archives(path):
     try:
@@ -974,6 +990,7 @@ def search_manga(query, session):
     mangas = []
     if not isinstance(arr, list): return []
 
+    raw_item_count = sum(1 for item in arr if isinstance(item, dict))
     for item in arr:
         if not isinstance(item, dict): continue
         decoded = {}
@@ -992,6 +1009,13 @@ def search_manga(query, session):
             else:
                 decoded[k] = v
         if "id" in decoded and "title" in decoded and isinstance(decoded["id"], int): mangas.append(decoded)
+
+    # Warn if the API returned items but decoding produced nothing — likely a schema change.
+    if raw_item_count > 0 and not mangas:
+        logging.warning("search_manga: API returned %d item(s) but none decoded successfully. "
+                        "The search.data response schema may have changed.", raw_item_count)
+        print_warning("Search returned results but could not be decoded. The site API may have changed.")
+
     seen = set()
     return [m for m in mangas if not (m["id"] in seen or seen.add(m["id"]))]
 
@@ -1013,7 +1037,7 @@ def detect_groups_from_filenames(directory):
         return [], {}
 
     for filename in filenames:
-        filepath = os.path.normpath(os.path.join(directory, filename))
+        filepath = os.path.normcase(os.path.normpath(os.path.join(directory, filename)))
         name  = re.sub(r'\.(cbz|zip)$', '', filename, flags=re.IGNORECASE)
         found, _ = _extract_bracket_groups(name)
 
@@ -1144,7 +1168,8 @@ def _tus_offset(session, location):
     return None
 
 def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
-                           upload_type, batch_id, language, scanlator_name, abort_event):
+                           upload_type, batch_id, language, scanlator_name, abort_event,
+                           verify_timeout=MAX_VERIFY_SECONDS):
     filename = file_info["filename"]
     filepath = file_info["filepath"]
     size     = file_info["size"]
@@ -1285,10 +1310,17 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
     found        = False
     verify_start = time.time()
 
+    # If we have no group_ids and no scanlator_name there is no identity
+    # anchor to verify against — accept the upload as successful immediately
+    # rather than spinning until timeout.
+    if not group_ids and not scanlator_name:
+        renderer.update_chapter_status(filename, "✅ Uploaded", 1.0, current=size, total=size, speed=0.0, eta=0.0)
+        return {"key": filename, "success": True}
+
     while not found:
         if abort_event.is_set(): return {"key": filename, "success": False, "error": "Aborted"}
         elapsed_verify = int(time.time() - verify_start)
-        if elapsed_verify >= MAX_VERIFY_SECONDS: return {"key": filename, "success": False, "error": "Verification timeout reached."}
+        if elapsed_verify >= verify_timeout: return {"key": filename, "success": False, "error": "Verification timeout reached."}
         renderer.update_chapter_status(filename, f"Verifying... ({elapsed_verify}s)", 1.0, current=size, total=size, speed=0.0, eta=0.0)
         time.sleep(RETRY_DELAY)
         try:
@@ -1337,7 +1369,7 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
 
 def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                     upload_type, language, scanlator_name, thread_count,
-                    per_file_group_map=None):
+                    per_file_group_map=None, verify_timeout=MAX_VERIFY_SECONDS):
     """per_file_group_map: optional dict of {filename: [group_id, ...]} for mixed-group
     batches where different chapters belong to different groups."""
     per_file_group_map = per_file_group_map or {}
@@ -1394,19 +1426,29 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
             with concurrent.futures.ThreadPoolExecutor(max_workers=thread_count) as executor:
                 futures = {executor.submit(
                     upload_file_tus_worker, req_session, renderer, f, manga_id,
-                    per_file_group_map.get(f["filepath"], group_ids),  # per-file override or batch default
-                    upload_type, batch_id, language, scanlator_name, abort_event
+                    # Normalize key lookup so mixed slash styles on Windows don't silently miss.
+                    per_file_group_map.get(os.path.normcase(f["filepath"]), group_ids),
+                    upload_type, batch_id, language, scanlator_name, abort_event,
+                    verify_timeout
                 ): f for f in chunk}
-                for future in concurrent.futures.as_completed(futures):
-                    f_info = futures[future]
-                    try:
-                        result = future.result()
-                        if not result['success']:
-                            mark_failed(result['key'], result.get('error', 'Unknown error'), f"❌ {result['error']}")
-                    except SessionExpiredError:
-                        session_expired = True
-                        abort_event.set()
-                        mark_failed(f_info["filename"], "Paused — authentication expired", "⏸️ Paused (Auth)")
+                try:
+                    for future in concurrent.futures.as_completed(futures):
+                        f_info = futures[future]
+                        try:
+                            result = future.result()
+                            if not result['success']:
+                                mark_failed(result['key'], result.get('error', 'Unknown error'), f"❌ {result['error']}")
+                        except SessionExpiredError:
+                            session_expired = True
+                            abort_event.set()
+                            mark_failed(f_info["filename"], "Paused — authentication expired", "⏸️ Paused (Auth)")
+                except KeyboardInterrupt:
+                    abort_event.set()
+                    # Cancel queued futures that haven't started yet, then re-raise
+                    # so the outer handler can clean up the renderer.
+                    for f in futures:
+                        f.cancel()
+                    raise
 
             if batch_id and not session_expired:
                 for comp_attempt in range(MAX_RETRIES):
@@ -1540,7 +1582,7 @@ def _setup_group_config(directory, req_session):
                     for filepath, fnames in per_file_names.items():
                         ids = [name_to_id[n] for n in fnames if n in name_to_id]
                         if ids:
-                            per_file_group_map[filepath] = ids
+                            per_file_group_map[os.path.normcase(filepath)] = ids
 
                     all_resolved = list(name_to_id.values())
                     if all_resolved:
@@ -1590,7 +1632,7 @@ def _setup_group_config(directory, req_session):
 
 def _run_upload_loop(files, req_session, manga_id, group_ids, upload_type,
                      language, scanlator_name, thread_count, per_file_group_map,
-                     current_browser):
+                     current_browser, verify_timeout=MAX_VERIFY_SECONDS):
     """Runs the upload-and-retry loop, handling session expiry and per-run failures.
     Returns (final_failed_set, upload_elapsed_seconds, current_browser)."""
     current_files_to_upload = files
@@ -1602,7 +1644,8 @@ def _run_upload_loop(files, req_session, manga_id, group_ids, upload_type,
         failed_chapters, session_expired, failure_reasons = process_uploads(
             current_files_to_upload, req_session, manga_id, group_ids, upload_type,
             language, scanlator_name, thread_count,
-            per_file_group_map=per_file_group_map
+            per_file_group_map=per_file_group_map,
+            verify_timeout=verify_timeout
         )
 
         if session_expired:
@@ -1662,6 +1705,35 @@ def _run_upload_loop(files, req_session, manga_id, group_ids, upload_type,
 # 🚀 MAIN
 # ==============================================================================
 
+def _check_proxy(proxy_url):
+    """Verify the proxy is reachable by hitting a neutral, Cloudflare-free endpoint.
+    Using BASE_URL would fail immediately — Cloudflare blocks python-requests UA.
+    Returns (ok: bool, error_msg: str | None)."""
+    test_url = "https://1.1.1.1"  # Cloudflare DNS — neutral, reliable, no bot protection
+    try:
+        r = requests.get(
+            test_url,
+            proxies={"http": proxy_url, "https": proxy_url},
+            timeout=10,
+            headers={"User-Agent": DEFAULT_USER_AGENTS["chrome"]},
+            allow_redirects=False,
+        )
+        if r.status_code == 407:
+            return False, "Proxy returned 407 — credentials are wrong or missing."
+        # Any response (even a redirect or HTML) means the proxy forwarded the request.
+        return True, None
+    except requests.exceptions.SSLError:
+        return False, (
+            "SSL error through proxy. The proxy may be intercepting TLS (MITM). "
+            "If you trust this proxy, add '--proxy-no-verify' to skip SSL checks."
+        )
+    except requests.exceptions.ProxyError as e:
+        return False, f"Proxy connection failed: {str(e)[:80]}"
+    except requests.exceptions.ConnectionError as e:
+        return False, f"Could not reach proxy: {str(e)[:80]}"
+    except Exception as e:
+        return False, f"Proxy check error: {str(e)[:80]}"
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="MangaDot Batch Uploader", formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true", help="Scan and parse chapter names without uploading.")
@@ -1669,15 +1741,19 @@ def build_arg_parser():
     parser.add_argument("--verify-timeout", type=int, default=MAX_VERIFY_SECONDS, metavar="SECONDS", help=f"How long to wait for validation confirmation (default: {MAX_VERIFY_SECONDS}s).")
     parser.add_argument("--library", default=DEFAULT_LIBRARY_DIR or None, metavar="DIR", help="Parent folder of manga subfolders; pick one interactively instead of typing a path.")
     parser.add_argument("--proxy", default=None, help="Tunnel all HTTP/HTTPS requests through a specific proxy server.")
+    parser.add_argument("--proxy-no-verify", action="store_true", help="Disable SSL certificate verification when using a proxy (use only if the proxy does TLS interception).")
     return parser
 
 def main():
-    global MAX_VERIFY_SECONDS
     args = build_arg_parser().parse_args()
-    MAX_VERIFY_SECONDS = args.verify_timeout
+    verify_timeout = args.verify_timeout
 
     saved_config     = load_config()
     resolved_library = args.library or saved_config.get("library") or (DEFAULT_LIBRARY_DIR or None)
+
+    # Proxy is intentionally NOT persisted to config — credentials must be
+    # passed explicitly via --proxy on every run to avoid plaintext storage.
+    resolved_proxy = args.proxy or None
 
     if args.dry_run: run_dry_run(resolved_library)
 
@@ -1699,9 +1775,25 @@ def main():
 
     req_session = requests.Session()
     if args.debug: req_session.hooks['response'].append(log_request_response)
-    if args.proxy:
-        req_session.proxies = {"http": args.proxy, "https": args.proxy}
-        console.print(f"[yellow][PROXY] Routing all traffic through: {args.proxy}[/yellow]")
+
+    if resolved_proxy:
+        proxy_no_verify = getattr(args, 'proxy_no_verify', False)
+        console.print(f"[yellow][PROXY] Routing all traffic through: {resolved_proxy}[/yellow]")
+        with console.status("[cyan]Checking proxy connectivity...[/cyan]", spinner="dots"):
+            proxy_ok, proxy_err = _check_proxy(resolved_proxy)
+        if not proxy_ok:
+            print_error(f"Proxy health check failed: {proxy_err}")
+            if not ask_confirm("Continue anyway?", default=False):
+                sys.exit(1)
+        else:
+            print_success("Proxy is reachable.")
+        req_session.proxies = {"http": resolved_proxy, "https": resolved_proxy}
+        if proxy_no_verify:
+            req_session.verify = False
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            print_warning("SSL verification disabled — traffic is NOT verified end-to-end.")
+
     req_session.headers.update({"Origin": BASE_URL, "Referer": f"{BASE_URL}/"})
     no_retry_adapter = HTTPAdapter(max_retries=0)
     req_session.mount("https://", no_retry_adapter)
@@ -1782,7 +1874,8 @@ def main():
 
     final_failed, upload_elapsed, current_browser = _run_upload_loop(
         files, req_session, manga_id, group_ids, upload_type,
-        language, scanlator_name, thread_count, per_file_group_map, current_browser
+        language, scanlator_name, thread_count, per_file_group_map, current_browser,
+        verify_timeout=verify_timeout
     )
 
     manga_url = f"{BASE_URL}/manga/{manga_id}"
