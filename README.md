@@ -1,7 +1,7 @@
 # MangaDot.net Batch Uploader
 
 A multi-threaded, session-cloning batch uploader for [MangaDot.net](https://mangadot.net).  
-This tool automatically extracts your session cookies directly from your web browser to natively bypass Cloudflare, and securely uploads massive batches of `.cbz` or `.zip` chapters/volumes using the resumable TUS protocol.
+This tool automatically extracts your session cookies directly from your web browser and dynamically spoofs your exact User-Agent to natively bypass Cloudflare. Uploads are handled via the resumable TUS protocol in 5MB chunks with optional proxy tunneling.
 
 ## Features
 
@@ -27,8 +27,8 @@ Both scripts run on the exact same core engine and contain identical bug fixes a
 
 ## Repository Structure
 
-- **`mangadot.py`** — The main production release (v1.2.0). It features the full interactive `rich` dashboard, live progress bars, automated dependency checks, and the hardened network layer.
-- **`mangadot_v1.1.3.py`** — An archived, legacy backup of the stable v1.1.3 build. It uses the old manual ANSI console logger and lacks the advanced v1.2.0 automation features, preserved strictly for regression testing.
+- **`mangadot.py`** — The main production release (v1.2.2). It features the full interactive `rich` dashboard, live progress bars, automated dependency checks, and the hardened network layer.
+- **`mangadot_v1.1.3.py`** — An archived, legacy backup of the stable v1.1.3 build. It uses the old manual ANSI console logger and lacks the advanced v1.2.x automation features, preserved strictly for regression testing.
 
 ## Prerequisites
 
@@ -85,11 +85,13 @@ py -3.12 mangadot_v1.1.3.py
 
 | Flag | Description |
 |---|---|
+| `-h` | Shows the help menu with all available arguments. |
 | `--dry-run` | Scans your directory, parses filenames, and flags missing chapters without uploading anything. |
 | `--debug` | Dumps all HTTP traffic to `api_requests.log` using a rotating 10MB file system (3-file backup limit). |
 | `--library <path>` | Opens the interactive manga picker directly inside your parent library folder instead of typing a path manually. |
 | `--verify-timeout <seconds>` | Overrides how long the script waits for the server to confirm a successful upload before marking it as timed out (default: 60 seconds). |
 | `--proxy <url>` | *(Optional)* Tunnel all HTTP/HTTPS traffic through a specific custom proxy server to bypass regional ISP restrictions or server-side Cloudflare blocks. |
+| `--proxy-no-verify` | *(Optional)* Disables SSL certificate verification. Use only if your proxy actively intercepts TLS traffic (MITM). |
 
 ## Troubleshooting Cookies (Windows)
 
@@ -102,6 +104,23 @@ If any uploads fail permanently, the script will generate a timestamped file (e.
 Detailed HTTP request data is not saved by default to save disk space, but can be enabled by running the script with the `--debug` flag.
 
 ## Patch Notes
+
+### v1.2.2
+
+**🛡️ Security & Routing**
+- **Proxy Tunneling:** Added `--proxy` and `--proxy-no-verify` CLI flags to route traffic through custom network tunnels and bypass MITM SSL errors.
+- **Smart Health Check:** Implemented a secure pre-flight proxy check against `1.1.1.1` with a spoofed User-Agent to seamlessly bypass MangaDot's Cloudflare gate.
+
+**🐛 Critical Bug Fixes**
+- **Locale Crash Prevented:** Fixed a `UnicodeDecodeError` in the Chromium CLI version checker on non-UTF-8 Linux distributions.
+- **Verification Hang Resolved:** Bypassed the 60-second verification timeout loop when uploading strictly under a Scanlator Name without a Group ID.
+- **Cross-Platform Pathing:** Normalized all filepath dictionary keys to prevent mixed-group assignments from failing due to Windows/Linux slash direction mismatches.
+
+**⚡ Performance & UX**
+- **Graceful Aborts:** Added explicit thread cancellation on `KeyboardInterrupt` (`Ctrl+C`) to instantly kill the executor without traceback vomits.
+- **API Schema Detection:** Added a proactive warning trigger if MangaDot changes its obfuscated search payload structure.
+- **Windows Temp Locking:** Trapped OS-level file locking exceptions during `chafa` image rendering to prevent random crashes.
+- **UI Formatting:** Fixed human-readable size formatting for files under 1MB.
 
 ### v1.2.0
 
