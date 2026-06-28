@@ -8,7 +8,7 @@
 
 WHAT THIS SCRIPT DOES:
   A multi-threaded batch uploader for .cbz/.zip files to MangaDot.net. 
-  It extracts active browser cookies (Chrome, Firefox, Edge, Brave, Opera, Vivaldi)
+  It extracts active browser cookies (Chrome, Firefox, Edge, Brave, Opera, Vivaldi) s
   and dynamically spoofs your exact User-Agent to natively bypass Cloudflare. 
   Uploads are handled via the resumable TUS protocol in 5MB chunks with optional proxy tunneling.
 
@@ -407,11 +407,10 @@ def get_dynamic_user_agent(browser):
     with _UA_CACHE_LOCK:
         _UA_CACHE[browser] = ua
         try:
-            fresh_config = load_config()
-            cached_uas = fresh_config.get("cached_user_agents", {})
+            cached_uas = config.get("cached_user_agents", {})
             cached_uas[browser] = ua
-            fresh_config["cached_user_agents"] = cached_uas
-            save_config(fresh_config)
+            config["cached_user_agents"] = cached_uas
+            save_config(config)
         except Exception:
             pass
 
@@ -1042,7 +1041,8 @@ def validate_session(session):
             data = res.json()
             profile = data.get("profile", {})
             name = profile.get("username") or profile.get("email")
-            # Confirmed via live API: id is the profile's user ID.
+            # NOTE: exact field name unconfirmed against a live response — adjust
+            # these fallbacks if --debug shows the real key (e.g. via api_requests.log).
             user_id = profile.get("id") or profile.get("user_id") or profile.get("uid")
             return name, user_id
     except Exception: pass
@@ -1259,7 +1259,7 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
     worker_session.cookies.update(session.cookies)
     if session.proxies: worker_session.proxies.update(session.proxies)
     worker_session.verify = session.verify
-    if session.hooks.get('response'): worker_session.hooks['response'] = list(session.hooks['response'])
+    if session.hooks.get('response'): worker_session.hooks['response'] = session.hooks['response']
 
 
     worker_adapter = HTTPAdapter(max_retries=0, pool_connections=10, pool_maxsize=25)
@@ -1387,7 +1387,6 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
 
     base_check_url = f"{BASE_URL}/api/manga/{manga_id}/volumes" if upload_type == "volume" else f"{BASE_URL}/api/manga/{manga_id}/chapters/list"
     found        = False
-    found_item   = None
     verify_start = time.time()
 
     if not group_ids and not scanlator_name:
@@ -1430,12 +1429,11 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
                         elif isinstance(g, int): item_group_ids.append(g)
                     item_scanlator = item.get("scanlator_name") or item.get("scanlator")
 
-                    if group_ids and any(gid in item_group_ids for gid in group_ids):
-                        found_item = item; found = True; break
+                    if group_ids and any(gid in item_group_ids for gid in group_ids): found = True; break
 
                     if not group_ids and scanlator_name:
                         if isinstance(item_scanlator, str) and item_scanlator.strip().lower() == scanlator_name.strip().lower():
-                            found_item = item; found = True; break
+                            found = True; break
 
           except SessionExpiredError:
             raise
@@ -1443,9 +1441,12 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
             continue
 
     if already_exists:
-        uploader_obj = found_item.get("uploader") if found_item else {}
-        uploader_id  = (found_item.get("uploaded_by") or found_item.get("uploader_id") or found_item.get("user_id")
-                        or (uploader_obj.get("id") if isinstance(uploader_obj, dict) else None)) if found_item else None
+        # NOTE: field names for the uploader on a chapter entry are unconfirmed
+        # against a live response — adjust these fallbacks if --debug shows
+        # the real key (check api_requests.log for the chapters/list response).
+        uploader_obj = item.get("uploader")
+        uploader_id  = (item.get("uploaded_by") or item.get("uploader_id") or item.get("user_id")
+                        or (uploader_obj.get("id") if isinstance(uploader_obj, dict) else None))
         if current_user_id is not None and uploader_id is not None and str(uploader_id) == str(current_user_id):
             label = "✅ Already Uploaded"
         else:
@@ -1672,7 +1673,7 @@ def _setup_group_config(directory, req_session):
 
                     all_resolved = list(name_to_id.values())
                     if all_resolved:
-                        group_ids = []
+                        group_ids = all_resolved
                         strip_bracket_groups = True
                     if not any(per_file_group_map.values()) and not group_ids:
                         print_warning("No groups could be resolved. Falling back to manual search.")
@@ -1687,7 +1688,7 @@ def _setup_group_config(directory, req_session):
                     if not group_ids:
                         print_warning("No groups could be resolved. Falling back to manual search.")
 
-        while not group_ids and not any(per_file_group_map.values()):
+        while not group_ids:
             g_input = prompt("Search Group by Name, or enter ID directly")
             if g_input.isdigit():
                 group_ids = [int(g_input)]
@@ -1843,9 +1844,7 @@ def main():
 
     resolved_proxy = args.proxy
 
-    if args.dry_run: 
-        run_dry_run(resolved_library)
-        sys.exit(0)
+    if args.dry_run: run_dry_run(resolved_library)
 
     if args.debug:
         log_handler = logging.handlers.RotatingFileHandler(
@@ -1867,7 +1866,7 @@ def main():
     if args.debug: req_session.hooks['response'].append(log_request_response)
 
     if resolved_proxy:
-        proxy_no_verify = args.proxy_no_verify
+        proxy_no_verify = getattr(args, 'proxy_no_verify', False)
         console.print(f"[yellow][PROXY] Routing all traffic through: {resolved_proxy}[/yellow]")
         with console.status("[cyan]Checking proxy connectivity...[/cyan]", spinner="dots"):
             proxy_ok, proxy_err = _check_proxy(resolved_proxy, verify=not proxy_no_verify)
