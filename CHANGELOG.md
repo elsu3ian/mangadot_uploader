@@ -2,11 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.3] - 2026-06-30
+
+### Added
+- **Ownership-Aware Labeling:** The uploader now fetches your MangaDot user ID at login and compares it against the uploader of any chapter flagged as a duplicate, distinguishing your own prior uploads (`✅ Already Uploaded`) from someone else's (`✅ Already Exists`).
+- **Persistent User-Agent Cache:** Resolved browser/User-Agent strings are now cached in `~/.mangadot_uploader.json`, avoiding repeated registry/plist/CLI probes on every launch.
+- **Verification Concurrency Limiter:** Added a semaphore capping simultaneous server-side verification checks at 3, preventing large batches from hammering the API with parallel polling requests.
+- **Fuzzy Group Search:** Scanlator group lookups now retry with camelCase-split and progressively spaced variations of the entered name (e.g. `GroupName` → `Group Name`) to find matches that wouldn't surface from an exact-string query.
+
+### Fixed
+- **Mixed-Group Batching Bug:** Files that didn't resolve to an explicit group in a mixed-group run no longer silently inherit the combined group list of every *other* resolved group in the batch.
+- **Create-Conflict Ghost Chapters:** An HTTP 409 on the initial upload creation call (meaning the chapter already exists) now falls through to full Ghost Chapter verification instead of being trusted as an automatic success, closing a gap where someone else's pre-existing chapter could be miscounted as yours.
+- **Case-Sensitive Scanlator Matching:** Scanlator name verification is now case-insensitive, preventing false negatives from minor capitalization differences.
+- **Search Query Encoding:** Manga and group search requests now use `requests`'s `params=` encoding instead of raw f-string concatenation, fixing failures on queries containing special characters.
+- **Localized API Fields:** Manga title, status, description, and alt-titles are now safely unpacked when the API returns them as localized objects (e.g. `{"en": ...}`) instead of plain strings, preventing blank or crashed confirmation screens.
+- **Batch Completion Call:** The batch-complete API call is now skipped if a batch chunk had zero successful uploads, avoiding incorrect "complete" signals to the server.
+- **ID Input Parsing:** Manga ID and Group ID prompts now use safe integer parsing instead of `.isdigit()`, correctly handling malformed input without crashing.
+- **Proxy Health Check Rework:** Replaced the `1.1.1.1` Cloudflare-DNS probe with a dedicated no-content endpoint (`google.com/generate_204`) and wired the `--proxy-no-verify` flag through to the health check itself, so it now properly respects your SSL verification setting.
+- **Sub-1KB File Sizes:** Files smaller than 1KB now display in bytes (e.g. `512 B`) instead of a misleading fractional KB value like `0.05 KB`.
+
+### Changed
+- **Genres Display:** The manga confirmation screen now shows a dedicated "Genres" line alongside "Tags".
+- **Color Theme Sync:** Finished syncing the cyan/amber color scheme across the Cover Art, MangaDot, and MangaBaka links in the confirmation panel.
+- **Directory & Archive Scanning:** Switched from `os.listdir` to `os.scandir` for faster directory traversal, added zero-byte file detection, and hardened `.cbz`/`.zip` validation against corrupt archives (`BadZipFile`).
+- **Bracket/Title Extraction:** Group-tag and title stripping now uses match-position slicing instead of `str.replace()`, preventing accidental removal of duplicate substrings elsewhere in a filename.
+- **Worker Session Lifecycle:** Each upload worker thread now opens its `requests.Session` as a context manager and inherits the parent session's SSL verification setting, ensuring sockets are cleaned up properly and `--proxy-no-verify` is honored on every worker.
+- **Graceful Ctrl+C Feedback:** Added an explicit status message while in-flight uploads finish during a `KeyboardInterrupt` abort.
+- Internal: `finished_order` upload-history tracking switched from a list to a `deque` for O(1) trimming at high throughput.
+
+---
+
 ## [1.2.2] - 2026-06-26
 
 ### Added
 - CLI flags `--proxy` and `--proxy-no-verify` for custom network routing and SSL bypass.
-- Secure Cloudflare-bypassing proxy health check routed against `1.1.1.1` to prevent false-positive failures.
+- Initial pre-flight proxy health check, routed against `1.1.1.1` with a spoofed User-Agent, to catch obviously dead proxies before a batch starts.
 
 ### Fixed
 - `UnicodeDecodeError` crash during Chromium version detection on non-UTF-8 Linux locales.
@@ -17,7 +47,7 @@ All notable changes to this project will be documented in this file.
 - Added explicit thread cancellation on `KeyboardInterrupt` for clean terminal exits.
 - Implemented proactive warning triggers for undetectable API search schema changes.
 - Added exception handling for Windows temp file locking during `chafa` rendering to prevent execution crashes.
-- Fixed UI file size formatting precision to properly display files under 1MB.
+- Reworked human-readable file size formatting to use tiered GB/MB/KB units instead of a flat KB-only display.
 
 ---
 
