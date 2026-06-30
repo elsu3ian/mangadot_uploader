@@ -23,7 +23,7 @@ SMART PROTECTIONS:
   - TUS Conflict Resolution: Automatically queries server offsets to rescue stalled or dropped chunks.
   - Ghost Chapter Prevention: Strictly verifies server ingestion to your specific Scanlator Name/Group ID.
   - API Schema Detection: Warns you immediately if MangaDot changes its search payload structure.
-  - Failure State Recovery: Saves failures to 'failed_manga_[id].txt' for immediate isolated retries.
+  - Failure State Recovery: Saves failures to 'logs/failed_manga_[id]_[timestamp].txt' for isolated retries.
 
 COMMAND LINE FLAGS:
   py -3.12 mangadot.py -h                 : Shows the help menu with all available arguments.
@@ -50,7 +50,6 @@ import subprocess
 import platform
 import logging
 import logging.handlers
-import unicodedata
 import atexit
 import math
 import tempfile
@@ -167,7 +166,6 @@ try:
     from rich.rule import Rule
     from rich.table import Table
     from rich.text import Text
-    from rich.panel import Panel
     from rich import box
     from rich.progress import (
         Progress, TextColumn, BarColumn, TaskProgressColumn,
@@ -1254,206 +1252,205 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
     filepath = file_info["filepath"]
     size     = file_info["size"]
 
-    worker_session = requests.Session()
-    worker_session.headers.update(session.headers)
-    worker_session.cookies.update(session.cookies)
-    if session.proxies: worker_session.proxies.update(session.proxies)
-    worker_session.verify = session.verify
-    if session.hooks.get('response'): worker_session.hooks['response'] = list(session.hooks['response'])
+    with requests.Session() as worker_session:
+        worker_session.headers.update(session.headers)
+        worker_session.cookies.update(session.cookies)
+        if session.proxies: worker_session.proxies.update(session.proxies)
+        worker_session.verify = session.verify
+        if session.hooks.get('response'): worker_session.hooks['response'] = list(session.hooks['response'])
 
+        worker_adapter = HTTPAdapter(max_retries=0, pool_connections=10, pool_maxsize=25)
+        worker_session.mount("https://", worker_adapter)
+        worker_session.mount("http://",  worker_adapter)
 
-    worker_adapter = HTTPAdapter(max_retries=0, pool_connections=10, pool_maxsize=25)
-    worker_session.mount("https://", worker_adapter)
-    worker_session.mount("http://",  worker_adapter)
+        tus_metadata = {
+            "manga_id":       manga_id,
+            "chapter_number": "0" if upload_type == "volume" else file_info["number"],
+            "language":       language,
+            "group_ids":      group_ids,
+            "group_id":       group_ids[0] if group_ids else 0,
+            "upload_type":    upload_type,
+            "batch_id":       batch_id,
+            "name":           filename,
+            "type":           "application/zip",
+            "filetype":       "application/zip",
+            "filename":       filename,
+        }
+        if upload_type == "volume":   tus_metadata["volume_number"]  = file_info["number"]
+        if file_info.get("title"):    tus_metadata["chapter_title"]  = file_info["title"]
+        if scanlator_name:
+            tus_metadata["scanlator_name"] = scanlator_name
 
-    tus_metadata = {
-        "manga_id":       manga_id,
-        "chapter_number": "0" if upload_type == "volume" else file_info["number"],
-        "language":       language,
-        "group_ids":      group_ids,
-        "group_id":       group_ids[0] if group_ids else 0,
-        "upload_type":    upload_type,
-        "batch_id":       batch_id,
-        "name":           filename,
-        "type":           "application/zip",
-        "filetype":       "application/zip",
-        "filename":       filename,
-    }
-    if upload_type == "volume":   tus_metadata["volume_number"]  = file_info["number"]
-    if file_info.get("title"):    tus_metadata["chapter_title"]  = file_info["title"]
-    if scanlator_name:
-        tus_metadata["scanlator_name"] = scanlator_name
+        encoded_metadata = encode_tus_metadata(tus_metadata)
+        headers = {
+            "Tus-Resumable":   "1.0.0",
+            "Upload-Length":   str(size),
+            "Upload-Metadata": encoded_metadata,
+        }
 
-    encoded_metadata = encode_tus_metadata(tus_metadata)
-    headers = {
-        "Tus-Resumable":   "1.0.0",
-        "Upload-Length":   str(size),
-        "Upload-Metadata": encoded_metadata,
-    }
-
-    already_exists = False
-    for attempt in range(MAX_RETRIES):
-        if abort_event.is_set(): return {"key": filename, "success": False, "error": "Aborted"}
-        try:
-            renderer.update_chapter_status(filename, "Creating upload...", 0.0)
-            res = worker_session.post(TUS_ENDPOINT, headers=headers, timeout=(10, 30))
-            if res.status_code in (401, 403): raise SessionExpiredError()
-            if res.status_code == 409:
-                # Don't return success yet — the chapter already exists server-side,
-                # but it may belong to a different group/scanlator. Fall through to
-                # the same Ghost-Chapter verification block used by normal uploads.
-                already_exists = True
+        already_exists = False
+        for attempt in range(MAX_RETRIES):
+            if abort_event.is_set(): return {"key": filename, "success": False, "error": "Aborted"}
+            try:
+                renderer.update_chapter_status(filename, "Creating upload...", 0.0)
+                res = worker_session.post(TUS_ENDPOINT, headers=headers, timeout=(10, 30))
+                if res.status_code in (401, 403): raise SessionExpiredError()
+                if res.status_code == 409:
+                    # Don't return success yet — the chapter already exists server-side,
+                    # but it may belong to a different group/scanlator. Fall through to
+                    # the same Ghost-Chapter verification block used by normal uploads.
+                    already_exists = True
+                    break
+                res.raise_for_status()
+                upload_location = res.headers.get("Location")
+                if not upload_location: raise ValueError("No Location header in TUS response")
                 break
-            res.raise_for_status()
-            upload_location = res.headers.get("Location")
-            if not upload_location: raise ValueError("No Location header in TUS response")
-            break
+            except SessionExpiredError: raise
+            except Exception as e:
+                if attempt < MAX_RETRIES - 1:
+                    renderer.update_chapter_status(filename, "Create Err... Retrying", 0.0)
+                    time.sleep(RETRY_DELAY)
+                else: return {"key": filename, "success": False, "error": f"Init failed: {str(e)[:30]}"}
+
+        chunk_size = 5 * 1024 * 1024
+        offset     = size if already_exists else 0
+
+        try:
+            with open(filepath, 'rb') as f:
+                while offset < size:
+                    if abort_event.is_set(): return {"key": filename, "success": False, "error": "Aborted"}
+
+                    if f.tell() != offset:
+                        f.seek(offset)
+
+                    chunk = f.read(chunk_size)
+                    if not chunk: break
+
+                    chunk_done = False
+                    resynced   = False
+                    for patch_attempt in range(MAX_RETRIES):
+                        try:
+                            renderer.update_chapter_status(
+                                filename, "Uploading...", offset / size,
+                                current=offset, total=size
+                            )
+                            patch_headers = {
+                                "Tus-Resumable": "1.0.0",
+                                "Upload-Offset": str(offset),
+                                "Content-Type":  "application/offset+octet-stream",
+                            }
+                            patch_res = worker_session.patch(upload_location, headers=patch_headers, data=chunk, timeout=60)
+
+                            if patch_res.status_code in (401, 403): raise SessionExpiredError()
+                            elif patch_res.status_code == 204:
+                                server_off = patch_res.headers.get("Upload-Offset")
+                                offset     = int(server_off) if server_off is not None else offset + len(chunk)
+                                chunk_done = True
+                                break
+                            elif patch_res.status_code in FATAL_SIZE_STATUSES:
+                                return {"key": filename, "success": False, "error": f"HTTP {patch_res.status_code} (File Too Large/Bad Type)"}
+                            elif patch_res.status_code == 409:
+                                server_off = _tus_offset(worker_session, upload_location)
+                                if server_off is not None and server_off != offset:
+                                    offset   = server_off
+                                    resynced = True
+                                    break
+                                if patch_attempt < MAX_RETRIES - 1:
+                                    renderer.update_chapter_status(filename, f"Resyncing chunk... ({patch_attempt + 1})", offset / size, current=offset, total=size)
+                                    time.sleep(_compute_retry_delay(patch_res, patch_attempt))
+                                else: return {"key": filename, "success": False, "error": "HTTP 409 (Offset Conflict)"}
+                            elif patch_res.status_code in RETRYABLE_STATUSES:
+                                if patch_attempt < MAX_RETRIES - 1:
+                                    renderer.update_chapter_status(filename, f"Retrying chunk... ({patch_attempt + 1})", offset / size, current=offset, total=size)
+                                    time.sleep(_compute_retry_delay(patch_res, patch_attempt))
+                                else: return {"key": filename, "success": False, "error": f"HTTP {patch_res.status_code} (Max Retries)"}
+                            else: return {"key": filename, "success": False, "error": f"HTTP {patch_res.status_code}"}
+                        except SessionExpiredError: raise
+                        except Exception as e:
+                            if patch_attempt < MAX_RETRIES - 1:
+                                renderer.update_chapter_status(filename, f"Net Err, Retrying... ({patch_attempt + 1})", offset / size, current=offset, total=size)
+                                time.sleep(_compute_retry_delay(None, patch_attempt))
+                                server_off = _tus_offset(worker_session, upload_location)
+                                if server_off is not None and server_off > offset:
+                                    offset   = server_off
+                                    resynced = True
+                                    break
+                            else: return {"key": filename, "success": False, "error": f"Network Err: {str(e)[:30]}"}
+                    if resynced:
+                        continue
+                    if not chunk_done: return {"key": filename, "success": False, "error": "Chunk upload failed"}
         except SessionExpiredError: raise
-        except Exception as e:
-            if attempt < MAX_RETRIES - 1:
-                renderer.update_chapter_status(filename, "Create Err... Retrying", 0.0)
-                time.sleep(RETRY_DELAY)
-            else: return {"key": filename, "success": False, "error": f"Init failed: {str(e)[:30]}"}
+        except Exception as e: return {"key": filename, "success": False, "error": str(e)[:30]}
 
-    chunk_size = 5 * 1024 * 1024
-    offset     = size if already_exists else 0
+        base_check_url = f"{BASE_URL}/api/manga/{manga_id}/volumes" if upload_type == "volume" else f"{BASE_URL}/api/manga/{manga_id}/chapters/list"
+        found        = False
+        found_item   = None
+        verify_start = time.time()
 
-    try:
-        with open(filepath, 'rb') as f:
-            while offset < size:
-                if abort_event.is_set(): return {"key": filename, "success": False, "error": "Aborted"}
+        if not group_ids and not scanlator_name:
+            # Nothing to verify uploader-attribution against here — default to the safer label.
+            label = "✅ Already Exists" if already_exists else "✅ Uploaded"
+            renderer.update_chapter_status(filename, label, 1.0, current=size, total=size, speed=0.0, eta=0.0)
+            return {"key": filename, "success": True}
 
-                if f.tell() != offset:
-                    f.seek(offset)
+        while not found:
+            if abort_event.is_set(): return {"key": filename, "success": False, "error": "Aborted"}
+            elapsed_verify = int(time.time() - verify_start)
+            if elapsed_verify >= verify_timeout: return {"key": filename, "success": False, "error": "Verification timeout reached."}
+            renderer.update_chapter_status(filename, f"Verifying... ({elapsed_verify}s)", 1.0, current=size, total=size, speed=0.0, eta=0.0)
+            time.sleep(RETRY_DELAY)
+            
+            with get_verify_sem():
+                try:
+                    fetch_check = worker_session.get(f"{base_check_url}?_t={int(time.time())}", timeout=10)
 
-                chunk = f.read(chunk_size)
-                if not chunk: break
+                    if fetch_check.status_code in (401, 403): raise SessionExpiredError()
+                    if fetch_check.status_code != 200: continue
 
-                chunk_done = False
-                resynced   = False
-                for patch_attempt in range(MAX_RETRIES):
-                    try:
-                        renderer.update_chapter_status(
-                            filename, "Uploading...", offset / size,
-                            current=offset, total=size
-                        )
-                        patch_headers = {
-                            "Tus-Resumable": "1.0.0",
-                            "Upload-Offset": str(offset),
-                            "Content-Type":  "application/offset+octet-stream",
-                        }
-                        patch_res = worker_session.patch(upload_location, headers=patch_headers, data=chunk, timeout=60)
+                    items_list = fetch_check.json()
+                    if isinstance(items_list, dict): items_list = items_list.get("volumes", items_list.get("chapters", []))
+                    if not isinstance(items_list, list): continue
 
-                        if patch_res.status_code in (401, 403): raise SessionExpiredError()
-                        elif patch_res.status_code == 204:
-                            server_off = patch_res.headers.get("Upload-Offset")
-                            offset     = int(server_off) if server_off is not None else offset + len(chunk)
-                            chunk_done = True
-                            break
-                        elif patch_res.status_code in FATAL_SIZE_STATUSES:
-                            return {"key": filename, "success": False, "error": f"HTTP {patch_res.status_code} (File Too Large/Bad Type)"}
-                        elif patch_res.status_code == 409:
-                            server_off = _tus_offset(worker_session, upload_location)
-                            if server_off is not None and server_off != offset:
-                                offset   = server_off
-                                resynced = True
-                                break
-                            if patch_attempt < MAX_RETRIES - 1:
-                                renderer.update_chapter_status(filename, f"Resyncing chunk... ({patch_attempt + 1})", offset / size, current=offset, total=size)
-                                time.sleep(_compute_retry_delay(patch_res, patch_attempt))
-                            else: return {"key": filename, "success": False, "error": "HTTP 409 (Offset Conflict)"}
-                        elif patch_res.status_code in RETRYABLE_STATUSES:
-                            if patch_attempt < MAX_RETRIES - 1:
-                                renderer.update_chapter_status(filename, f"Retrying chunk... ({patch_attempt + 1})", offset / size, current=offset, total=size)
-                                time.sleep(_compute_retry_delay(patch_res, patch_attempt))
-                            else: return {"key": filename, "success": False, "error": f"HTTP {patch_res.status_code} (Max Retries)"}
-                        else: return {"key": filename, "success": False, "error": f"HTTP {patch_res.status_code}"}
-                    except SessionExpiredError: raise
-                    except Exception as e:
-                        if patch_attempt < MAX_RETRIES - 1:
-                            renderer.update_chapter_status(filename, f"Net Err, Retrying... ({patch_attempt + 1})", offset / size, current=offset, total=size)
-                            time.sleep(_compute_retry_delay(None, patch_attempt))
-                            server_off = _tus_offset(worker_session, upload_location)
-                            if server_off is not None and server_off > offset:
-                                offset   = server_off
-                                resynced = True
-                                break
-                        else: return {"key": filename, "success": False, "error": f"Network Err: {str(e)[:30]}"}
-                if resynced:
+                    for item in items_list:
+                        try:
+                            if upload_type == "volume":
+                                match = math.isclose(float(item.get("volume_number", -1)), float(file_info["number"]), abs_tol=0.001)
+                            else:
+                                match = math.isclose(float(item.get("chapter_number", -1)), float(file_info["number"]), abs_tol=0.001)
+                        except (ValueError, TypeError): match = False
+
+                        if match:
+                            item_group_ids = []
+                            if item.get("group_id"): item_group_ids.append(item["group_id"])
+                            for g in item.get("groups", []):
+                                if isinstance(g, dict) and g.get("id"): item_group_ids.append(g["id"])
+                                elif isinstance(g, int): item_group_ids.append(g)
+                            item_scanlator = item.get("scanlator_name") or item.get("scanlator")
+
+                            if group_ids and any(gid in item_group_ids for gid in group_ids):
+                                found_item = item; found = True; break
+
+                            if not group_ids and scanlator_name:
+                                if isinstance(item_scanlator, str) and item_scanlator.strip().lower() == scanlator_name.strip().lower():
+                                    found_item = item; found = True; break
+
+                except SessionExpiredError:
+                    raise
+                except Exception:
                     continue
-                if not chunk_done: return {"key": filename, "success": False, "error": "Chunk upload failed"}
-    except SessionExpiredError: raise
-    except Exception as e: return {"key": filename, "success": False, "error": str(e)[:30]}
 
-    base_check_url = f"{BASE_URL}/api/manga/{manga_id}/volumes" if upload_type == "volume" else f"{BASE_URL}/api/manga/{manga_id}/chapters/list"
-    found        = False
-    found_item   = None
-    verify_start = time.time()
-
-    if not group_ids and not scanlator_name:
-        # Nothing to verify uploader-attribution against here — default to the safer label.
-        label = "✅ Already Exists" if already_exists else "✅ Uploaded"
+        if already_exists:
+            uploader_obj = found_item.get("uploader") if found_item else {}
+            uploader_id  = (found_item.get("uploaded_by") or found_item.get("uploader_id") or found_item.get("user_id")
+                            or (uploader_obj.get("id") if isinstance(uploader_obj, dict) else None)) if found_item else None
+            if current_user_id is not None and uploader_id is not None and str(uploader_id) == str(current_user_id):
+                label = "✅ Already Uploaded"
+            else:
+                label = "✅ Already Exists"
+        else:
+            label = "✅ Uploaded"
         renderer.update_chapter_status(filename, label, 1.0, current=size, total=size, speed=0.0, eta=0.0)
         return {"key": filename, "success": True}
-
-    while not found:
-        if abort_event.is_set(): return {"key": filename, "success": False, "error": "Aborted"}
-        elapsed_verify = int(time.time() - verify_start)
-        if elapsed_verify >= verify_timeout: return {"key": filename, "success": False, "error": "Verification timeout reached."}
-        renderer.update_chapter_status(filename, f"Verifying... ({elapsed_verify}s)", 1.0, current=size, total=size, speed=0.0, eta=0.0)
-        time.sleep(RETRY_DELAY)
-        
-        with get_verify_sem():
-          try:
-            fetch_check = worker_session.get(f"{base_check_url}?_t={int(time.time())}", timeout=10)
-
-            if fetch_check.status_code in (401, 403): raise SessionExpiredError()
-            if fetch_check.status_code != 200: continue
-
-            items_list = fetch_check.json()
-            if isinstance(items_list, dict): items_list = items_list.get("volumes", items_list.get("chapters", []))
-            if not isinstance(items_list, list): continue
-
-            for item in items_list:
-                try:
-                    if upload_type == "volume":
-                        match = math.isclose(float(item.get("volume_number", -1)), float(file_info["number"]), abs_tol=0.001)
-                    else:
-                        match = math.isclose(float(item.get("chapter_number", -1)), float(file_info["number"]), abs_tol=0.001)
-                except (ValueError, TypeError): match = False
-
-                if match:
-                    item_group_ids = []
-                    if item.get("group_id"): item_group_ids.append(item["group_id"])
-                    for g in item.get("groups", []):
-                        if isinstance(g, dict) and g.get("id"): item_group_ids.append(g["id"])
-                        elif isinstance(g, int): item_group_ids.append(g)
-                    item_scanlator = item.get("scanlator_name") or item.get("scanlator")
-
-                    if group_ids and any(gid in item_group_ids for gid in group_ids):
-                        found_item = item; found = True; break
-
-                    if not group_ids and scanlator_name:
-                        if isinstance(item_scanlator, str) and item_scanlator.strip().lower() == scanlator_name.strip().lower():
-                            found_item = item; found = True; break
-
-          except SessionExpiredError:
-            raise
-          except Exception:
-            continue
-
-    if already_exists:
-        uploader_obj = found_item.get("uploader") if found_item else {}
-        uploader_id  = (found_item.get("uploaded_by") or found_item.get("uploader_id") or found_item.get("user_id")
-                        or (uploader_obj.get("id") if isinstance(uploader_obj, dict) else None)) if found_item else None
-        if current_user_id is not None and uploader_id is not None and str(uploader_id) == str(current_user_id):
-            label = "✅ Already Uploaded"
-        else:
-            label = "✅ Already Exists"
-    else:
-        label = "✅ Uploaded"
-    renderer.update_chapter_status(filename, label, 1.0, current=size, total=size, speed=0.0, eta=0.0)
-    return {"key": filename, "success": True}
 
 # ==============================================================================
 # 🔄 PROCESS UPLOADS
@@ -1528,6 +1525,7 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                             abort_event.set()
                             mark_failed(f_info["filename"], "Paused — authentication expired", "⏸️ Paused (Auth)")
                 except KeyboardInterrupt:
+                    print_warning("Stopping after in-flight uploads finish... (This might take a minute)")
                     abort_event.set()
                     for f in futures:
                         f.cancel()
@@ -1562,7 +1560,7 @@ def _select_manga(req_session, guessed_title):
     while not manga_id:
         m_input = prompt("Search Manga by Title, or enter ID directly", default=guessed_title)
 
-        if m_input.isdigit():
+        try:
             candidate_id = int(m_input)
             with console.status(f"[cyan]Looking up manga ID {candidate_id}...[/cyan]", spinner="dots"):
                 title, cover_url = fetch_manga_brief(candidate_id, req_session)
@@ -1580,6 +1578,8 @@ def _select_manga(req_session, guessed_title):
             else:
                 guessed_title = None
             continue
+        except ValueError:
+            pass
 
         with console.status(f"[cyan]Searching MangaDot for '{m_input}'...[/cyan]", spinner="dots"):
             results = search_manga(m_input, req_session)
@@ -1689,10 +1689,13 @@ def _setup_group_config(directory, req_session):
 
         while not group_ids and not any(per_file_group_map.values()):
             g_input = prompt("Search Group by Name, or enter ID directly")
-            if g_input.isdigit():
-                group_ids = [int(g_input)]
-                selected_group_name = f"ID: {g_input}"
+            try:
+                candidate_id = int(g_input)
+                group_ids = [candidate_id]
+                selected_group_name = f"ID: {candidate_id}"
                 break
+            except ValueError:
+                pass
 
             results = []
             for q in _group_search_queries(g_input):
