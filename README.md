@@ -23,11 +23,11 @@ This tool automatically extracts your session cookies directly from your web bro
 
 ## The Two Versions
 
-Both scripts run on the exact same core engine and contain identical bug fixes and network logic. The only difference is the terminal rendering methodology:
+Both scripts run on the exact same core engine and contain identical bug fixes and network logic. The only difference is the terminal rendering methodology: `mangadot.py` uses the modern `rich`-powered interactive dashboard with live progress bars and inline cover art, while `mangadot_v1.1.3.py` uses the older manual ANSI console logger. Functionally they upload the same way — pick whichever interface you prefer.
 
 ## Repository Structure
 
-- **`mangadot.py`** — The main production release (v1.2.2). It features the full interactive `rich` dashboard, live progress bars, automated dependency checks, and the hardened network layer.
+- **`mangadot.py`** — The main production release (v1.2.3). It features the full interactive `rich` dashboard, live progress bars, automated dependency checks, and the hardened network layer.
 - **`mangadot_v1.1.3.py`** — An archived, legacy backup of the stable v1.1.3 build. It uses the old manual ANSI console logger and lacks the advanced v1.2.x automation features, preserved strictly for regression testing.
 
 ## Prerequisites
@@ -57,11 +57,11 @@ pip install --upgrade requests rookiepy questionary rich
 
 4. *(Optional)* Install `chafa` for inline cover art:
 
-| Platform | Command |
-|---|---|
-| Windows | `winget install hpjansson.Chafa` |
-| macOS | `brew install chafa` |
-| Linux | `sudo apt install chafa` |
+   | Platform | Command |
+   | -------- | ------- |
+   | Windows  | `winget install hpjansson.Chafa` |
+   | macOS    | `brew install chafa` |
+   | Linux    | `sudo apt install chafa` |
 
 ## Usage
 
@@ -105,11 +105,38 @@ Detailed HTTP request data is not saved by default to save disk space, but can b
 
 ## Patch Notes
 
+### v1.2.3
+
+**🛡️ Ghost Chapter & Verification Hardening**
+- **Ownership-Aware Labeling:** The uploader now resolves your MangaDot user ID at login and compares it against the existing chapter's uploader, so duplicates are correctly labeled `✅ Already Uploaded` (yours) vs. `✅ Already Exists` (someone else's).
+- **Create-Conflict Verification:** An HTTP 409 on the initial upload call (chapter already exists) no longer auto-succeeds — it now runs through the same Ghost Chapter verification as a normal upload before being accepted.
+- **Case-Insensitive Scanlator Matching:** Scanlator name verification now ignores capitalization differences to reduce false-negative ghost-chapter flags.
+- **Verification Concurrency Cap:** Limited simultaneous server-side verification polling to 3 in-flight requests, easing API load on large batches.
+
+**🔍 Search & Group Matching**
+- **Fuzzy Group Search:** Scanlator group lookups now automatically retry with camelCase-split and progressively spaced name variations to find groups that don't match an exact-string search.
+- **Proper Query Encoding:** Manga and group searches now use safe URL parameter encoding instead of raw string concatenation, fixing failures on special characters.
+
+**🐛 Mixed-Group & Stability Fixes**
+- **Mixed-Group Mapping Fix:** Files without an explicit group assignment in a mixed-group batch no longer incorrectly inherit the combined group list from other resolved groups in the same run.
+- **Localized API Field Handling:** Manga title, status, description, and alt-titles are now safely unpacked when MangaDot returns them as localized objects, preventing blank or broken confirmation screens.
+- **Batch Completion Safety:** The batch-complete signal is now skipped if a batch chunk had zero successful uploads.
+- **Safer ID Parsing:** Manga ID and Group ID prompts use proper integer parsing instead of `.isdigit()`, avoiding crashes on malformed input.
+- **Sub-1KB File Sizes:** Files smaller than 1KB now display in bytes (e.g. `512 B`) instead of a misleading fractional KB value like `0.05 KB`.
+- **Reworked Proxy Health Check:** Swapped the Cloudflare DNS probe for a dedicated no-content endpoint and ensured `--proxy-no-verify` is actually honored during the health check itself.
+
+**⚡ Performance & UX**
+- **Persistent User-Agent Cache:** Browser/User-Agent detection results are now cached in `~/.mangadot_uploader.json`, skipping repeated registry/plist/CLI lookups on subsequent runs.
+- **Faster Directory Scans:** Switched to `os.scandir` for directory traversal, with zero-byte file detection and hardened corrupt-archive handling.
+- **Cleaner Worker Sessions:** Each upload thread now manages its own `requests.Session` as a context manager and correctly inherits SSL verification settings.
+- **Genres Display:** Added a dedicated "Genres" line to the manga confirmation screen, alongside "Tags".
+- **Graceful Ctrl+C Feedback:** Added an on-screen status message while in-flight uploads finish during an abort.
+
 ### v1.2.2
 
 **🛡️ Security & Routing**
 - **Proxy Tunneling:** Added `--proxy` and `--proxy-no-verify` CLI flags to route traffic through custom network tunnels and bypass MITM SSL errors.
-- **Smart Health Check:** Implemented a secure pre-flight proxy check against `1.1.1.1` with a spoofed User-Agent to seamlessly bypass MangaDot's Cloudflare gate.
+- **Smart Health Check:** Implemented an initial pre-flight proxy check against `1.1.1.1` with a spoofed User-Agent to catch obviously dead proxies before a batch starts.
 
 **🐛 Critical Bug Fixes**
 - **Locale Crash Prevented:** Fixed a `UnicodeDecodeError` in the Chromium CLI version checker on non-UTF-8 Linux distributions.
@@ -120,7 +147,7 @@ Detailed HTTP request data is not saved by default to save disk space, but can b
 - **Graceful Aborts:** Added explicit thread cancellation on `KeyboardInterrupt` (`Ctrl+C`) to instantly kill the executor without traceback vomits.
 - **API Schema Detection:** Added a proactive warning trigger if MangaDot changes its obfuscated search payload structure.
 - **Windows Temp Locking:** Trapped OS-level file locking exceptions during `chafa` image rendering to prevent random crashes.
-- **UI Formatting:** Fixed human-readable size formatting for files under 1MB.
+- **UI Formatting:** Reworked human-readable file size display to use tiered GB/MB/KB units instead of a flat KB-only format.
 
 ### v1.2.0
 
