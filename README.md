@@ -5,18 +5,21 @@ This tool automatically extracts your session cookies directly from your web bro
 
 ## Features
 
-- **No Manual Cookies Needed:** Automatically extracts your active MangaDot session from Chrome, Firefox, Brave, Edge, Opera, or Vivaldi.
+- **No Manual Cookies Needed:** Automatically extracts your active MangaDot session from Chrome, Firefox, Brave, Edge, Opera, Vivaldi, or Zen.
+- **Auto-Scan Login:** Scans every supported browser for a valid MangaDot session on startup and logs in with the first one it finds — no need to pick a browser up front.
+- **CDP Fallback for Chromium Browsers:** If Chrome, Edge, Brave, Vivaldi, or Opera's encrypted cookie store blocks direct extraction, a Chrome DevTools Protocol mode launches an isolated debug profile and reads the session over a WebSocket connection instead.
 - **Auto-Dependency Installer:** Detects missing or outdated packages on startup and installs them automatically — no manual `pip` setup required.
 - **TUS Resumability:** True resumable uploads. If your internet drops on a 200MB volume, it resumes exactly where it left off, including HEAD-based offset recovery for partial-chunk conflicts (HTTP 409).
-- **Concurrent Uploads:** Upload multiple chapters at the same time (up to 10 threads), each with an isolated, high-capacity connection pool.
-- **Bulletproof Retries:** Handles 502/503/429 Cloudflare and server errors gracefully.
-- **Volume & Chapter Support:** Automatically formats titles and numbers properly (e.g., `Vol. 1`, `Chapter 12`).
+- **Concurrent Uploads:** Upload multiple chapters at the same time (up to 30 threads), sharing one pooled, high-capacity connection pool across the whole run.
+- **Bulletproof Retries:** Handles 502/503/429 Cloudflare and server errors gracefully, with abort-aware retry waits so `Ctrl+C` lands immediately instead of after the current backoff.
+- **Volume & Chapter Support:** Automatically formats titles and numbers properly (e.g., `Vol. 1`, `Chapter 12`), with automatic drift correction when chapter numbers and episode labels disagree within a batch.
+- **Dynamic Title Picker:** Auto-detect naming presents a labeled picker of candidate titles (full, without episode/season/chapter label, bare, minimal) built from each filename's structure, memoized per filename "shape" across the batch.
 - **Live Terminal Dashboard:** Full `rich`-powered interactive UI with animated progress bars, cover art rendering, and real-time speed/ETA.
 - **Inline Cover Art:** Renders manga cover art directly in your terminal during confirmation and the final upload summary (requires `chafa`).
 - **Bracket Group Detection:** Automatically extracts scanlator release groups from `[Bracket]` tags in filenames, with intelligent filtering of technical metadata tags (e.g., `[1080p]`).
-- **Mixed-Group Batching:** Chapters with different release groups in the same folder are automatically mapped to their respective group profiles in a single run.
+- **Mixed-Group Batching:** Chapters with different release groups in the same folder are automatically mapped to their respective group profiles in a single run, with a manual Group-ID fallback if a name can't be resolved via search.
 - **Persistent Preferences:** Remembers your last-used library directory across sessions via `~/.mangadot_uploader.json`.
-- **Dynamic User-Agent Spoofing:** Queries your local registry, plist, or CLI to build a User-Agent string from your actual installed browser version.
+- **Dynamic User-Agent Spoofing:** Queries your local registry, plist, or CLI to build a User-Agent string from your actual installed browser version, cached in `~/.mangadot_uploader.json` to skip repeated lookups.
 - **Parallel Processing Safety:** Dynamic error logging with rotating file support allows multiple instances to run simultaneously without log conflicts.
 - **Advanced Naming:** Custom regex extraction and renaming modes for messy filenames.
 - **Optional Routing Proxy:** Supports passing a custom network tunnel directly via the command line to cleanly bypass restrictive regional ISPs or server-side IP blocks.
@@ -27,13 +30,13 @@ Both scripts run on the exact same core engine and contain identical bug fixes a
 
 ## Repository Structure
 
-- **`mangadot.py`** — The main production release (v1.2.3). It features the full interactive `rich` dashboard, live progress bars, automated dependency checks, and the hardened network layer.
+- **`mangadot.py`** — The main production release (v1.3.0). It features the full interactive `rich` dashboard, live progress bars, automated dependency checks, and the hardened network layer.
 - **`mangadot_v1.1.3.py`** — An archived, legacy backup of the stable v1.1.3 build. It uses the old manual ANSI console logger and lacks the advanced v1.2.x automation features, preserved strictly for regression testing.
 
 ## Prerequisites
 
 - **Python 3.12** (the scripts are built specifically for 3.12).
-- You must be **logged in** to [MangaDot.net](https://mangadot.net) on your web browser.
+- You must be **logged in** to [MangaDot.net](https://mangadot.net) on your web browser — Chrome, Firefox, Brave, Edge, Opera, Vivaldi, and Zen are all supported.
 - **`chafa`** *(optional)* — Enables inline cover art rendering in the terminal. Install instructions are shown at startup if missing.
 
 ## Installation
@@ -48,12 +51,12 @@ cd mangadot_uploader
 2. Install the required dependencies:
 
 ```bash
-pip install --upgrade requests rookiepy questionary rich
+pip install --upgrade requests rookiepy questionary rich websocket-client
 ```
 
 > **Note:** As of v1.2.0, the script also auto-installs missing or outdated packages on launch. Manual installation is only necessary for the very first run.
 
-3. Ensure your browser is completely **closed** before running the script so it can successfully extract your session cookies.
+3. Ensure your browser is completely **closed** before running the script so it can successfully extract your session cookies — unless you're using the **CDP mode** for a Chromium browser (see [Troubleshooting Cookies](#troubleshooting-cookies-windows) below), which launches its own isolated debug profile instead.
 
 4. *(Optional)* Install `chafa` for inline cover art:
 
@@ -79,7 +82,7 @@ or
 py -3.12 mangadot_v1.1.3.py
 ```
 
-3. Follow the on-screen prompts to select your browser, search for the target manga, assign scanlator groups, and start the upload.
+3. The script automatically scans all your installed browsers for a valid MangaDot session and logs in with the first one it finds. If none succeed, you'll get a manual picker (including a CDP option for Chromium browsers — see [Troubleshooting Cookies](#troubleshooting-cookies-windows) below). From there, follow the on-screen prompts to search for the target manga, assign scanlator groups, and start the upload.
 
 ## Advanced Usage (Command Line Flags)
 
@@ -89,13 +92,13 @@ py -3.12 mangadot_v1.1.3.py
 | `--dry-run` | Scans your directory, parses filenames, and flags missing chapters without uploading anything. |
 | `--debug` | Dumps all HTTP traffic to `api_requests.log` using a rotating 10MB file system (3-file backup limit). |
 | `--library <path>` | Opens the interactive manga picker directly inside your parent library folder instead of typing a path manually. |
-| `--verify-timeout <seconds>` | Overrides how long the script waits for the server to confirm a successful upload before marking it as timed out (default: 60 seconds). |
+| `--verify-timeout <seconds>` | Overrides how long the script waits for the server to confirm a successful upload before marking it as timed out (default: 60 seconds). Must be a positive integer. |
 | `--proxy <url>` | *(Optional)* Tunnel all HTTP/HTTPS traffic through a specific custom proxy server to bypass regional ISP restrictions or server-side Cloudflare blocks. |
 | `--proxy-no-verify` | *(Optional)* Disables SSL certificate verification. Use only if your proxy actively intercepts TLS traffic (MITM). |
 
 ## Troubleshooting Cookies (Windows)
 
-If you are using Chrome or Edge v130+, they require Administrator privileges to extract cookies. Right-click your terminal and select **Run as Administrator**, or use Firefox instead.
+If you are using Chrome, Edge, Brave, Vivaldi, or Opera, their encrypted cookie stores often block direct extraction outright (not just on v130+ with elevated privileges). If direct extraction fails or you'd rather not run as Administrator, select that browser's **`(CDP)`** option from the manual browser picker instead — it launches an isolated debug profile for that browser and reads your session over its DevTools Protocol port, sidestepping the encrypted store entirely. Zen and Firefox are read directly from disk and don't need CDP or elevated privileges.
 
 ## Log Files
 
@@ -104,6 +107,33 @@ If any uploads fail permanently, the script will generate a timestamped file (e.
 Detailed HTTP request data is not saved by default to save disk space, but can be enabled by running the script with the `--debug` flag.
 
 ## Patch Notes
+
+### v1.3.0
+
+**🔑 Browser & Session Handling**
+- **Zen Browser Support:** Session cookies can now be read directly from Zen's Gecko-based profile store, with automatic profile discovery and a safe fallback copy if the live database is locked.
+- **CDP Fallback for Chromium Browsers:** Chrome, Edge, Brave, Vivaldi, and Opera now have a `(CDP)` mode that launches an isolated debug profile and reads your session over a WebSocket connection, bypassing the encrypted cookie stores that normally block direct extraction from these browsers.
+- **Auto-Scan Login:** The uploader now automatically scans every supported browser for a valid MangaDot session on startup instead of defaulting to one browser, stopping at the first successful match.
+
+**🏷️ Smarter Naming**
+- **Dynamic Title Picker:** Auto-detect naming now always shows a labeled picker of candidate titles (full, without episode/season/chapter label, bare, minimal) built dynamically from each filename's structure, and remembers your choice per detected filename "shape" so you're not asked twice for the same layout.
+- **Episode/Chapter Drift Correction:** Chapter numbers and episode labels that disagree within a batch are now reconciled and interpolated instead of one silently overriding the other.
+- **Group Detection Across Mixed Batches:** Filename group-tag scanning now collects every unique group name seen in the folder instead of only the single most common one.
+- **Manual Group-ID Fallback:** If a group name can't be resolved via search, you can now type its numeric MangaDot Group ID directly instead of losing that mapping.
+
+**⚡ Performance & Reliability**
+- **Higher Thread Ceiling:** Parallel uploads raised from 1–10 (default 3) to 1–30 (default 5), with an on-screen heads-up about Cloudflare rate-limiting at high thread counts.
+- **Shared Connection Pool:** Upload workers now share one pooled session for the whole run instead of opening and closing a new one per chunk.
+- **Ghost Chapter Verification Pagination:** Post-upload verification now pages through the server's full chapter/volume listing instead of only checking the first page.
+- **Interruptible Retries:** Retry and verification waits now check for abort every 100ms, so `Ctrl+C` and session-expiry aborts take effect immediately instead of waiting out the current backoff.
+- **TUS Offset Recovery:** Falls back to an explicit `HEAD` offset check if the server confirms a chunk without returning its new offset.
+- **Natural Sort Fix:** Numeric sorting no longer misreads a filename separator hyphen (e.g. `Chapter-5`) as a negative number.
+
+**🐛 Fixes**
+- **Unverified-Upload Warning:** Files with no resolvable group now upload with a clear `⚠️ Uploaded (Unverified — no group)` status instead of the generic success label.
+- **Stale CDP Process Safety:** Verifies a tracked PID still belongs to the expected browser before killing it when relaunching CDP mode.
+- **`--verify-timeout` Validation:** Now requires a positive integer instead of silently accepting invalid values.
+- Removed a dead, unused `ctypes` import.
 
 ### v1.2.3
 
