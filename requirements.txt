@@ -3,4 +3,8 @@ rookiepy==0.5.6
 questionary==2.0.1
 rich==14.1.0
 colorama==0.4.6
+<<<<<<< HEAD
 urllib3==2.7.0
+=======
+urllib3==2.7.0
+>>>>>>> 5ceb6dd8a44b4209bdf014879551011e6ed767fd
