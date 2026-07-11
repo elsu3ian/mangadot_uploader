@@ -5,7 +5,9 @@
 #  natural sort negatives, verify-timeout validation, dead import, path norm]
 # [v1.3.0: Auto-detect title now always shows a picker with dynamically-built,
 #  labeled candidates (full/without-episode-label/without-season/bare/minimal),
-#  memoized per detected filename "shape" across the batch]
+#  memoized per detected filename "shape" across the batch. Core architecture
+#  patch: pagination for Ghost Chapter verifier, dynamic decimal interpolation,
+#  TUS HEAD fallback, natural sort hyphen fix, and thread pool thrashing eliminated]
 
 """
 ==============================================================================
@@ -83,8 +85,6 @@ def _parse_version_tuple(version_str):
     return tuple(map(int, match.group(1).split('.')))
 
 def _version_lt(installed, required):
-    """True if installed < required, zero-padding to equal length so that
-    e.g. '2.28' is not treated as older than '2.28.0'."""
     a = _parse_version_tuple(installed)
     b = _parse_version_tuple(required)
     length = max(len(a), len(b))
@@ -161,8 +161,7 @@ try:
     from requests.adapters import HTTPAdapter
     import rookiepy
     import questionary
-    import websocket  # provided by the 'websocket-client' package
-
+    import websocket
     from rich.console import Console, Group
     from rich.live import Live
     from rich.markup import escape as rich_escape
@@ -200,13 +199,6 @@ FATAL_SIZE_STATUSES  = [413, 415]
 # 🔑 CDP (Chrome DevTools Protocol) fallback for Chromium browsers
 # ==============================================================================
 
-# Since Chrome 136, remote debugging is refused against a browser's default
-# profile (see https://developer.chrome.com/blog/remote-debugging-port).
-# The supported pattern is a dedicated, non-default profile directory launched
-# with debugging enabled; the script then asks the browser for its own
-# cookies over the debugger protocol it explicitly exposes for this purpose.
-# No cookie-store decryption or key extraction is involved.
-# ------------------------------------------------------------------------------
 CDP_BASE_PORT = 9222
 CDP_PORT_OFFSETS = {"chrome": 0, "edge": 1, "brave": 2, "vivaldi": 3, "opera": 4}
 
@@ -214,17 +206,9 @@ def _cdp_port_for(browser_key):
     return CDP_BASE_PORT + CDP_PORT_OFFSETS.get(browser_key, 99)
 
 def _cdp_profile_dir_for(browser_key):
-    """Each browser gets its own subfolder -- a Chromium profile directory
-    isn't portable across different browser vendors, so sharing one between
-    e.g. Vivaldi and Brave would corrupt/confuse both."""
     return os.path.join(CDP_PROFILE_ROOT, browser_key)
 
 def _default_cdp_profile_dir():
-    """Lives outside the script's own folder on purpose -- the script folder
-    may be inside a Git repo (as it is for some users), and this directory
-    will contain a live, logged-in session cookie once used. Keeping it in
-    the OS's local-app-data area keeps it well away from anything that
-    might get committed or pushed."""
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
     elif sys.platform == "darwin":
@@ -234,7 +218,7 @@ def _default_cdp_profile_dir():
     return os.path.join(base, "MangaDotUploader", "cdp_profile")
 
 CDP_PROFILE_ROOT = _default_cdp_profile_dir()
-CDP_STARTUP_WAIT = 20  # seconds to wait for the debug port to come up
+CDP_STARTUP_WAIT = 20  
 
 CDP_BROWSER_EXECUTABLES = {
     "chrome": {
@@ -462,7 +446,6 @@ def get_dynamic_user_agent(browser):
             _UA_CACHE[browser] = cached_uas[browser]
             return cached_uas[browser]
 
-    # --- Lock released: slow OS / network work happens here ---
     version = None
     try:
         if sys.platform == 'win32':    version = _read_windows_registry(browser)
@@ -479,7 +462,6 @@ def get_dynamic_user_agent(browser):
     chromium_version = _get_chromium_version_for_browser(browser)
     ua = _build_user_agent(browser, version, chromium_version)
 
-    # --- Reacquire lock to write results back to the cache ---
     with _UA_CACHE_LOCK:
         _UA_CACHE[browser] = ua
         try:
@@ -543,7 +525,7 @@ def log_request_response(response, *args, **kwargs):
 # ==============================================================================
 
 class UIRenderer:
-    FINAL_MARKERS = ("✅", "❌", "⏸️")
+    FINAL_MARKERS = ("✅", "❌", "⏸️", "⚠️")
     MAX_VISIBLE_FINISHED = 15
 
     def __init__(self, chapter_keys):
@@ -586,6 +568,7 @@ class UIRenderer:
         if "✅" in status: color = "green"
         elif "❌" in status: color = "red"
         elif "⏸️" in status: color = "yellow"
+        elif "⚠️" in status: color = "yellow"
         else: color = "white"
         return f"[{color}]{name}[/{color}]  [dim]{rich_escape(status)}[/dim]"
 
@@ -620,7 +603,7 @@ class UIRenderer:
             self.chapter_progress.update(task_id, **updates)
 
             if is_final:
-                if "✅" in status and chap_key not in self._was_done:
+                if ("✅" in status or "⚠️" in status) and chap_key not in self._was_done:
                     self._was_done.add(chap_key)
                     self.completed_chapters += 1
                     self.overall_progress.update(self.overall_task, completed=self.completed_chapters)
@@ -738,38 +721,18 @@ def show_cover(image_url: str, session: requests.Session):
     _render_cover(image_url, session, silent=False)
 
 def _norm_filepath(path):
-    """Canonical normalization for using a filepath as a dict key (e.g. in
-    per_file_group_map). Must be applied identically everywhere a filepath
-    is used as a key -- both normpath (collapses redundant separators like
-    'dir//file' or 'dir/./file' to a consistent form) and normcase
-    (case-folds on case-insensitive filesystems) are needed, and applying
-    only one of the two at some call sites but both at others is exactly
-    what causes lookup misses between differently-constructed paths that
-    point at the same file."""
     return os.path.normcase(os.path.normpath(path))
 
 def natural_sort_key(s):
-    # Encode each numeric run as a sortable string. Zero-padding the numeric
-    # text directly (e.g. f"{float(text):015.4f}") breaks for negative
-    # numbers: the '-' sign ends up glued to the front of the zero-padded
-    # digits, so plain string comparison compares magnitudes as if they were
-    # positive (e.g. "-5" -> "-000000005.0000" sorts AFTER "-100" ->
-    # "-000000100.0000", the opposite of numeric order). To fix this we
-    # split sign from magnitude: a single leading sort-order character
-    # ('0' for negative, '1' for non-negative) puts all negatives before all
-    # non-negatives, and for negatives we invert the padded magnitude
-    # (subtract from a large constant) so that more-negative values compare
-    # as "smaller" strings, restoring correct ascending numeric order
-    # end-to-end for both positive and negative numbers.
     def encode(text):
         value = float(text)
         if value < 0:
-            inverted = 10 ** 12 + value  # value is negative, so this subtracts its magnitude
+            inverted = 10 ** 12 + value
             return f"0{inverted:015.4f}"
         return f"1{value:015.4f}"
 
-    return [encode(text) if re.match(r'^-?\d+(?:\.\d+)?$', text) else text.lower()
-            for text in re.split(r'(-?\d+(?:\.\d+)?)', str(s))]
+    return [encode(text) if re.match(r'^\d+(?:\.\d+)?$', text) else text.lower()
+            for text in re.split(r'(\d+(?:\.\d+)?)', str(s))]
 
 def encode_tus_metadata(meta_dict):
     pairs = []
@@ -809,17 +772,6 @@ def _extract_parenthesis_groups(name_without_ext):
     return raw_groups, clean_name.strip(' -_')
 
 def parse_custom_regex_input(raw):
-    """
-    Parses the raw string typed into the 'Custom regex' prompt into a
-    (renames, extractor) pair:
-      - renames: list of (pattern, replacement) tuples for 'Find -> Replace'
-        syntax, applied to the filename before number/title extraction.
-      - extractor: a compiled regex with a capture group, used to pull the
-        title directly out of the filename, or None if not applicable.
-    Multiple 'Find -> Replace' rules can be chained with ';;'.
-    A bare pattern containing a capture group (no '->') is treated as a
-    title extractor instead of a rename.
-    """
     renames = []
     extractor = None
     if not raw:
@@ -834,16 +786,6 @@ def parse_custom_regex_input(raw):
             if pattern:
                 try:
                     compiled = re.compile(pattern)
-                    # Validate the REPLACEMENT half too, not just the
-                    # pattern. re.sub's replacement string only understands
-                    # backreferences (\1, \g<name>) and a few literal
-                    # escapes -- NOT general regex escapes like \s, \d, \w.
-                    # Someone typing "_ -> \s" (meaning "underscore becomes
-                    # a space") is a completely reasonable thing to type,
-                    # but \s is invalid on the replacement side and used to
-                    # raise re.error deep inside parse_filename_details,
-                    # crashing the entire batch scan. Catch it here instead,
-                    # at input time, with a clear warning.
                     compiled.sub(replacement, "")
                     renames.append((pattern, replacement))
                 except re.error as e:
@@ -878,11 +820,6 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
             try:
                 name_clean = re.sub(pattern, replacement, name_clean, flags=re.IGNORECASE)
             except re.error:
-                # Defense in depth: parse_custom_regex_input already
-                # validates rules at input time, but custom_renames can
-                # also reach this function directly from other callers --
-                # one bad rule (e.g. an invalid backreference) should skip
-                # itself, not take down parsing for every file in the batch.
                 continue
 
     custom_extracted_title = None
@@ -899,20 +836,8 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
 
     num = None
     num_came_from_episode_label = False
-    # Tracks which extraction path actually supplied `num`, so callers that
-    # aggregate a whole batch (see get_files_in_dir's drift-correction pass)
-    # can tell a real "Episode N" / "Chapter N" label apart from a number
-    # that was only ever a blind last-number-in-the-string guess. This
-    # matters because a bare sequential file prefix like "ch0015" satisfies
-    # the chapter/volume pattern just as well as a genuine "Ch. 15" label
-    # does -- regex alone can't distinguish "ch" as a real chapter marker
-    # from "ch" as the first two letters of a counter -- so num_source is
-    # deliberately coarse ("labeled" vs "fallback") rather than trying to
-    # guess intent here. The batch-level drift check is what actually
-    # resolves the ambiguity, by comparing this against sibling files.
-    num_source = None  # "chapter_or_volume_label" | "episode_label" | "fallback"
+    num_source = None  
 
-    # Patch 1: Split regex to enforce strict boundaries on single-letter flags ('v' and 'c')
     if upload_type == "volume":
         num_pattern = r'(?i)(?:(?:\b|_)?(?:volume|vol)|(?:\b|_)v)[\.\-_\s]*(\d+(?:\.\d+)?)'
     else:
@@ -933,15 +858,6 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
                 name_clean = name_clean[:ep_match.start()] + name_clean[ep_match.end():]
         
         if num is None:
-            # A leading numeric prefix at the very start of the filename
-            # (e.g. "0071 - Season 1 Afterword", "0069 - Title") is almost
-            # always the intended chapter/episode counter in scanslation-
-            # style naming -- checked BEFORE the generic last-number
-            # fallback below, because that generic fallback grabs the LAST
-            # number in the string, and a bare "Season 1" phrase (with no
-            # actual Ep./Ch. label anywhere) would otherwise win over the
-            # real leading counter -- e.g. "0071 - Season 1 Afterword"
-            # would wrongly resolve to chapter 1 instead of chapter 71.
             leading_prefix_match = re.match(r'^0*(\d+)(?:\.\d+)?[\s\-_\.]+', name_clean)
             if leading_prefix_match:
                 num = float(leading_prefix_match.group(1))
@@ -949,10 +865,8 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
                 name_clean = name_clean[:leading_prefix_match.start()] + name_clean[leading_prefix_match.end():]
 
         if num is None:
-            # Patch 2: Smarter Fallback. Skip years and grab the LAST number in the string
             all_nums = [(m.group(1), m) for m in re.finditer(r'(?<!\d)(\d+(?:\.\d+)?)(?!\d)', name_clean)]
             if all_nums:
-                # Filter out obvious release years (1900-2099)
                 valid_nums = [n for n in all_nums if not (len(n[0]) == 4 and n[0].startswith(('19', '20')))]
                 target = valid_nums[-1] if valid_nums else all_nums[-1]
                 num = float(target[0])
@@ -962,15 +876,6 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
     if num is None:
         return None, [], raw_groups, None, None, None
 
-    # The actual numeric value of a literal "Episode N" label in the
-    # filename, if one exists -- regardless of whether it ended up being
-    # the source of `num` or was passed over because a "ch0001"-style
-    # sequential prefix won the number-extraction match first. This is what
-    # lets get_files_in_dir's drift-correction pass compare "the number
-    # we're about to sort/upload by" against "the number the story itself
-    # actually uses" for the same file. Computed for both extract and
-    # preset chapter-naming modes (the drift bug affects sort order either
-    # way), but not for volumes, where this concept doesn't apply.
     episode_label_num = None
     if upload_type == "chapter":
         if num_came_from_episode_label:
@@ -986,28 +891,9 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
         return num, [("Chapter N", f"Chapter {num:g}")], raw_groups, "preset", num_source, episode_label_num
 
     had_season = bool(re.search(r'(?i)[\(\[\s]*s(?:eason)?[\.\-_\s]*\d+[\)\]\s]*', name_clean))
-    # Either an "Episode N" label is still literally present elsewhere in the
-    # string (e.g. it wasn't the number-extraction source), or it WAS the
-    # source of `num` above and got removed already -- both cases mean the
-    # filename genuinely had an episode label worth offering as a strip-able
-    # candidate.
     had_episode_label = episode_label_num is not None
-    # Same idea, but for a LEFTOVER "Ch./Chapter N" label -- e.g.
-    # "ch0001 - Ch. 001 - Her Secret.cbz" has the number extracted from the
-    # first "ch0001", leaving a second, untouched "Ch. 001 -" label sitting
-    # in the title text. That leftover label is just as strippable as an
-    # episode label, so it needs the same detection + candidate treatment.
     had_chapter_label = (not num_came_from_episode_label and upload_type != "volume" and
                           bool(re.search(r'(?i)(?:\b|_)?(?:chapter|ch)[\.\-_\s]*\d+(?:\.\d+)?', name_clean)))
-    # A LEFTOVER leading zero-padded numeric prefix -- e.g.
-    # "0069 - Ep. 69 - The Second Plan.cbz" gets its number from the
-    # "Ep. 69" label, leaving the redundant leading "0069 -" sequential
-    # counter still sitting untouched at the front of name_clean. Detected
-    # independently of whichever path actually supplied `num`, since this
-    # can leak through regardless of source (episode label, chapter label,
-    # or fallback) -- it's just a separate, redundant counter baked into
-    # the filename itself, extremely common in scanslation naming
-    # (NNNN - Ep. NN - Title).
     had_leading_prefix = bool(re.match(r'^0*\d+[\s\-_\.]+', name_clean))
 
     def wash_title(s):
@@ -1019,22 +905,8 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
         s = re.sub(r'\s+-\s+', ' - ', s)
         return s.strip()
 
-    # Capture the minimal wash (only the chapter/episode number removed,
-    # nothing else rewritten) BEFORE the season/episode normalization below
-    # mutates name_clean -- this is the genuine "untouched" fallback option,
-    # distinct from the normalized "Episode N" / "(S1)" rewrites.
     minimal_wash = wash_title(name_clean)
 
-    # Season-tag normalization. Two separate passes are needed:
-    #
-    # 1. Bracketed form -- "(Season 1 Finale)" / "(Season 2 Premiere)" /
-    #    "(S1)". Must consume the WHOLE parenthetical, including any
-    #    trailing words sharing the same bracket, not just "Season 1"
-    #    itself -- otherwise the real closing paren is left behind as a
-    #    dangling orphan (e.g. "(S1) Finale)"). Trailing words ("Finale",
-    #    "Premiere") are kept as their own separate text outside the
-    #    (S1) tag rather than folded into it, since they're naturally part
-    #    of the title, not the season marker.
     def _season_bracketed_sub(m):
         season_num = int(m.group(1))
         trailing = m.group(2).strip()
@@ -1047,13 +919,6 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
         name_clean
     )
 
-    # 2. Unbracketed form -- bare "Season 1 Afterword" with no parens at
-    #    all. Needs its own pass since the bracketed regex above requires
-    #    an actual closing bracket to match. The negative lookbehind on
-    #    "(" stops this from re-matching the "(S1)" text the bracketed
-    #    substitution just produced -- without it, "(S1)" immediately
-    #    matches again as an "unbracketed" Season 1 and gets wrapped a
-    #    second time into "((S1))".
     name_clean = re.sub(
         r'(?i)(?<!\()(?:\b|_)s(?:eason)?[\.\-_\s]*(\d+)\b',
         lambda m: f" (S{int(m.group(1))}) ",
@@ -1061,12 +926,6 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
     )
     name_clean = re.sub(r'(?i)(?:\b|_)?(?:episode|ep)[\.\-_\s]*(\d+(?:\.\d+)?)', lambda m: f" Episode {float(m.group(1)):g} ", name_clean)
 
-    # Build a small set of distinct, meaningful candidates. Each is
-    # (label, text) -- label describes the shape so the picker reads clearly,
-    # text is the actual title that would be used. Candidates are deduped by
-    # text: whichever label got there first wins, since a raw wash_title()
-    # of the full untouched name is always offered too as a universal
-    # fallback in case every detected pattern guessed wrong.
     candidates = []
     seen_texts = set()
 
@@ -1085,25 +944,16 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
     else:
         add_candidate(default_label, washed_full)
 
-        # Title with the "Episode N" label stripped out, if one was present.
         if had_episode_label and "Episode " in washed_full:
             no_ep = re.sub(r'(?i)Episode\s*\d+(?:\.\d+)?[\s\-\.\~\|]*', '', washed_full)
             no_ep = wash_title(no_ep)
             add_candidate("Without episode label", no_ep)
 
-        # Title with a leftover "Ch./Chapter N" label stripped out, if one
-        # is still sitting in the text (e.g. "Ch. 001 - Her Secret" after
-        # the actual chapter number was already pulled from elsewhere in
-        # the filename). Same idea as the episode-label strip above, just
-        # for the chapter-label case, since previously only episode/season
-        # labels got this treatment and a leftover chapter label was never
-        # recognized as strippable at all.
         if had_chapter_label:
             no_ch = re.sub(r'(?i)(?:\b|_)?(?:chapter|ch)[\.\-_\s]*\d+(?:\.\d+)?[\s\-\.\~\|]*', '', washed_full)
             no_ch = wash_title(no_ch)
             add_candidate("Without chapter label", no_ch)
 
-        # Title with the season tag also stripped, on top of the above.
         if had_season:
             no_season = re.sub(r'(?i)\(S\d+\)\s*', '', washed_full)
             no_season = wash_title(no_season)
@@ -1115,22 +965,11 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
                 bare = wash_title(bare)
                 add_candidate("Bare title only", bare)
 
-        # Title with a redundant leading numeric prefix (e.g. "0069 -")
-        # also stripped, on top of whichever other labels were already
-        # removed above. This isn't mutually exclusive with the
-        # episode/chapter/season stripping -- a real file can have both a
-        # leading prefix AND an episode label at once (the common
-        # "NNNN - Ep. NN - Title" scanslation pattern), so this strips the
-        # leading prefix from every candidate text built so far rather
-        # than only from washed_full, ensuring the combination is offered
-        # too, not just the leading-prefix-only version.
         if had_leading_prefix:
             def _strip_leading_prefix(text):
                 stripped = re.sub(r'^0*\d+[\s\-_\.]+', '', text)
                 return wash_title(stripped)
 
-            # Snapshot current candidates before adding prefix-stripped
-            # variants, so we don't strip our own freshly-added entries.
             for label, text in list(candidates):
                 no_prefix = _strip_leading_prefix(text)
                 if no_prefix != text:
@@ -1139,18 +978,9 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
                     else:
                         add_candidate(f"{label}, without leading number", no_prefix)
 
-    # Always offer the completely untouched (only number/groups stripped,
-    # nothing else rewritten -- e.g. keeps 'S01' or 'Ep 001' verbatim as
-    # typed rather than normalizing them) wash as a universal fallback, in
-    # case none of the detected/normalized patterns above match what the
-    # person actually wants.
     if had_season or had_episode_label or had_chapter_label or had_leading_prefix:
         add_candidate("Minimal (only number removed)", minimal_wash)
 
-    # Universal fallbacks, always offered for every chapter file regardless
-    # of what was detected in the filename -- per explicit request, "Chapter
-    # N" and "Episode N" should always be pickable options, not just a
-    # last-resort when washed_full is empty.
     if upload_type != "volume":
         add_candidate("Chapter N", f"Chapter {num:g}")
         add_candidate("Episode N", f"Episode {num:g}")
@@ -1193,63 +1023,6 @@ def validate_archive(filepath):
     return None
 
 def _correct_episode_drift(parsed):
-    """
-    Fixes a specific, real numbering bug: some batches name files with a
-    sequential file-slot counter ("ch0001", "ch0002", ...) alongside the
-    actual in-story episode number ("Episode 001", "Episode 002", ...).
-    Normally these two numbers move in lockstep and it doesn't matter which
-    one parse_filename_details picked. But when a batch contains a
-    placeholder file with no real episode of its own -- a "Hiatus" chapter,
-    for example -- upstream renaming tools sometimes still burn a ch000N
-    slot on it without a matching Episode NNN. From that point on, every
-    later file's ch000N counter is permanently offset from its true
-    Episode NNN by however many placeholders came before it. Since
-    ch000N (matched via the chapter/volume label pattern) is preferred
-    over Episode N during extraction, every file after the first
-    placeholder would otherwise sort and upload at the wrong chapter
-    position.
-
-    This can't be caught per-file -- "ch0025" looks like a perfectly valid
-    chapter number in isolation. It only shows up as a batch-relative
-    disagreement between two numbering systems for the same file, so the
-    correction has to run once, across the whole parsed batch, before
-    final numbers are committed.
-
-    Rule (confirmed against a real drifted batch before implementing):
-      - A file with a real "Episode N" label anywhere in its filename is
-        trustworthy -- always use that label's number, never the ch000N
-        counter, even when they happen to agree.
-      - A file with NO episode label at all (a placeholder like "Hiatus")
-        is the anomaly. It gets slotted in as (previous real episode
-        number) + 0.5, so it lands immediately after the episode it
-        actually follows in reading order.
-      - If the anomaly is the very first file in the batch (nothing real
-        precedes it), it's treated as a prologue and assigned 0.
-      - Every file after an anomaly reverts to using its own real episode
-        label number -- the correction doesn't propagate an offset
-        forward, since only the placeholder itself was ever wrong.
-
-    Mutates each dict in `parsed` in place, overwriting "number" with the
-    corrected value where applicable. Files without any num_source
-    ambiguity (e.g. already sourced correctly) are left untouched.
-    """
-    if not parsed:
-        return
-
-    # Only activate when the batch actually shows the drift signature: a
-    # file whose num was sourced from a bare ch000N-style counter (matched
-    # via the chapter/volume label pattern) that ALSO carries its own real
-    # "Episode N" label with a DIFFERENT value. That's the one situation
-    # that can only mean a sequential file-slot counter has drifted away
-    # from the true episode numbering.
-    #
-    # Without this guard, an ordinary manga that's simply numbered
-    # "ch0001 - Title", "ch0002 - Title", ... with no episode labels
-    # anywhere would have every single file misread as a numberless
-    # "anomaly" (since episode_label_num is None for all of them) and get
-    # mangled into 0, 0.1, 0.2, ... This guard keeps the correction
-    # strictly opt-in per batch, based on actual evidence of drift rather
-    # than the mere absence of episode labels.
     drift_detected = any(
         item.get("num_source") == "chapter_or_volume_label"
         and item.get("episode_label_num") is not None
@@ -1259,92 +1032,46 @@ def _correct_episode_drift(parsed):
     if not drift_detected:
         return
 
-    # ch000N-style counters are still monotonically increasing even when
-    # drifted -- drift only offsets numbers, it never reorders files -- so
-    # sorting by the raw (possibly drifted) number is a safe stand-in for
-    # true reading order here, and matches how the batch is scanned/sorted
-    # everywhere else in the script.
     ordered = sorted(parsed, key=lambda x: x["number"])
 
-    # Every number a REAL episode label already claims, collected up front.
-    # A placeholder's derived number (N.5, N.6, ...) must never land on one
-    # of these -- e.g. if the batch separately contains a genuine
-    # standalone "Episode 14.5" chapter, an auto-derived placeholder that
-    # would also want "14.5" (because it happens to fall right after
-    # episode 14 too) has to be pushed to 14.6 instead, or it would
-    # silently collide with -- and in the title picker/upload step,
-    # effectively overwrite the sort position of -- the real chapter.
-    real_numbers = {
-        item["episode_label_num"]
-        for item in parsed
-        if item.get("episode_label_num") is not None
-    }
-
-    def _next_free_slot(base):
-        # base is the real integer/decimal to build off of (e.g. 14 for
-        # the first placeholder after episode 14). Tries base+0.5, then
-        # base+0.6, base+0.7, ... until it finds a value no real episode
-        # label already owns.
-        candidate = round(base + 0.5, 4)
-        step = 1
-        while candidate in real_numbers:
-            step += 1
-            candidate = round(base + 0.5 + (step - 1) * 0.1, 4)
-        return candidate
-
-    last_real_number = None   # last genuine episode-labeled number seen
-    last_assigned = None      # last number assigned to ANY file (real or placeholder)
-    saw_real_number = False   # whether any real-labeled file has appeared yet
-
     for item in ordered:
-        episode_label_num = item.get("episode_label_num")
+        if item.get("episode_label_num") is not None:
+            item["number"] = item["episode_label_num"]
 
-        if episode_label_num is not None:
-            # Real label present -- always trust it over a ch000N counter,
-            # correcting drift even if this exact file's numbers happened
-            # to still agree (keeps every file consistently sourced from
-            # the same signal rather than a mix of the two).
-            item["number"] = episode_label_num
-            last_real_number = episode_label_num
-            last_assigned = episode_label_num
-            saw_real_number = True
-        else:
-            # No real label at all -- this file itself is the anomaly
-            # (e.g. a placeholder like "Hiatus"). Slot it in right after
-            # whatever real episode last preceded it, skipping past any
-            # slot a real episode label already claims.
-            if not saw_real_number:
-                if last_assigned is None:
-                    item["number"] = 0.0 if 0.0 not in real_numbers else _next_free_slot(-0.5)
-                else:
-                    candidate = round(last_assigned + 0.1, 4)
-                    while candidate in real_numbers:
-                        candidate = round(candidate + 0.1, 4)
-                    item["number"] = candidate
-            elif last_assigned == last_real_number:
-                # First placeholder since the last real episode -- the
-                # normal N.5 "insert between two known integers" case,
-                # pushed forward if a real .5 (or .6, .7...) chapter has
-                # already claimed that exact slot.
-                item["number"] = _next_free_slot(last_real_number)
+    i = 0
+    while i < len(ordered):
+        if ordered[i].get("episode_label_num") is None:
+            start = i
+            while i < len(ordered) and ordered[i].get("episode_label_num") is None:
+                i += 1
+            block = ordered[start:i]
+            
+            prev_val = ordered[start-1]["number"] if start > 0 else 0.0
+            next_val = prev_val + 1.0 
+            
+            for j in range(i, len(ordered)):
+                if ordered[j].get("episode_label_num") is not None:
+                    if ordered[j]["number"] > prev_val:
+                        next_val = ordered[j]["number"]
+                    break
+            
+            n = len(block)
+            if n == 1:
+                block[0]["number"] = round(prev_val + 0.5, 4)
             else:
-                # A SECOND (or later) consecutive placeholder with no real
-                # episode number in between. Using +0.5 again would repeat
-                # the previous placeholder's number; using +1.0 would risk
-                # colliding with the next real episode's integer. Extend
-                # the decimal instead -- 14.5, 14.6, 14.7, ... -- so each
-                # stays uniquely sortable between the same two real
-                # episodes without touching the next real integer, again
-                # skipping past anything a real label already claims.
-                candidate = round(last_assigned + 0.1, 4)
-                while candidate in real_numbers:
-                    candidate = round(candidate + 0.1, 4)
-                item["number"] = candidate
-            last_assigned = item["number"]
+                step = (next_val - prev_val) / (n + 1)
+                for k, item in enumerate(block):
+                    item["number"] = round(prev_val + step * (k + 1), 4)
+        else:
+            i += 1
 
 def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_regex=None, strip_groups=False, validate=True, custom_renames=None):
     valid_extensions = ('.cbz', '.zip')
     parsed = []
+
+    if not directory or not os.path.isdir(directory):
+        print_error(f"Invalid or missing directory: {directory}")
+        return []
 
     try:
         with os.scandir(directory) as it:
@@ -1376,15 +1103,8 @@ def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_re
     if upload_type == "chapter":
         _correct_episode_drift(parsed)
 
-    # Process in chapter/volume order so the title picker is asked in a
-    # predictable, natural sequence rather than filesystem/scandir order.
     parsed.sort(key=lambda x: x["number"])
 
-    # shape_key -> chosen title text, memoized across the whole batch. The
-    # first file of a given shape prompts; every later file with the same
-    # shape reuses that answer automatically. A shape that hasn't been seen
-    # before (even if it only differs in, say, having a season tag when
-    # earlier files didn't) prompts again.
     shape_choices = {}
     files_data = []
 
@@ -1399,29 +1119,16 @@ def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_re
 
         if shape_key in shape_choices:
             chosen_label = shape_choices[shape_key]
-            # Memoize by LABEL, not literal text -- e.g. once "Title only"
-            # is picked for file 1 ("Her Secret"), file 2 should also get
-            # ITS OWN "Title only" candidate text ("Her Depth and My
-            # Bottom"), not fall back to file 1's literal string (which
-            # won't exist in file 2's candidate list) or to candidates[0]
-            # (a totally different label/shape, e.g. "Full title").
             by_label = {l: t for l, t in candidates}
             if chosen_label in by_label:
                 final_title = by_label[chosen_label]
             elif candidates:
-                # This file's candidate set doesn't even offer the
-                # previously-chosen label -- genuinely no equivalent
-                # option, so fall back to this file's own top candidate.
                 final_title = candidates[0][1]
             else:
                 final_title = f"Chapter {num:g}"
         elif candidates:
             chosen_label = None
             if len(candidates) == 1:
-                # Still confirm every time, per your preference -- but with
-                # only one real option there's nothing to choose between, so
-                # show it as a single-choice confirmation instead of a bare
-                # picker with one row.
                 label, text = candidates[0]
                 console.print()
                 confirmed = ask_confirm(f"'{filename}' -> title will be [bold]\"{text}\"[/bold] ({label}). Use this for matching files?", default=True)
@@ -1430,16 +1137,7 @@ def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_re
                     chosen_label = label
                 else:
                     final_title = prompt(f"Enter title for '{filename}'", default=text).strip() or text
-                    # A hand-typed title has no matching label -- don't
-                    # memoize a label for it, so later files of this shape
-                    # get re-prompted rather than silently reusing text
-                    # that was specific to this one file.
             else:
-                # value carries an index into `candidates` (as a string) so
-                # the label can be recovered after selection -- using the
-                # literal title text as the value loses which label/shape
-                # was actually chosen, which is what broke memoization
-                # across files with different per-file title text.
                 choices = [
                     questionary.Choice(title=f"{text}  [dim]({label})[/dim]", value=str(i))
                     for i, (label, text) in enumerate(candidates)
@@ -1662,6 +1360,10 @@ def run_dry_run(library_dir=None):
     console.print()
 
     directory = select_directory(library_dir)
+    if not directory:
+        print_error("No directory selected.")
+        sys.exit(1)
+        
     flush_input_buffer()
 
     upload_type = ask_select("Upload type?", [
@@ -1716,7 +1418,6 @@ def validate_session(session):
             data = res.json()
             profile = data.get("profile", {})
             name = profile.get("username") or profile.get("email")
-            # Confirmed via live API: id is the profile's user ID.
             user_id = profile.get("id") or profile.get("user_id") or profile.get("uid")
             return name, user_id
     except Exception: pass
@@ -1768,7 +1469,6 @@ def search_groups(query, session):
     except Exception: return []
 
 def _group_search_queries(name):
-    """Build an ordered list of search queries to try for a group name."""
     queries = [name]
     if not re.search(r'\s', name):
         camel = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', name)
@@ -1846,14 +1546,6 @@ def resolve_group_names(names, session):
 class SessionExpiredError(Exception): pass
 
 def _read_cookie_db_with_fallback(db_path, domains=None):
-    """Tries the DB in place first (works fine if the browser is closed).
-    If that fails -- typically because the browser has it open and locked --
-    copies it (plus its -wal/-shm sidecar files, since SQLite in WAL mode
-    keeps recent writes there rather than in the main file) to a temp
-    location and reads the copy instead. This is standard practice for
-    reading a live SQLite database (the same idea backup tools and forensic
-    utilities use) -- it doesn't touch encryption or the browser process,
-    just works around the OS file lock."""
     try:
         return rookiepy.firefox_based(db_path, domains=domains)
     except Exception:
@@ -1873,11 +1565,6 @@ def _read_cookie_db_with_fallback(db_path, domains=None):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 def get_zen_cookies(domains=None):
-    """rookiepy.firefox() only auto-detects the standard Firefox install
-    location and has no parameter to redirect it elsewhere, so it can't be
-    pointed at Zen. Instead this finds Zen's actual cookies.sqlite file and
-    reads it via rookiepy.firefox_based(db_path, domains), the lower-level
-    function that accepts an explicit database path."""
     if sys.platform == 'win32':
         profile_roots = [
             os.path.expandvars(r'%LOCALAPPDATA%\zen\Profiles'),
@@ -1895,8 +1582,6 @@ def get_zen_cookies(domains=None):
     for root in profile_roots:
         if not os.path.isdir(root):
             continue
-        # Prefer a profile folder name containing 'default' (case-insensitive),
-        # matching Firefox/Zen's own convention for the main profile.
         entries = sorted(os.listdir(root))
         default_entries = [e for e in entries if 'default' in e.lower()]
         ordered = default_entries + [e for e in entries if e not in default_entries]
@@ -1904,20 +1589,14 @@ def get_zen_cookies(domains=None):
         for entry in ordered:
             db_path = os.path.join(root, entry, 'cookies.sqlite')
             if os.path.isfile(db_path):
-                return _read_cookie_db_with_fallback(db_path, domains=domains)
+                cookies = _read_cookie_db_with_fallback(db_path, domains=domains)
+                if cookies:
+                    return cookies
 
     return []
 # ==============================================================================
 # 🔑 CDP-based cookie retrieval (Chromium browsers)
 # ==============================================================================
-
-# This talks to the browser's own DevTools debugging endpoint, which the
-# browser opts into explicitly via --remote-debugging-port. It is the same
-# mechanism automation tools like Playwright/Selenium use. Cookies are
-# returned by the browser itself over Network.getAllCookies -- there is no
-# decryption of the on-disk cookie store and no bypass of App-Bound
-# Encryption involved.
-# ------------------------------------------------------------------------------
 
 CDP_REGISTRY_APP_NAMES = {
     "chrome":  "chrome.exe",
@@ -1928,10 +1607,6 @@ CDP_REGISTRY_APP_NAMES = {
 }
 
 def _find_browser_via_registry(app_exe_name):
-    """Checks the Windows 'App Paths' registry keys, which installers
-    register with the actual install location regardless of drive letter.
-    This is the same mechanism Windows itself uses to resolve `chrome.exe`
-    when you run it from the Start menu or `Win+R`."""
     if sys.platform != "win32":
         return None
     try:
@@ -1960,7 +1635,6 @@ def _find_browser_executable(browser_key):
     plat = sys.platform
     plat_key = "win32" if plat == "win32" else ("darwin" if plat == "darwin" else "linux")
 
-    # Registry lookup first -- finds installs on any drive/custom path.
     if plat_key == "win32":
         app_exe = CDP_REGISTRY_APP_NAMES.get(browser_key)
         if app_exe:
@@ -1968,7 +1642,6 @@ def _find_browser_executable(browser_key):
             if found:
                 return found
 
-    # Fall back to hardcoded common install paths.
     candidates = CDP_BROWSER_EXECUTABLES.get(browser_key, {}).get(plat_key, [])
     for candidate in candidates:
         expanded = os.path.expandvars(candidate)
@@ -2000,18 +1673,9 @@ def _cdp_pid_file(browser_key):
     return os.path.join(_cdp_profile_dir_for(browser_key), ".cdp_launch.pid")
 
 def _cdp_pid_matches_expected_exe(pid, expected_exe):
-    """Best-effort check that `pid` is still the process we launched (i.e. its
-    running executable matches `expected_exe`), before we kill it. PIDs get
-    recycled by the OS, so without this check a stale/incorrect PID entry
-    could point at a completely unrelated process by the time cleanup runs.
-    Returns True only when we can positively confirm a match; returns False
-    for "doesn't match" AND for "couldn't determine" -- i.e. we only kill
-    when we're reasonably sure, erring on the side of *not* killing."""
     if not expected_exe:
         return False
     expected_name = os.path.basename(expected_exe).lower()
-    # Normalize away the .app/Contents/MacOS wrapper naming and .exe suffix
-    # so comparisons are robust to how each platform reports process names.
     expected_name_stripped = re.sub(r'\.exe$', '', expected_name)
 
     try:
@@ -2022,7 +1686,6 @@ def _cdp_pid_matches_expected_exe(pid, expected_exe):
             )
             if result.returncode != 0 or not result.stdout.strip():
                 return False
-            # CSV format: "imagename.exe","pid","session","session#","mem"
             first_field = result.stdout.strip().split(',')[0].strip('"')
             running_name = re.sub(r'\.exe$', '', first_field.lower())
             return running_name == expected_name_stripped
@@ -2038,14 +1701,14 @@ def _cdp_pid_matches_expected_exe(pid, expected_exe):
             running_name = os.path.basename(running_path).lower()
             return running_name == expected_name or expected_name in running_path.lower()
 
-        else:  # linux / other POSIX
+        else: 
             proc_exe = f"/proc/{pid}/exe"
             if os.path.exists(proc_exe):
                 try:
                     resolved = os.readlink(proc_exe)
                     return os.path.basename(resolved).lower() == expected_name
                 except OSError:
-                    pass  # fall through to `ps` fallback below (e.g. permission denied)
+                    pass  
             result = subprocess.run(
                 ["ps", "-p", str(pid), "-o", "comm="],
                 capture_output=True, text=True, timeout=5, check=False,
@@ -2058,11 +1721,6 @@ def _cdp_pid_matches_expected_exe(pid, expected_exe):
         return False
 
 def _cdp_kill_stale_process(browser_key):
-    """If a previous CDP launch of this specific browser is still alive (e.g.
-    it kept running in the background after its window was closed), kill it
-    so the next launch is guaranteed to pick up current command-line flags.
-    Without this, subprocess.Popen on some platforms/browsers can silently
-    hand off to the already-running process instead of starting a fresh one."""
     pid_file = _cdp_pid_file(browser_key)
     if not os.path.isfile(pid_file):
         return
@@ -2072,9 +1730,6 @@ def _cdp_kill_stale_process(browser_key):
     except (ValueError, OSError):
         return
 
-    # Verify this PID is still actually our browser before killing it -- PIDs
-    # get recycled, so without this check we could kill an unrelated process
-    # that happens to have inherited the same PID since our last run.
     expected_exe = _find_browser_executable(browser_key)
     if not _cdp_pid_matches_expected_exe(old_pid, expected_exe):
         try:
@@ -2096,7 +1751,7 @@ def _cdp_kill_stale_process(browser_key):
                 time.sleep(0.5)
                 os.kill(old_pid, signal.SIGKILL)
             except ProcessLookupError:
-                pass  # already dead
+                pass  
     except Exception:
         pass 
     finally:
@@ -2111,11 +1766,6 @@ def _cleanup_all_cdp_processes():
 atexit.register(_cleanup_all_cdp_processes)        
 
 def _cdp_launch_browser(browser_key, url):
-    """Launch a Chromium browser with remote debugging enabled, pointed at a
-    dedicated (non-default) profile directory unique to this browser. Chrome
-    136+ refuses the debug port against the default profile, so a separate
-    profile is required -- you'll need to log into MangaDot once inside this
-    dedicated window."""
     exe = _find_browser_executable(browser_key)
     if not exe:
         return None
@@ -2146,7 +1796,8 @@ def _cdp_launch_browser(browser_key, url):
             with open(_cdp_pid_file(browser_key), "w", encoding="utf-8") as f:
                 f.write(str(proc.pid))
         except OSError:
-            pass
+            proc.terminate()
+            return None
         return proc
     except Exception:
         return None
@@ -2161,8 +1812,6 @@ def _cdp_get_targets(port):
 
 def _cdp_open_new_tab(port, url):
     try:
-        # PUT is the documented method for /json/new in modern Chrome; older
-        # versions also accepted GET, so fall back if PUT is rejected.
         r = requests.put(f"http://127.0.0.1:{port}/json/new?{url}", timeout=5)
         if r.status_code >= 400:
             r = requests.get(f"http://127.0.0.1:{port}/json/new?{url}", timeout=5)
@@ -2172,8 +1821,6 @@ def _cdp_open_new_tab(port, url):
         return None
 
 def _cdp_get_all_cookies(port, timeout=10):
-    """Connects to a page-level DevTools target and issues Network.getAllCookies,
-    which returns cookies across the whole browser (not just that one tab)."""
     targets = [t for t in _cdp_get_targets(port) if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
     if not targets:
         new_target = _cdp_open_new_tab(port, BASE_URL)
@@ -2184,26 +1831,25 @@ def _cdp_get_all_cookies(port, timeout=10):
         return None
 
     ws_url = targets[0]["webSocketDebuggerUrl"]
-    ws = websocket.create_connection(ws_url, timeout=timeout)
     try:
-        ws.send(json.dumps({"id": 1, "method": "Network.getAllCookies"}))
-        ws.settimeout(timeout)
-        while True:
-            raw = ws.recv()
-            msg = json.loads(raw)
-            if msg.get("id") == 1:
-                return msg.get("result", {}).get("cookies", [])
-    finally:
-        ws.close()
+        ws = websocket.create_connection(ws_url, timeout=timeout)
+        try:
+            ws.send(json.dumps({"id": 1, "method": "Network.getAllCookies"}))
+            ws.settimeout(timeout)
+            while True:
+                raw = ws.recv()
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if msg.get("id") == 1:
+                    return msg.get("result", {}).get("cookies", [])
+        finally:
+            ws.close()
+    except Exception:
+        return None
 
 def _cdp_tracked_process_alive(browser_key):
-    """True only if the PID we last launched for this specific browser via
-    _cdp_launch_browser is still running -- i.e. we know it was started with
-    current command-line flags. A port simply being 'up' isn't enough
-    evidence, since a stale process from before a flag change (like
-    --remote-allow-origins) can still be listening and would otherwise get
-    silently reused -- or worse, a different browser's live process could be
-    mistaken for this one if ports/profiles were shared."""
     pid_file = _cdp_pid_file(browser_key)
     if not os.path.isfile(pid_file):
         return False
@@ -2232,10 +1878,6 @@ def _cdp_tracked_process_alive(browser_key):
             return False
 
 def get_cdp_cookies(browser_key, domains=None):
-    """Returns cookies for `browser_key` via CDP, launching a dedicated debug
-    profile (own port, own user-data-dir) if one isn't already running for
-    this specific browser. Returns a list of dicts shaped like rookiepy's
-    output: {'name', 'value', 'domain'}."""
     port = _cdp_port_for(browser_key)
     port_up = _cdp_port_is_up(port)
     trusted = port_up and _cdp_tracked_process_alive(browser_key)
@@ -2270,11 +1912,6 @@ def get_cdp_cookies(browser_key, domains=None):
     return filtered
 
 def authenticate_session(req_session, force_browser=None):
-    # Gecko-based (Zen/Firefox) store cookies in a plain, unencrypted SQLite
-    # file on disk -- rookiepy reads that directly, no issue. Chromium-based
-    # browsers encrypt cookies at rest (App-Bound Encryption on Windows) and
-    # usually block direct decryption by external processes; their CDP
-    # counterparts exist specifically to route around that.
     CHROMIUM_BROWSERS = {"chrome", "brave", "edge", "opera", "vivaldi"}
 
     supported_browsers = {
@@ -2287,9 +1924,6 @@ def authenticate_session(req_session, force_browser=None):
         "vivaldi": rookiepy.vivaldi,
     }
 
-    # CDP fallbacks -- these use a dedicated debug profile per browser, so
-    # they're only tried explicitly (via the manual retry menu), not in the
-    # automatic first pass, since they may need a one-time login.
     cdp_browsers = {
         "chrome (cdp)":  lambda domains=None: get_cdp_cookies("chrome", domains=domains),
         "edge (cdp)":    lambda domains=None: get_cdp_cookies("edge", domains=domains),
@@ -2376,13 +2010,6 @@ def _compute_retry_delay(response, attempt):
     return min(RETRY_DELAY * (2 ** attempt), 60)
 
 def _interruptible_sleep(delay, abort_event, slice_seconds=0.1):
-    """Sleep for `delay` seconds, but in short slices so an abort (e.g. from
-    Ctrl+C) is noticed almost immediately instead of only after the full
-    delay elapses. Returns True if the sleep completed normally, False if it
-    was cut short because abort_event got set. Retry backoffs here can be up
-    to 60s (exponential) or 120s (server Retry-After), and since a Python
-    thread can't be force-killed, without this a worker mid-sleep on a bad
-    retry window could hold up the whole script's exit for up to two minutes."""
     if delay <= 0:
         return not abort_event.is_set()
     remaining = delay
@@ -2408,13 +2035,6 @@ def _tus_offset(session, location):
     return None
 
 def _build_shared_upload_session(session):
-    """Build one requests.Session, configured with the same auth/cookies/proxy
-    as the main session, that persists across the whole batch and is shared
-    by every worker thread. requests.Session objects (and the connection pool
-    on their mounted HTTPAdapter) are thread-safe for concurrent requests, so
-    a single shared session here lets uploads across files/threads actually
-    reuse pooled TCP+TLS connections instead of each file paying for a fresh
-    handshake."""
     shared_session = requests.Session()
     shared_session.headers.update(session.headers)
     shared_session.cookies.update(session.cookies)
@@ -2424,9 +2044,6 @@ def _build_shared_upload_session(session):
     if session.hooks.get('response'):
         shared_session.hooks['response'] = list(session.hooks['response'])
 
-    # Sized for the full batch: pool_maxsize should comfortably cover the
-    # configured thread count (1-30) so worker threads aren't fighting each
-    # other for pooled connections.
     shared_adapter = HTTPAdapter(max_retries=0, pool_connections=32, pool_maxsize=32)
     shared_session.mount("https://", shared_adapter)
     shared_session.mount("http://",  shared_adapter)
@@ -2441,11 +2058,6 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
     filepath = file_info["filepath"]
     size     = file_info["size"]
 
-    # upload_session is a shared, pre-configured session that persists across
-    # the whole batch (see _build_shared_upload_session / process_uploads),
-    # so connections are pooled across files and threads instead of each file
-    # paying for a fresh TCP+TLS handshake. Falling back to a private session
-    # keeps this function usable standalone (e.g. in tests) if none is passed.
     owns_session = upload_session is None
     worker_session = upload_session if upload_session is not None else requests.Session()
     try:
@@ -2492,9 +2104,6 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
                 res = worker_session.post(TUS_ENDPOINT, headers=headers, timeout=(10, 30))
                 if res.status_code in (401, 403): raise SessionExpiredError()
                 if res.status_code == 409:
-                    # Don't return success yet — the chapter already exists server-side,
-                    # but it may belong to a different group/scanlator. Fall through to
-                    # the same Ghost-Chapter verification block used by normal uploads.
                     already_exists = True
                     break
                 res.raise_for_status()
@@ -2541,7 +2150,13 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
                             if patch_res.status_code in (401, 403): raise SessionExpiredError()
                             elif patch_res.status_code == 204:
                                 server_off = patch_res.headers.get("Upload-Offset")
-                                offset     = int(server_off) if server_off is not None else offset + len(chunk)
+                                if server_off is not None:
+                                    offset = int(server_off)
+                                else:
+                                    actual_off = _tus_offset(worker_session, upload_location)
+                                    if actual_off is None:
+                                        return {"key": filename, "success": False, "error": "Server dropped offset and HEAD failed"}
+                                    offset = actual_off
                                 chunk_done = True
                                 break
                             elif patch_res.status_code in FATAL_SIZE_STATUSES:
@@ -2586,15 +2201,10 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
         found        = False
         found_item   = None
         verify_start = time.time()
+        total_semaphore_wait = 0
 
         if not group_ids and not scanlator_name:
             if is_group_upload and not has_file_specific_group:
-                # This is a group upload overall, but this specific file had no
-                # [Group] tag that could be resolved (or its tag failed to
-                # resolve). There is nothing to verify server-side ingestion
-                # against, so — unlike a genuine individual/ungrouped upload —
-                # we must NOT silently report success. Surface this clearly so
-                # it isn't mistaken for a verified upload.
                 label = "⚠️ Uploaded (Unverified — no group)"
                 renderer.update_chapter_status(filename, label, 1.0, current=size, total=size, speed=0.0, eta=0.0)
                 return {
@@ -2602,52 +2212,61 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
                     "success": True,
                     "warning": "Uploaded without attribution verification: no resolved group/scanlator for this file."
                 }
-            # Genuine individual (non-group) upload — nothing to verify uploader-attribution against.
             label = "✅ Already Exists" if already_exists else "✅ Uploaded"
             renderer.update_chapter_status(filename, label, 1.0, current=size, total=size, speed=0.0, eta=0.0)
             return {"key": filename, "success": True}
 
         while not found:
             if abort_event.is_set(): return {"key": filename, "success": False, "error": "Aborted"}
-            elapsed_verify = int(time.time() - verify_start)
+            
+            elapsed_verify = int(time.time() - verify_start - total_semaphore_wait)
             if elapsed_verify >= verify_timeout: return {"key": filename, "success": False, "error": "Verification timeout reached."}
+            
             renderer.update_chapter_status(filename, f"Verifying... ({elapsed_verify}s)", 1.0, current=size, total=size, speed=0.0, eta=0.0)
             if not _interruptible_sleep(RETRY_DELAY, abort_event):
                 return {"key": filename, "success": False, "error": "Aborted"}
             
+            wait_start = time.time()
             with get_verify_sem():
+                total_semaphore_wait += (time.time() - wait_start)
                 try:
-                    fetch_check = worker_session.get(f"{base_check_url}?_t={int(time.time())}", timeout=10)
+                    page = 1
+                    while True:
+                        fetch_check = worker_session.get(f"{base_check_url}?page={page}&limit=100&_t={int(time.time())}", timeout=10)
 
-                    if fetch_check.status_code in (401, 403): raise SessionExpiredError()
-                    if fetch_check.status_code != 200: continue
+                        if fetch_check.status_code in (401, 403): raise SessionExpiredError()
+                        if fetch_check.status_code != 200: break
 
-                    items_list = fetch_check.json()
-                    if isinstance(items_list, dict): items_list = items_list.get("volumes", items_list.get("chapters", []))
-                    if not isinstance(items_list, list): continue
+                        items_list = fetch_check.json()
+                        if isinstance(items_list, dict): items_list = items_list.get("volumes", items_list.get("chapters", []))
+                        if not isinstance(items_list, list) or not items_list: 
+                            break
 
-                    for item in items_list:
-                        try:
-                            if upload_type == "volume":
-                                match = math.isclose(float(item.get("volume_number", -1)), float(file_info["number"]), abs_tol=0.001)
-                            else:
-                                match = math.isclose(float(item.get("chapter_number", -1)), float(file_info["number"]), abs_tol=0.001)
-                        except (ValueError, TypeError): match = False
+                        for item in items_list:
+                            try:
+                                if upload_type == "volume":
+                                    match = math.isclose(float(item.get("volume_number", -1)), float(file_info["number"]), abs_tol=0.001)
+                                else:
+                                    match = math.isclose(float(item.get("chapter_number", -1)), float(file_info["number"]), abs_tol=0.001)
+                            except (ValueError, TypeError): match = False
 
-                        if match:
-                            item_group_ids = []
-                            if item.get("group_id"): item_group_ids.append(item["group_id"])
-                            for g in item.get("groups", []):
-                                if isinstance(g, dict) and g.get("id"): item_group_ids.append(g["id"])
-                                elif isinstance(g, int): item_group_ids.append(g)
-                            item_scanlator = item.get("scanlator_name") or item.get("scanlator")
+                            if match:
+                                item_group_ids = []
+                                if item.get("group_id"): item_group_ids.append(item["group_id"])
+                                for g in item.get("groups", []):
+                                    if isinstance(g, dict) and g.get("id"): item_group_ids.append(g["id"])
+                                    elif isinstance(g, int): item_group_ids.append(g)
+                                item_scanlator = item.get("scanlator_name") or item.get("scanlator")
 
-                            if group_ids and any(gid in item_group_ids for gid in group_ids):
-                                found_item = item; found = True; break
-
-                            if not group_ids and scanlator_name:
-                                if isinstance(item_scanlator, str) and item_scanlator.strip().lower() == scanlator_name.strip().lower():
+                                if group_ids and any(gid in item_group_ids for gid in group_ids):
                                     found_item = item; found = True; break
+
+                                if not group_ids and scanlator_name:
+                                    if isinstance(item_scanlator, str) and item_scanlator.strip().lower() == scanlator_name.strip().lower():
+                                        found_item = item; found = True; break
+                        
+                        if found: break
+                        page += 1
 
                 except SessionExpiredError:
                     raise
@@ -2667,9 +2286,6 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
         renderer.update_chapter_status(filename, label, 1.0, current=size, total=size, speed=0.0, eta=0.0)
         return {"key": filename, "success": True}
     finally:
-        # Only close sessions this call created itself. The shared batch
-        # session (passed in via upload_session) must stay open -- it's
-        # reused by every other worker thread/file for the rest of the batch.
         if owns_session:
             worker_session.close()
 
@@ -2682,12 +2298,6 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                     per_file_group_map=None, verify_timeout=MAX_VERIFY_SECONDS, current_user_id=None,
                     is_group_upload=None):
     per_file_group_map = per_file_group_map or {}
-    # is_group_upload tells the workers whether this batch is a "group" upload
-    # overall (so a file with no resolvable group/scanlator is an attribution
-    # gap that must be flagged) versus a genuine individual/ungrouped upload
-    # (where having no group_ids/scanlator is expected and fine).
-    # If not explicitly provided, infer it defensively: treat as a group
-    # upload whenever any group information exists anywhere in the batch.
     if is_group_upload is None:
         is_group_upload = bool(group_ids) or any(per_file_group_map.values())
     chunks    = [files_to_upload[i:i + MAX_BATCH_SIZE] for i in range(0, len(files_to_upload), MAX_BATCH_SIZE)]
@@ -2700,10 +2310,6 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
     session_expired  = False
     abort_event      = threading.Event()
 
-    # One shared session, reused by every worker thread across every chunk of
-    # this batch, so upload connections are actually pooled instead of each
-    # file paying for a fresh TCP+TLS handshake (requests.Session is safe for
-    # concurrent use across threads).
     shared_upload_session = _build_shared_upload_session(req_session)
 
     def mark_failed(name, reason, status):
@@ -2713,39 +2319,39 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
         failure_reasons[name] = reason
 
     try:
-        for chunk in chunks:
-            if session_expired:
-                for f in chunk:
-                    mark_failed(f["filename"], "Paused — session expired before upload", "⏸️ Paused (Session)")
-                continue
-
-            chapters_payload = [{"chapter_number": f["number"] if upload_type == "chapter" else 0, "volume_number": f["number"] if upload_type == "volume" else None, "chapter_title": f["title"]} for f in chunk]
-
-            chunk_group_ids = set(group_ids) if group_ids else set()
-            for f in chunk:
-                f_groups = per_file_group_map.get(f.get("norm_filepath") or _norm_filepath(f["filepath"]))
-                if f_groups:
-                    chunk_group_ids.update(f_groups)
-            init_payload = {"manga_id": manga_id, "language": language, "group_ids": list(chunk_group_ids), "type": upload_type, "scanlator_name": scanlator_name, "chapters": chapters_payload}
-            batch_id = None
-            try:
-                res = req_session.post(BATCH_INIT_ENDPOINT, json=init_payload, timeout=(10, 30))
-                if res.status_code in (401, 403):
-                    session_expired = True
-                    abort_event.set()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=thread_count) as executor:
+            for chunk in chunks:
+                if session_expired:
                     for f in chunk:
-                        mark_failed(f["filename"], "Paused — authentication expired", "⏸️ Paused (Auth)")
+                        mark_failed(f["filename"], "Paused — session expired before upload", "⏸️ Paused (Session)")
                     continue
-                res.raise_for_status()
-                batch_data = res.json()
-                if not batch_data.get("success"): raise Exception(str(batch_data))
-                batch_id = batch_data["batch_id"]
-            except Exception as e:
-                for f in chunk:
-                    mark_failed(f["filename"], f"Batch init failed: {str(e)[:80]}", "❌ Batch Init Failed")
-                continue
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=thread_count) as executor:
+                chapters_payload = [{"chapter_number": f["number"] if upload_type == "chapter" else 0, "volume_number": f["number"] if upload_type == "volume" else None, "chapter_title": f["title"]} for f in chunk]
+
+                chunk_group_ids = set(group_ids) if group_ids else set()
+                for f in chunk:
+                    f_groups = per_file_group_map.get(f.get("norm_filepath") or _norm_filepath(f["filepath"]))
+                    if f_groups:
+                        chunk_group_ids.update(f_groups)
+                init_payload = {"manga_id": manga_id, "language": language, "group_ids": list(chunk_group_ids), "type": upload_type, "scanlator_name": scanlator_name, "chapters": chapters_payload}
+                batch_id = None
+                try:
+                    res = req_session.post(BATCH_INIT_ENDPOINT, json=init_payload, timeout=(10, 30))
+                    if res.status_code in (401, 403):
+                        session_expired = True
+                        abort_event.set()
+                        for f in chunk:
+                            mark_failed(f["filename"], "Paused — authentication expired", "⏸️ Paused (Auth)")
+                        continue
+                    res.raise_for_status()
+                    batch_data = res.json()
+                    if not batch_data.get("success"): raise Exception(str(batch_data))
+                    batch_id = batch_data["batch_id"]
+                except Exception as e:
+                    for f in chunk:
+                        mark_failed(f["filename"], f"Batch init failed: {str(e)[:80]}", "❌ Batch Init Failed")
+                    continue
+
                 futures = {}
                 for f in chunk:
                     norm_path = f.get("norm_filepath") or _norm_filepath(f["filepath"])
@@ -2784,20 +2390,20 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                         f.cancel()
                     raise
 
-            if batch_id and not session_expired and chunk_had_success:
-                for comp_attempt in range(MAX_RETRIES):
-                    try:
-                        comp_res = req_session.post(f"{BASE_URL}/api/uploads/batch/{batch_id}/complete", timeout=(10, 30))
-                        if comp_res.status_code in (401, 403):
-                            session_expired = True
-                            break
-                        comp_res.raise_for_status()
-                        break
-                    except Exception as e:
-                        if comp_attempt < MAX_RETRIES - 1:
-                            if not _interruptible_sleep(_compute_retry_delay(None, comp_attempt), abort_event):
+                if batch_id and not session_expired and chunk_had_success:
+                    for comp_attempt in range(MAX_RETRIES):
+                        try:
+                            comp_res = req_session.post(f"{BASE_URL}/api/uploads/batch/{batch_id}/complete", timeout=(10, 30))
+                            if comp_res.status_code in (401, 403):
+                                session_expired = True
                                 break
-                        else: logging.warning(f"Batch {batch_id} complete call failed after {MAX_RETRIES} attempts: {e}")
+                            comp_res.raise_for_status()
+                            break
+                        except Exception as e:
+                            if comp_attempt < MAX_RETRIES - 1:
+                                if not _interruptible_sleep(_compute_retry_delay(None, comp_attempt), abort_event):
+                                    break
+                            else: logging.warning(f"Batch {batch_id} complete call failed after {MAX_RETRIES} attempts: {e}")
     except KeyboardInterrupt:
         abort_event.set()
         raise
@@ -3106,13 +2712,6 @@ def _check_proxy(proxy_url, verify=True):
         return False, f"Proxy check error: {str(e)[:80]}"
 
 def _positive_int(value):
-    """argparse type= validator for arguments that must be a positive
-    integer (e.g. --verify-timeout). Without this, a value like 0 or a
-    negative number passes argparse silently and only causes a confusing
-    failure much later -- e.g. --verify-timeout 0 makes the very first
-    'elapsed >= verify_timeout' check in the verification loop already
-    true, so every upload immediately reports "Verification timeout
-    reached" instead of a clear "invalid argument" error up front."""
     try:
         ivalue = int(value)
     except ValueError:
