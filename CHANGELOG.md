@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2026-07-12
+
+### Added
+- **Zen Browser Support:** Session cookies can now be read directly from the Zen browser's Gecko-based profile store, with automatic profile discovery and a WAL/SHM-safe copy fallback if the live database is locked.
+- **CDP Fallback for Chromium Browsers:** Chrome, Edge, Brave, Vivaldi, and Opera now have a Chrome DevTools Protocol option (`Browser (CDP)`) that launches an isolated debug profile and reads cookies over a WebSocket connection, bypassing the OS-level encrypted cookie store that normally blocks direct extraction from these browsers.
+- **Auto-Scan Login:** Login no longer defaults to a single browser (previously Firefox). The uploader now scans every supported browser automatically for a valid MangaDot session and stops at the first hit; a manual picker (including the new CDP options) still appears if none succeed.
+- **Dynamic Title Picker:** Auto-detect naming now always presents a labeled picker of candidate titles (e.g. "Full title as detected," "Without episode label," "Without season tag," "Bare title only," "Minimal") built dynamically from the filename's structure, memoized per detected filename "shape" so it only has to be answered once per batch.
+- **Episode/Chapter Number Drift Correction:** When chapter numbers and episode labels disagree within a batch, numbering is now reconciled and interpolated across the run instead of trusting whichever value was parsed first.
+- **Manual Group-ID Fallback:** If a scanlator group name can't be resolved through search (fuzzy or otherwise), you can now type in its numeric MangaDot Group ID directly instead of the file being dropped from the group mapping.
+- **Unverified-Upload Warning State:** Files in a group upload that don't resolve to any specific group now upload with an explicit `⚠️ Uploaded (Unverified — no group)` status instead of silently reusing the generic "uploaded" success label.
+- **`websocket-client` Dependency:** Added to support the new CDP cookie-retrieval path.
+
+### Changed
+- **Higher Thread Ceiling:** Parallel upload threads raised from a 1–10 cap (default 3) to 1–30 (default 5), with an on-screen warning about Cloudflare rate-limiting before you commit to a high count.
+- **Shared Upload Connection Pool:** Worker threads now share one pooled `requests.Session` (32 connections) for the whole run instead of each opening and tearing down its own session per chunk.
+- **Ghost Chapter Verification Pagination:** The post-upload verification check now pages through the server's chapter/volume listing instead of trusting only the first page, closing a gap where a match on a later page could be missed and falsely reported as a Ghost Chapter conflict.
+- **Group Name Detection Across Mixed Batches:** Filename group-tag detection now collects every unique group name seen across the batch instead of only surfacing the single most-frequent group's names.
+- **Natural Sort Hyphen Fix:** Numeric sorting no longer treats a leading `-` used as a filename separator (e.g. `Chapter-5`) as part of the number; true negative numbers are still sorted correctly via value inversion.
+- **Interruptible Retry Waits:** All inter-retry sleeps (chunk retries, verification polling, batch-complete retries) now check the abort signal every 100ms instead of blocking for the full delay, so `Ctrl+C` and session-expiry aborts land immediately instead of after the current backoff finishes.
+- **TUS Offset Recovery:** If the server returns a 204 on a chunk PATCH without an `Upload-Offset` header, the uploader now falls back to an explicit `HEAD` offset check instead of guessing the new offset from the chunk size.
+
+### Fixed
+- **Dead `ctypes` Import:** Removed an unused, unconditionally-imported `ctypes` module left over from earlier Windows-specific code.
+- **Stale CDP Process Safety:** Before relaunching a browser for CDP mode, the uploader now verifies a previously tracked PID still belongs to the expected browser executable before killing it, preventing an unrelated process from being terminated if the PID was recycled.
+- **`--verify-timeout` Validation:** The flag now requires a positive integer and rejects zero, negative, or non-numeric values with a clear error instead of accepting them silently.
+
+---
+
 ## [1.2.3] - 2026-06-30
 
 ### Added
