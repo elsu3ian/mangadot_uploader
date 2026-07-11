@@ -24,5 +24,6 @@ Thumbs.db
 .idea/
 tempCodeRunnerFile.py
 tempCoderRunnerFile.py
-failed_manga_*.txt
+#failed_manga_*.txt
 logs/
+requirements.txt
