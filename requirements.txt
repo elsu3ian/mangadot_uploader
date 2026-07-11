@@ -1,4 +1,6 @@
-requests>=2.34.2
-urllib3>=2.7.0
-rookiepy>=0.5.6
-colorama>=0.4.6
+requests==2.34.2
+rookiepy==0.5.6
+questionary==2.0.1
+rich==14.1.0
+colorama==0.4.6
+urllib3==2.7.0
