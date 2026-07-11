@@ -835,36 +835,49 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
             pass
 
     num = None
-    num_came_from_episode_label = False
-    num_source = None  
+    num_source = None
+    episode_label_num = None
+    num_came_from_episode_label = False 
 
     if upload_type == "volume":
         num_pattern = r'(?i)(?:(?:\b|_)?(?:volume|vol)|(?:\b|_)v)[\.\-_\s]*(\d+(?:\.\d+)?)'
     else:
-        num_pattern = r'(?i)(?:(?:\b|_)?(?:chapter|ch)|(?:\b|_)c)[\.\-_\s]*(\d+(?:\.\d+)?)'
+        num_pattern = r'(?i)(?:(?:\b|_)?(?:chapter|ch|episode|ep)|(?:\b|_)c)[\.\-_\s]*(\d+(?:\.\d+)?)'
 
-    match = re.search(num_pattern, name_clean)
-    if match:
-        num = float(match.group(1))
-        num_source = "chapter_or_volume_label"
-        name_clean = name_clean[:match.start()] + name_clean[match.end():]
-    else:
-        if upload_type == "chapter":
-            ep_match = re.search(r'(?i)(?:\b|_)?(?:episode|ep)[\.\-_\s]*(\d+(?:\.\d+)?)', name_clean)
-            if ep_match:
-                num = float(ep_match.group(1))
-                num_came_from_episode_label = True
-                num_source = "episode_label"
-                name_clean = name_clean[:ep_match.start()] + name_clean[ep_match.end():]
+    matches = list(re.finditer(num_pattern, name_clean))
+    
+    if len(matches) > 1:
+        num = float(matches[0].group(1))
+        num_source = "sequence_index"
+        episode_label_num = float(matches[-1].group(1))
         
-        if num is None:
-            leading_prefix_match = re.match(r'^0*(\d+)(?:\.\d+)?[\s\-_\.]+', name_clean)
-            if leading_prefix_match:
-                num = float(leading_prefix_match.group(1))
-                num_source = "fallback"
-                name_clean = name_clean[:leading_prefix_match.start()] + name_clean[leading_prefix_match.end():]
-
-        if num is None:
+        if 'ep' in matches[-1].group(0).lower() or 'episode' in matches[-1].group(0).lower():
+            num_came_from_episode_label = True
+        name_clean = name_clean[:matches[0].start()] + name_clean[matches[0].end():]
+        
+    elif len(matches) == 1:
+        val = float(matches[0].group(1))
+        matched_str = matches[0].group(0).lower()
+        
+        if matches[0].start() == 0 and re.search(r'0\d+', matched_str):
+            num = val
+            num_source = "sequence_index"
+            episode_label_num = None
+        else:
+            num = val
+            num_source = "chapter_or_volume_label"
+            episode_label_num = val
+            if 'ep' in matched_str or 'episode' in matched_str:
+                num_came_from_episode_label = True
+                
+        name_clean = name_clean[:matches[0].start()] + name_clean[matches[0].end():]
+    else:
+        leading_prefix_match = re.match(r'^0*(\d+(?:\.\d+)?)[\s\-_\.]+', name_clean)
+        if leading_prefix_match:
+            num = float(leading_prefix_match.group(1))
+            num_source = "fallback"
+            name_clean = name_clean[:leading_prefix_match.start()] + name_clean[leading_prefix_match.end():]
+        else:
             all_nums = [(m.group(1), m) for m in re.finditer(r'(?<!\d)(\d+(?:\.\d+)?)(?!\d)', name_clean)]
             if all_nums:
                 valid_nums = [n for n in all_nums if not (len(n[0]) == 4 and n[0].startswith(('19', '20')))]
@@ -876,14 +889,6 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
     if num is None:
         return None, [], raw_groups, None, None, None
 
-    episode_label_num = None
-    if upload_type == "chapter":
-        if num_came_from_episode_label:
-            episode_label_num = num
-        else:
-            _ep_num_match = re.search(r'(?i)(?:\b|_)?(?:episode|ep)[\.\-_\s]*(\d+(?:\.\d+)?)', name_clean)
-            if _ep_num_match:
-                episode_label_num = float(_ep_num_match.group(1))
 
     if upload_type == "volume":
         return num, [("Vol. N.NN", f"Vol. {num:.2f}")], raw_groups, "volume", num_source, None
@@ -1024,15 +1029,40 @@ def validate_archive(filepath):
 
 def _correct_episode_drift(parsed):
     drift_detected = any(
-        item.get("num_source") == "chapter_or_volume_label"
-        and item.get("episode_label_num") is not None
-        and item["episode_label_num"] != item["number"]
+        (item.get("episode_label_num") is not None and item["episode_label_num"] != item["number"])
+        or (item.get("episode_label_num") is None)
         for item in parsed
     )
-    if not drift_detected:
+    has_real_labels = any(item.get("episode_label_num") is not None for item in parsed)
+
+    if not drift_detected or not has_real_labels:
         return
 
-    ordered = sorted(parsed, key=lambda x: x["number"])
+    # Prompt the user if a major numbering collision (like a Season reset) is found
+    conflicts = [item for item in parsed if item.get("episode_label_num") is not None and item["episode_label_num"] != item["number"]]
+    
+    if conflicts:
+        console.print()
+        console.rule("[bold yellow]Numbering Conflict Detected[/bold yellow]")
+        print_info("Filename sequence and Episode labels disagree (likely a Season 2 reset).")
+        print_info(f"Example: '{conflicts[0]['filename']}'")
+        print_info(f" -> File Index:    [magenta]{conflicts[0]['number']:g}[/magenta]")
+        print_info(f" -> Episode Label: [cyan]{conflicts[0]['episode_label_num']:g}[/cyan]\n")
+        
+        choice = ask_select(
+            "How should these be sorted on MangaDot?",
+            choices=[
+                questionary.Choice(title="Continuous (Use File Index 'ch0057' -> Ch 57)", value="continuous"),
+                questionary.Choice(title="Trust Labels (Use Label 'Episode 1' -> Ch 1)", value="reset")
+            ]
+        )
+        if choice == "continuous":
+            return  # Bypass drift correction entirely; the chXXXX prefixes handle the exact order
+
+    for item in parsed:
+        item["original_num"] = item["number"]
+
+    ordered = sorted(parsed, key=lambda x: x["original_num"])
 
     for item in ordered:
         if item.get("episode_label_num") is not None:
@@ -1064,6 +1094,17 @@ def _correct_episode_drift(parsed):
                     item["number"] = round(prev_val + step * (k + 1), 4)
         else:
             i += 1
+
+    # Fix the desynced text titles
+    for item in ordered:
+        old_num = item["original_num"]
+        new_num = item["number"]
+        if old_num != new_num:
+            updated_candidates = []
+            for label, text in item["candidates"]:
+                text = re.sub(rf'(?i)(Chapter|Episode)\s+{old_num:g}\b', rf'\g<1> {new_num:g}', text)
+                updated_candidates.append((label, text))
+            item["candidates"] = updated_candidates
 
 def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_regex=None, strip_groups=False, validate=True, custom_renames=None):
     valid_extensions = ('.cbz', '.zip')
