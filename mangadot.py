@@ -63,7 +63,8 @@ import math
 import tempfile
 import shutil
 import zipfile
-from collections import deque
+import sqlite3
+from collections import deque, Counter
 from pathlib import Path
 
 # ==============================================================================
@@ -92,6 +93,16 @@ def _version_lt(installed, required):
     b += (0,) * (length - len(b))
     return a < b
 
+def _in_virtualenv():
+    """True if running inside a venv/virtualenv/conda env, where auto-installing
+    packages only affects this isolated environment rather than the user's
+    system-wide Python."""
+    return (
+        hasattr(sys, "real_prefix")
+        or sys.base_prefix != sys.prefix
+        or bool(os.environ.get("CONDA_DEFAULT_ENV"))
+    )
+
 def check_dependencies():
     sep   = "=" * 62
     ok    = True
@@ -106,7 +117,11 @@ def check_dependencies():
                 outdated_pip.append((pkg, min_version, installed))
         except importlib.metadata.PackageNotFoundError:
             missing_pip.append(pkg)
-        except Exception:
+        except (ValueError, TypeError) as e:
+            # Malformed package metadata (rare, but importlib.metadata can choke
+            # on broken/partial installs) - treat it like "missing" so the user
+            # gets a chance to reinstall it cleanly, instead of silently skipping.
+            print(f"  ⚠️  Could not read version metadata for '{pkg}' ({e}); treating as missing.")
             missing_pip.append(pkg)
 
     if missing_pip or outdated_pip:
@@ -122,15 +137,34 @@ def check_dependencies():
             print("\n  Outdated (need upgrade):")
             for pkg, req, inst in outdated_pip:
                 print(f"    ✗  {pkg}  (have {inst}, need >= {req})")
+
         to_install = missing_pip + [p for p, _, _ in outdated_pip]
-        print(f"\n  🔧 Auto-installing missing/outdated packages: {' '.join(to_install)}...")
+
+        if not _in_virtualenv():
+            print("\n  ℹ️   You're not inside a virtual environment - installing now would")
+            print("      affect your system-wide Python packages.")
+            print(f"\n      requirements.txt is included next to this script. You can instead run:")
+            print(f"        python -m venv .venv")
+            print(f"        .venv\\Scripts\\activate      (Windows)   OR   source .venv/bin/activate  (macOS/Linux)")
+            print(f"        pip install -r requirements.txt\n")
+            proceed = input("  Install these packages to your system Python anyway? [y/N]: ").strip().lower()
+            if proceed != "y":
+                print("\n  Skipped. Install the packages above, then re-run this script.")
+                print(sep)
+                return False
+
+        print(f"\n  🔧 Installing missing/outdated packages: {' '.join(to_install)}...")
         try:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade"] + to_install)
             print("  ✅ All dependencies verified and updated.\n")
             ok = True
-        except subprocess.CalledProcessError:
-            print("  ❌ Auto-install failed. You'll need to run pip manually.")
+        except subprocess.CalledProcessError as e:
+            print(f"  ❌ Auto-install failed (pip exited with code {e.returncode}).")
+            print(f"    Try running this manually:")
             print(f"    pip install --upgrade {' '.join(to_install)}\n")
+        except FileNotFoundError:
+            print("  ❌ Could not find pip for this Python interpreter.")
+            print(f"    Try running manually: pip install --upgrade {' '.join(to_install)}\n")
 
     if shutil.which("chafa") is None:
         _sys = platform.system()
@@ -175,8 +209,9 @@ try:
     )
 
     console = Console()
-except Exception as _import_err:
-    print(f"An unexpected error occurred during import: {_import_err}")
+except ImportError as _import_err:
+    print(f"A required package failed to import even after the dependency check: {_import_err}")
+    print("Try reinstalling it manually, e.g.: pip install --upgrade " + str(_import_err.name or ""))
     sys.exit(1)
 
 # ==============================================================================
@@ -311,7 +346,8 @@ def _detect_macos_ver():
                 if len(parts) >= 3 and parts[2]:
                     base += f"_{parts[2]}"
                 return base
-    except Exception: pass
+    except (IndexError, ValueError, OSError) as e:
+        logging.debug("_detect_macos_ver: falling back to default (%s)", e)
     return "10_15_7"
 
 def _read_windows_registry(browser):
@@ -336,7 +372,8 @@ def _read_windows_registry(browser):
                     v = _clean_version(val)
                     if v: return v
             except OSError: continue
-    except Exception: return None
+    except ImportError:
+        return None  # winreg unavailable (not on Windows)
     return None
 
 def _read_mac_plist(browser):
@@ -356,7 +393,11 @@ def _read_mac_plist(browser):
             plist = plistlib.load(f)
             raw = plist.get('KSVersion') or plist.get('CFBundleShortVersionString')
             return _clean_version(raw)
-    except Exception: return None
+    except (OSError, ValueError) as e:
+        # ValueError covers plistlib's InvalidFileException (a ValueError subclass)
+        # for a corrupt/unexpected Info.plist.
+        logging.debug("_read_mac_plist(%s): %s", browser, e)
+        return None
 
 def _read_linux_version(browser):
     cmds = {
@@ -391,7 +432,9 @@ def _fetch_web_version(browser, timeout=5):
             if r.status_code == 200:
                 versions = r.json().get("versions") or []
                 if versions: return _clean_version(versions[0].get("version"))
-    except Exception: return None
+    except (requests.exceptions.RequestException, json.JSONDecodeError, ValueError) as e:
+        logging.debug("_fetch_web_version(%s): %s", browser, e)
+        return None
     return None
 
 def _get_chromium_version_for_browser(browser):
@@ -451,12 +494,15 @@ def get_dynamic_user_agent(browser):
         if sys.platform == 'win32':    version = _read_windows_registry(browser)
         elif sys.platform == 'darwin': version = _read_mac_plist(browser)
         else:                          version = _read_linux_version(browser)
-    except Exception: version = None
+    except (OSError, ValueError) as e:
+        logging.debug("get_dynamic_user_agent: local version detection failed for %s: %s", browser, e)
+        version = None
 
     if not version and browser in ("chrome", "edge", "firefox"):
         try:
             version = _fetch_web_version(browser, timeout=5)
-        except Exception:
+        except (requests.exceptions.RequestException, json.JSONDecodeError, ValueError) as e:
+            logging.debug("get_dynamic_user_agent: web version fetch failed for %s: %s", browser, e)
             version = None
 
     chromium_version = _get_chromium_version_for_browser(browser)
@@ -470,8 +516,10 @@ def get_dynamic_user_agent(browser):
             cached_uas[browser] = ua
             fresh_config["cached_user_agents"] = cached_uas
             save_config(fresh_config)
-        except Exception:
-            pass
+        except OSError as e:
+            # Best-effort cache write; a failure here just means we re-detect
+            # the UA next run instead of using the cache. Not fatal.
+            logging.debug("get_dynamic_user_agent: failed to persist UA cache: %s", e)
 
     return ua
 
@@ -479,7 +527,7 @@ def restore_terminal():
     try:
         sys.stdout.write("\033[?7h")
         sys.stdout.flush()
-    except Exception: pass
+    except (OSError, ValueError): pass
 
 atexit.register(restore_terminal)
 
@@ -487,11 +535,37 @@ atexit.register(restore_terminal)
 # 🐛  DEBUG LOGGING
 # ==============================================================================
 
-_SENSITIVE_HEADERS = frozenset({"cookie", "authorization", "x-auth-token", "x-session-token"})
+_SENSITIVE_HEADERS = frozenset({"cookie", "set-cookie", "authorization", "x-auth-token", "x-session-token"})
 
 _STRIP_ANSI_RE = re.compile(r'\033\[[0-9;?]*[A-Za-z]')
 def strip_ansi(text):
     return _STRIP_ANSI_RE.sub('', str(text))
+
+_HOME_DIR_STR = str(Path.home())
+def _redact_home_path(text):
+    """Replace the current user's home directory (and thus their OS username)
+    with a placeholder before showing exception text on-screen or in logs.
+    Many rookiepy/sqlite3/file-I/O exceptions embed the full cookie DB path,
+    which on Windows/macOS/Linux typically includes the OS username."""
+    text = str(text)
+    if _HOME_DIR_STR and _HOME_DIR_STR in text:
+        text = text.replace(_HOME_DIR_STR, "~")
+    return text
+
+def _redact_proxy_url(proxy_url):
+    """Mask any user:pass@ credentials embedded in a proxy URL before it's
+    ever printed to the console (or would end up in a debug log/screenshot)."""
+    import urllib.parse
+    try:
+        parsed = urllib.parse.urlsplit(proxy_url)
+        if parsed.username or parsed.password:
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            return urllib.parse.urlunsplit((parsed.scheme, f"[REDACTED]@{netloc}", parsed.path, parsed.query, parsed.fragment))
+        return proxy_url
+    except ValueError:
+        return proxy_url
 
 def log_request_response(response, *args, **kwargs):
     req = response.request
@@ -509,15 +583,17 @@ def log_request_response(response, *args, **kwargs):
                 logging.debug(strip_ansi(req.body))
             elif isinstance(req.body, bytes):
                 logging.debug("<Binary Data / File Chunk>")
-        except Exception: logging.debug("--- REQUEST BODY (Size: Unknown) ---")
+        except TypeError: logging.debug("--- REQUEST BODY (Size: Unknown) ---")
     logging.debug("--- RESPONSE STATUS: %s %s ---", response.status_code, response.reason)
     logging.debug("--- RESPONSE HEADERS ---")
-    for k, v in response.headers.items(): logging.debug(strip_ansi(f"{k}: {v}"))
+    for k, v in response.headers.items():
+        if k.lower() in _SENSITIVE_HEADERS: logging.debug("%s: [REDACTED]", k)
+        else: logging.debug(strip_ansi(f"{k}: {v}"))
     logging.debug("--- RESPONSE BODY ---")
     try:
         resp_text = response.text
         logging.debug(strip_ansi(f"{resp_text[:1000]}... (truncated)" if len(resp_text) > 1000 else resp_text))
-    except Exception: logging.debug("<Binary or Unreadable Response>")
+    except UnicodeDecodeError: logging.debug("<Binary or Unreadable Response>")
     logging.debug("=" * 63 + "\n")
 
 # ==============================================================================
@@ -619,7 +695,7 @@ class UIRenderer:
             task_id = self.chapter_tasks.pop(oldest, None)
             if task_id is not None:
                 try: self.chapter_progress.remove_task(task_id)
-                except Exception: pass
+                except KeyError: pass
 
     def start(self):
         self.live.start()
@@ -645,7 +721,7 @@ def flush_input_buffer():
         try:
             if sys.stdin.isatty():
                 termios.tcflush(sys.stdin, termios.TCIFLUSH)
-        except Exception: pass
+        except (termios.error, OSError, ValueError): pass
 
 def prompt(text, default=None, required=True):
     while True:
@@ -681,6 +757,80 @@ def ask_confirm(message, default=True):
         choices.reverse()
     return ask_select(message, choices, auto_number=False)
 
+def parse_number_ranges(text, valid_numbers=None):
+    """Parse flexible range input like '103-108,110,115-117' into a set of numbers.
+    Accepts ints or floats (chapter numbers can be e.g. 100.5 for extras).
+    If valid_numbers is given (an iterable of the numbers actually present),
+    results are filtered to that set and unmatched tokens are reported.
+    Returns (matched_set, unmatched_tokens)."""
+    result = set()
+    unmatched = []
+    valid_set = set(valid_numbers) if valid_numbers is not None else None
+
+    def _to_num(s):
+        s = s.strip()
+        try:
+            return int(s) if float(s) == int(float(s)) else float(s)
+        except ValueError:
+            return None
+
+    for raw_token in text.split(","):
+        token = raw_token.strip()
+        if not token:
+            continue
+        if "-" in token[1:]:  # skip leading '-' for negative-safety, not expected but harmless
+            left, _, right = token.partition("-")
+            lo, hi = _to_num(left), _to_num(right)
+            if lo is None or hi is None:
+                unmatched.append(token)
+                continue
+            if lo > hi:
+                lo, hi = hi, lo
+            if valid_set is not None:
+                matches = {n for n in valid_set if lo <= n <= hi}
+                if not matches:
+                    unmatched.append(token)
+                result |= matches
+            else:
+                # No known valid set — expand integer range only
+                if isinstance(lo, float) or isinstance(hi, float):
+                    unmatched.append(token)
+                else:
+                    result |= set(range(int(lo), int(hi) + 1))
+        else:
+            n = _to_num(token)
+            if n is None:
+                unmatched.append(token)
+                continue
+            if valid_set is not None and n not in valid_set:
+                unmatched.append(token)
+                continue
+            result.add(n)
+
+    return result, unmatched
+
+def ask_number_range(message, valid_numbers, allow_all=False):
+    """Prompt for a range string against a known set of valid numbers, retrying on
+    bad/empty input. If allow_all is True, blank input returns None (meaning 'all')."""
+    valid_sorted = sorted(valid_numbers)
+    lo, hi = (valid_sorted[0], valid_sorted[-1]) if valid_sorted else (None, None)
+    hint = f" (available: {fmt_num(lo)}\u2013{fmt_num(hi)})" if lo is not None else ""
+    while True:
+        raw = prompt(f"{message}{hint}", default="" if allow_all else None, required=not allow_all)
+        if allow_all and not raw:
+            return None
+        matched, unmatched = parse_number_ranges(raw, valid_numbers=valid_numbers)
+        if unmatched:
+            print_warning(f"Not found / invalid: {', '.join(str(u) for u in unmatched)}. Try again.")
+            continue
+        if not matched:
+            print_warning("No chapters matched that range. Try again.")
+            continue
+        return matched
+
+def fmt_num(n):
+    return str(int(n)) if isinstance(n, (int, float)) and float(n) == int(n) else str(n)
+
 def to_full_cover_url(photo):
     if not photo: return None
     return photo if photo.startswith(("http://", "https://")) else f"{BASE_URL}{photo}"
@@ -692,7 +842,12 @@ def fetch_manga_brief(manga_id, session):
             data = res.json().get("manga", {})
             title = data.get("title")
             if title: return title, to_full_cover_url(data.get("photo", ""))
-    except Exception: pass
+    except requests.exceptions.RequestException as e:
+        logging.debug("fetch_manga_brief(%s): network error: %s", manga_id, e)
+        print_warning(f"Network error while looking up manga ID {manga_id}: {e}")
+    except json.JSONDecodeError as e:
+        logging.debug("fetch_manga_brief(%s): bad JSON response: %s", manga_id, e)
+        print_warning(f"Unexpected response while looking up manga ID {manga_id} — the site API may have changed.")
     return None, None
 
 def _render_cover(image_url: str, session: requests.Session, silent: bool = False) -> None:
@@ -712,7 +867,7 @@ def _render_cover(image_url: str, session: requests.Session, silent: bool = Fals
                 os.unlink(tmp.name)
             except OSError:
                 pass
-    except Exception as e:
+    except (requests.exceptions.RequestException, OSError) as e:
         if not silent:
             print_warning(f"Could not display cover art: {e}")
             print_info(f"Cover: {image_url}")
@@ -804,6 +959,94 @@ def parse_custom_regex_input(raw):
 
     return renames, extractor
 
+def _ask_chapter_naming():
+    """Ask the chapter naming format question. Returns
+    (chapter_naming, custom_regex, custom_renames, advanced_strip_groups)."""
+    chapter_naming = ask_select("Chapter naming format?", [
+        questionary.Choice(title="Force 'Chapter X' (Default)", value="preset"),
+        questionary.Choice(title="Auto-detect title (Recommended)", value="extract"),
+        questionary.Choice(title="Auto-detect title (Advanced)", value="advanced"),
+    ])
+
+    custom_regex = None
+    custom_renames = None
+    advanced_strip_groups = False
+
+    if chapter_naming == "advanced":
+        chapter_naming = "extract"  # advanced options augment auto-detect, they don't replace it
+        adv_choices = questionary.checkbox(
+            "Advanced auto-detect options (space to toggle, enter to confirm):",
+            choices=[
+                questionary.Choice(title="Custom regex...", value="regex"),
+                questionary.Choice(title="Strip bracket/parenthesis groups before detection", value="strip_groups"),
+            ],
+            qmark="?",
+        ).ask()
+        if adv_choices is None:
+            print_warning("No selection made — exiting.")
+            sys.exit(0)
+
+        if "regex" in adv_choices:
+            print_info("Regex Tip: Use a capture group () to extract a title, or 'Find -> Replace' to rename.")
+            custom_regex_input = prompt("Enter your regex pattern")
+            custom_renames, custom_regex = parse_custom_regex_input(custom_regex_input)
+        if "strip_groups" in adv_choices:
+            advanced_strip_groups = True
+
+    return chapter_naming, custom_regex, custom_renames, advanced_strip_groups
+
+# Cyrillic/Greek characters that are visually identical or near-identical to Latin
+# letters and can accidentally end up in filenames (e.g. pasted from a source using
+# a different keyboard layout or font). Without normalizing these, a filename like
+# "Сh.002" (Cyrillic С) fails to match the chapter/episode label regex entirely,
+# since it only recognizes Latin "ch"/"chapter"/"episode"/"ep".
+_HOMOGLYPH_MAP = {
+    'А': 'A', 'а': 'a', 'В': 'B', 'С': 'C', 'с': 'c', 'Е': 'E', 'е': 'e',
+    'Н': 'H', 'І': 'I', 'і': 'i', 'Ѕ': 'S', 'О': 'O', 'о': 'o', 'Р': 'P',
+    'р': 'p', 'Т': 'T', 'т': 't', 'Х': 'X', 'х': 'x', 'Ү': 'Y',
+}
+_HOMOGLYPH_TABLE = str.maketrans(_HOMOGLYPH_MAP)
+
+def normalize_homoglyphs(text):
+    """Return a Latin-normalized copy of text for regex matching purposes only.
+    This is a 1-to-1 character substitution (no insertions/deletions), so
+    character positions/indices stay identical to the original string -
+    match spans found against the normalized text are valid against the
+    original text too."""
+    return text.translate(_HOMOGLYPH_TABLE)
+
+def strip_leading_zeros_in_title(text):
+    """Strip unnecessary leading zeros from standalone numbers in title text.
+    e.g. 'Episode 001' -> 'Episode 1', 'Ch. 113 - Stalker (01)' -> 'Ch. 113 - Stalker (1)'.
+    Uses word boundaries so it won't touch things like 'S002' (no boundary between S and 0)."""
+    return re.sub(r'\b0+(\d+)\b', r'\1', text)
+
+def compile_removal_pattern(pattern_input):
+    """Compile a user-entered word/phrase into a regex pattern for removal.
+    Plain text (e.g. '(Official)') is treated literally so parens/brackets the user
+    typed as ordinary text don't get interpreted as regex groups. Only treated as a
+    real regex if it contains metacharacters unlikely to appear as plain text:
+    \\d \\w \\s * + ? | ^ $ {n,m} etc."""
+    looks_like_regex = bool(re.search(r'\\[dwsSDWbB]|[*+?^$|]|\{\d*,?\d*\}', pattern_input))
+    if looks_like_regex:
+        try:
+            re.compile(pattern_input)
+            return pattern_input
+        except re.error:
+            return re.escape(pattern_input)
+    return re.escape(pattern_input)
+
+def apply_removal_pattern(pattern, text):
+    """Apply a compiled removal pattern to text, cleaning up leftover empty
+    parens/brackets and extra whitespace. Returns None if the result would be empty."""
+    try:
+        result = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
+        result = re.sub(r'\(\s*\)|\[\s*\]', '', result)
+        result = re.sub(r'\s{2,}', ' ', result).strip(' -_')
+        return result if result else None
+    except re.error:
+        return None
+
 def parse_filename_details(filename, upload_type="chapter", chapter_naming="extract", custom_regex=None, strip_groups=False, custom_renames=None):
     name_no_ext = re.sub(r'\.(cbz|zip)$', '', filename, flags=re.IGNORECASE)
 
@@ -844,7 +1087,7 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
     else:
         num_pattern = r'(?i)(?:(?:\b|_)?(?:chapter|ch|episode|ep)|(?:\b|_)c)[\.\-_\s]*(\d+(?:\.\d+)?)'
 
-    matches = list(re.finditer(num_pattern, name_clean))
+    matches = list(re.finditer(num_pattern, normalize_homoglyphs(name_clean)))
     
     if len(matches) > 1:
         num = float(matches[0].group(1))
@@ -858,8 +1101,18 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
     elif len(matches) == 1:
         val = float(matches[0].group(1))
         matched_str = matches[0].group(0).lower()
-        
-        if matches[0].start() == 0 and re.search(r'0\d+', matched_str):
+        digits_str = matches[0].group(1)
+        has_explicit_label = bool(re.search(r'(?i)chapter|ch\b|episode|ep\b', matched_str))
+        # The file's own auto-generated sequence prefix always looks like a bare
+        # 'ch' immediately followed by digits with no separator (e.g. 'ch1000',
+        # 'ch0057') - lowercase, no dot/space, and not the word 'chapter'. Real
+        # chapter/episode labels almost always have a separator ('Ch. 001',
+        # 'Chapter 11') or use 'episode'/'ep'. This is more reliable than
+        # checking for zero-padding, which breaks once the sequence number
+        # reaches 4+ digits without a leading zero (e.g. 'ch1000').
+        is_bare_sequence_prefix = bool(re.fullmatch(r'ch\d+', matched_str)) and not has_explicit_label
+
+        if matches[0].start() == 0 and is_bare_sequence_prefix:
             num = val
             num_source = "sequence_index"
             episode_label_num = None
@@ -1023,14 +1276,13 @@ def validate_archive(filepath):
                 return "no image files inside"
     except zipfile.BadZipFile:
         return "not a valid ZIP/CBZ archive"
-    except Exception as e:
+    except (OSError, EOFError) as e:
         return f"unreadable archive ({str(e)[:40]})"
     return None
 
 def _correct_episode_drift(parsed):
     drift_detected = any(
-        (item.get("episode_label_num") is not None and item["episode_label_num"] != item["number"])
-        or (item.get("episode_label_num") is None)
+        item.get("episode_label_num") is not None and item["episode_label_num"] != item["number"]
         for item in parsed
     )
     has_real_labels = any(item.get("episode_label_num") is not None for item in parsed)
@@ -1042,18 +1294,34 @@ def _correct_episode_drift(parsed):
     conflicts = [item for item in parsed if item.get("episode_label_num") is not None and item["episode_label_num"] != item["number"]]
     
     if conflicts:
+        # Compute the drift (file_index - episode_label) for every conflict so the
+        # user can see whether this is one clean, consistent reset (safe to resolve
+        # with a single choice) or several different drift amounts (which a single
+        # Continuous/Trust-Labels choice can't correctly handle for the whole batch).
+        drifts = [item['number'] - item['episode_label_num'] for item in conflicts]
+        distinct_drifts = sorted(set(round(d, 4) for d in drifts))
+
         console.print()
         console.rule("[bold yellow]Numbering Conflict Detected[/bold yellow]")
-        print_info("Filename sequence and Episode labels disagree (likely a Season 2 reset).")
+        print_info("Filename sequence and Episode labels disagree (this can happen after a season reset, inserted specials, or renumbering).")
+        print_info(f"{len(conflicts)} file(s) affected.")
+        if len(distinct_drifts) == 1:
+            print_info(f"Drift is consistent: File Index is always {distinct_drifts[0]:+g} relative to Episode Label.")
+        else:
+            print_info(f"[yellow]Drift is NOT consistent — {len(distinct_drifts)} different drift amounts found ({distinct_drifts[0]:+g} to {distinct_drifts[-1]:+g}).[/yellow]")
+            print_info("[yellow]A single choice below may not be correct for every file — consider reviewing individual titles afterward.[/yellow]")
         print_info(f"Example: '{conflicts[0]['filename']}'")
         print_info(f" -> File Index:    [magenta]{conflicts[0]['number']:g}[/magenta]")
         print_info(f" -> Episode Label: [cyan]{conflicts[0]['episode_label_num']:g}[/cyan]\n")
         
+        example_file_index = conflicts[0]['number']
+        example_episode_label = conflicts[0]['episode_label_num']
+
         choice = ask_select(
             "How should these be sorted on MangaDot?",
             choices=[
-                questionary.Choice(title="Continuous (Use File Index 'ch0057' -> Ch 57)", value="continuous"),
-                questionary.Choice(title="Trust Labels (Use Label 'Episode 1' -> Ch 1)", value="reset")
+                questionary.Choice(title=f"Continuous (Use File Index -> Ch {example_file_index:g})", value="continuous"),
+                questionary.Choice(title=f"Trust Labels (Use Label -> Ch {example_episode_label:g})", value="reset")
             ]
         )
         if choice == "continuous":
@@ -1074,24 +1342,49 @@ def _correct_episode_drift(parsed):
             start = i
             while i < len(ordered) and ordered[i].get("episode_label_num") is None:
                 i += 1
+            prev_val = ordered[start - 1]["number"] if start > 0 else 0.0
             block = ordered[start:i]
-            
-            prev_val = ordered[start-1]["number"] if start > 0 else 0.0
-            next_val = prev_val + 1.0 
-            
-            for j in range(i, len(ordered)):
-                if ordered[j].get("episode_label_num") is not None:
-                    if ordered[j]["number"] > prev_val:
-                        next_val = ordered[j]["number"]
-                    break
-            
             n = len(block)
-            if n == 1:
-                block[0]["number"] = round(prev_val + 0.5, 4)
+            if i < len(ordered) and ordered[i]["number"] > prev_val:
+                next_val = ordered[i]["number"]
             else:
-                step = (next_val - prev_val) / (n + 1)
+                # No next labeled item (trailing run at the end of the list, or
+                # the file list started with unlabeled items) - leave enough
+                # room for the whole block to count up sequentially rather than
+                # collapsing everything into a 1.0-wide gap.
+                next_val = prev_val + n + 1.0
+
+            gap = next_val - prev_val
+
+            if n == 1:
+                block[0]["number"] = round(prev_val + gap / 2, 6)
+            elif gap >= n + 1:
+                # There's enough room to continue sequential whole numbers
+                # (prev_val + 1, prev_val + 2, ...) without reaching next_val.
+                # This is the right treatment for a long run of unlabeled files
+                # that are really just sequential chapters without an explicit
+                # "Chapter N" label in the filename - not a small cluster of
+                # specials squeezed between two labeled chapters, which is what
+                # the decimal (.1/.2/.3...) scheme below is for.
                 for k, item in enumerate(block):
-                    item["number"] = round(prev_val + step * (k + 1), 4)
+                    item["number"] = round(prev_val + (k + 1), 6)
+            else:
+                # Multiple unlabeled items in this gap: number them prev.1, prev.2, prev.3...
+                # in file order, but only as many decimal places as needed to fit
+                # strictly within the available gap without colliding with next_val.
+                pad = 2 if n > 9 else 1
+                base = int(prev_val)
+                step = 1 / (10 ** pad)
+                for k, item in enumerate(block):
+                    frac = (k + 1) * step
+                    proposed = round(base + frac, pad + 4)
+                    # Guard against overshooting into or past the next real label
+                    # (can happen if prev_val's fractional part is already close
+                    # to next_val, e.g. prev=9.9, next=10.0).
+                    if proposed >= next_val:
+                        # Fall back to splitting the remaining gap evenly instead.
+                        proposed = round(prev_val + gap * (k + 1) / (n + 1), 6)
+                    item["number"] = proposed
         else:
             i += 1
 
@@ -1106,7 +1399,7 @@ def _correct_episode_drift(parsed):
                 updated_candidates.append((label, text))
             item["candidates"] = updated_candidates
 
-def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_regex=None, strip_groups=False, validate=True, custom_renames=None):
+def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_regex=None, strip_groups=False, validate=True, custom_renames=None, select_subset=False):
     valid_extensions = ('.cbz', '.zip')
     parsed = []
 
@@ -1146,8 +1439,93 @@ def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_re
 
     parsed.sort(key=lambda x: x["number"])
 
+    if select_subset and parsed:
+        unit = "volume" if upload_type == "volume" else "chapter"
+        console.print()
+        print_info(f"Found {len(parsed)} {unit}(s) in this folder.")
+        upload_all = ask_confirm(f"Upload all {len(parsed)} {unit}(s)?", default=True)
+        if not upload_all:
+            valid_numbers = [item["number"] for item in parsed]
+            chosen_numbers = ask_number_range(
+                f"Which {unit}s do you want to upload? (e.g. '103-108,110,115-117')",
+                valid_numbers=valid_numbers
+            )
+            parsed = [item for item in parsed if item["number"] in chosen_numbers]
+            print_success(f"Selected {len(parsed)} {unit}(s) to upload.\n")
+
+    shape_key_counts = Counter(item["shape_key"] for item in parsed)
+
     shape_choices = {}
+    range_choices = {}  # shape_key -> list of (number_set, chosen_label, cached-form for lookup)
     files_data = []
+
+    def _pick_candidate_title(filename, candidates, match_count, scope_desc):
+        """Runs the interactive multi-candidate picker once and returns (final_title, chosen_label)."""
+        choices = [
+            questionary.Choice(title=f"{label}: {text}", value=str(i))
+            for i, (label, text) in enumerate(candidates)
+        ]
+        choices.append(questionary.Choice(title="Remove word/phrase (regex)...", value="__regex_remove__"))
+        choices.append(questionary.Choice(title="Remove unnecessary leading zeros...", value="__strip_zeros__"))
+        choices.append(questionary.Choice(title="Type my own...", value="__custom__"))
+        console.print()
+        while True:
+            selection = ask_select(
+                f"Select title for '{filename}' (applies to {scope_desc}):",
+                choices=choices,
+                auto_number=True
+            )
+            if selection == "__custom__":
+                candidate_title = prompt(f"Enter custom title for '{filename}'", default=candidates[0][1]).strip() or candidates[0][1]
+                candidate_label = None
+            elif selection == "__regex_remove__":
+                base_label, base_text = candidates[0]
+                print_info(f"Base title: \"{base_text}\"")
+                pattern_input = prompt("Enter word/phrase to remove (plain text, or a regex pattern)")
+                if not pattern_input:
+                    continue
+                pattern = compile_removal_pattern(pattern_input)
+                candidate_title = apply_removal_pattern(pattern, base_text)
+                if candidate_title is None:
+                    print_warning("Removing that would leave an empty title — try a narrower pattern.")
+                    continue
+                candidate_label = {"type": "regex_remove", "pattern": pattern}
+            elif selection == "__strip_zeros__":
+                base_label, base_text = candidates[0]
+                candidate_title = strip_leading_zeros_in_title(base_text)
+                if candidate_title == base_text:
+                    print_info("No unnecessary leading zeros found in this title.")
+                candidate_label = {"type": "strip_zeros"}
+            else:
+                candidate_label, candidate_title = candidates[int(selection)]
+
+            if match_count > 1:
+                confirmed = ask_confirm(
+                    f"Use \"{candidate_title}\" as the title? This applies to {scope_desc}. Confirm?",
+                    default=True
+                )
+            else:
+                confirmed = ask_confirm(
+                    f"Use \"{candidate_title}\" as the title for '{filename}'? Confirm?",
+                    default=True
+                )
+            if confirmed:
+                return candidate_title, candidate_label
+            # Not confirmed: loop back and let the user pick again
+
+    def _apply_cached(cached, candidates, num):
+        if isinstance(cached, dict) and cached.get("type") == "regex_remove":
+            base_label, base_text = candidates[0] if candidates else ("Full title (as detected)", f"Chapter {num:g}")
+            return apply_removal_pattern(cached["pattern"], base_text) or base_text
+        if isinstance(cached, dict) and cached.get("type") == "strip_zeros":
+            base_label, base_text = candidates[0] if candidates else ("Full title (as detected)", f"Chapter {num:g}")
+            return strip_leading_zeros_in_title(base_text)
+        by_label = {l: t for l, t in candidates}
+        if cached in by_label:
+            return by_label[cached]
+        elif candidates:
+            return candidates[0][1]
+        return f"Chapter {num:g}"
 
     for item in parsed:
         filename    = item["filename"]
@@ -1158,42 +1536,58 @@ def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_re
         file_groups = item["groups"]
         shape_key   = item["shape_key"]
 
-        if shape_key in shape_choices:
-            chosen_label = shape_choices[shape_key]
-            by_label = {l: t for l, t in candidates}
-            if chosen_label in by_label:
-                final_title = by_label[chosen_label]
-            elif candidates:
-                final_title = candidates[0][1]
-            else:
-                final_title = f"Chapter {num:g}"
+        # A range-scoped decision for this shape takes priority over the whole-shape cache,
+        # since it was made specifically for this file's number.
+        matched_range_choice = None
+        for number_set, chosen_label in range_choices.get(shape_key, []):
+            if num in number_set:
+                matched_range_choice = chosen_label
+                break
+
+        if matched_range_choice is not None:
+            final_title = _apply_cached(matched_range_choice, candidates, num)
+            chosen_label = matched_range_choice
+        elif shape_key in shape_choices:
+            cached = shape_choices[shape_key]
+            final_title = _apply_cached(cached, candidates, num)
+            chosen_label = cached
         elif candidates:
             chosen_label = None
             if len(candidates) == 1:
                 label, text = candidates[0]
                 console.print()
-                confirmed = ask_confirm(f"'{filename}' -> title will be [bold]\"{text}\"[/bold] ({label}). Use this for matching files?", default=True)
+                confirmed = ask_confirm(f"'{filename}' -> {label}: \"{text}\". Use this for matching files?", default=True)
                 if confirmed:
                     final_title = text
                     chosen_label = label
                 else:
                     final_title = prompt(f"Enter title for '{filename}'", default=text).strip() or text
             else:
-                choices = [
-                    questionary.Choice(title=f"{text}  [dim]({label})[/dim]", value=str(i))
-                    for i, (label, text) in enumerate(candidates)
-                ]
-                choices.append(questionary.Choice(title="Type my own...", value="__custom__"))
-                console.print()
-                selection = ask_select(
-                    f"Select title for '{filename}' (applies to all similarly-formatted files):",
-                    choices=choices,
-                    auto_number=True
-                )
-                if selection == "__custom__":
-                    final_title = prompt(f"Enter custom title for '{filename}'", default=candidates[0][1]).strip() or candidates[0][1]
+                match_count = shape_key_counts.get(shape_key, 1)
+                scope = "all similarly-formatted files"
+                if match_count > 1:
+                    applies_to = ask_select(
+                        f"Select title for '{filename}' applies to:",
+                        choices=[
+                            questionary.Choice(title="All similarly-formatted files", value="all"),
+                            questionary.Choice(title="Choose your chapter range from similarly-formatted files", value="range"),
+                        ],
+                        auto_number=True
+                    )
+                    if applies_to == "range":
+                        same_shape_numbers = [p["number"] for p in parsed if p["shape_key"] == shape_key]
+                        chosen_numbers = ask_number_range(
+                            "Which chapters should this title choice apply to?",
+                            valid_numbers=same_shape_numbers
+                        )
+                        scope = f"{len(chosen_numbers)} chosen chapter(s)"
+                        final_title, candidate_label = _pick_candidate_title(filename, candidates, len(chosen_numbers), scope)
+                        range_choices.setdefault(shape_key, []).append((chosen_numbers, candidate_label))
+                        chosen_label = None  # do not memoize to shape_choices — this was range-scoped only
+                    else:
+                        final_title, chosen_label = _pick_candidate_title(filename, candidates, match_count, scope)
                 else:
-                    chosen_label, final_title = candidates[int(selection)]
+                    final_title, chosen_label = _pick_candidate_title(filename, candidates, match_count, scope)
             if chosen_label is not None:
                 shape_choices[shape_key] = chosen_label
         else:
@@ -1218,7 +1612,7 @@ def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_re
             "filepath": filepath, "filename": filename,
             "norm_filepath": _norm_filepath(filepath),
             "number": num, "title": final_title, "size": file_size,
-            "groups": file_groups,
+            "groups": file_groups, "shape_key": shape_key, "candidates": candidates,
         })
 
     files_data.sort(key=lambda x: x["number"])
@@ -1246,13 +1640,267 @@ def fmt_duration(seconds) -> str:
     if m: return f"{m}m {s}s"
     return f"{s}s"
 
+def review_and_edit_titles(files):
+    """Post-scan review pass: let the user apply a global find/replace across
+    all titles (with a live preview before committing), redo the title for
+    a specific group of files, or override the computed number for a
+    specific file, before finally proceeding to upload."""
+    while True:
+        console.print()
+        action = ask_select(
+            "Everything look good, or want to adjust anything?",
+            choices=[
+                questionary.Choice(title="Proceed with upload", value="proceed"),
+                questionary.Choice(title="Remove word/phrase from ALL titles...", value="global_remove"),
+                questionary.Choice(title="Remove word/phrase from titles with specific range or single title...", value="ranged_remove"),
+                questionary.Choice(title="Redo title for a specific group...", value="redo_group"),
+                questionary.Choice(title="Change the number for a specific file...", value="edit_number"),
+            ]
+        )
+
+        if action == "proceed":
+            return files
+
+        elif action == "edit_number":
+            search = prompt("Type part of the filename to find it (e.g. 'Prologue' or 'ch0001')")
+            if not search:
+                continue
+            matches = [f for f in files if search.lower() in f["filename"].lower()]
+            if not matches:
+                print_warning(f"No filename contains \"{search}\".")
+                continue
+            if len(matches) > 1:
+                choices = [
+                    questionary.Choice(title=f"{f['filename']}  (currently {f['number']:g})", value=idx)
+                    for idx, f in enumerate(matches)
+                ]
+                choices.append(questionary.Choice(title="Cancel", value="__cancel__"))
+                pick = ask_select(f"{len(matches)} files match — which one?", choices=choices)
+                if pick == "__cancel__":
+                    continue
+                target = matches[pick]
+            else:
+                target = matches[0]
+
+            console.print()
+            print_info(f"'{target['filename']}' is currently number {target['number']:g}.")
+            while True:
+                new_num_input = prompt("Enter new number", default=f"{target['number']:g}").strip()
+                try:
+                    new_num = float(new_num_input)
+                    break
+                except ValueError:
+                    print_error("Please enter a valid number (e.g. 0, 1.5, 12).")
+
+            existing = [f for f in files if f is not target and f["number"] == new_num]
+            if existing:
+                print_warning(f"Number {new_num:g} is already used by: {', '.join(f['filename'] for f in existing)}")
+                if not ask_confirm("Set it anyway and create a duplicate? (You can resolve it in the next step)", default=False):
+                    continue
+
+            target["number"] = new_num
+            files.sort(key=lambda x: x["number"])
+            print_success(f"'{target['filename']}' is now number {new_num:g}.")
+            print_files_table(files, files[0].get("_upload_type", "chapter"), group_label=files[0].get("_group_label"))
+
+        elif action == "global_remove":
+            pattern_input = prompt("Enter word/phrase to remove from every title (plain text, or a regex pattern)")
+            if not pattern_input:
+                continue
+            pattern = compile_removal_pattern(pattern_input)
+
+            preview = []
+            affected = 0
+            for f in files:
+                new_title = apply_removal_pattern(pattern, f["title"])
+                if new_title is not None and new_title != f["title"]:
+                    affected += 1
+                    if len(preview) < 8:
+                        preview.append((f["filename"], f["title"], new_title))
+
+            if affected == 0:
+                print_warning(f"No titles contain \"{pattern_input}\" — nothing to change.")
+                continue
+
+            console.print()
+            print_info(f"This will change {affected} of {len(files)} title(s). Preview:")
+            for fname, old_t, new_t in preview:
+                console.print(f"  [dim]{fname}[/dim]")
+                console.print(f"    [red]- {old_t}[/red]")
+                console.print(f"    [green]+ {new_t}[/green]")
+            if affected > len(preview):
+                print_info(f"  ...and {affected - len(preview)} more.")
+
+            console.print()
+            if ask_confirm(f"Apply this removal to all {affected} affected title(s)?", default=True):
+                for f in files:
+                    new_title = apply_removal_pattern(pattern, f["title"])
+                    if new_title is not None:
+                        f["title"] = new_title
+                print_success(f"Updated {affected} title(s).")
+                print_files_table(files, files[0].get("_upload_type", "chapter"), group_label=files[0].get("_group_label"))
+            # else: loop back to the menu without changes
+
+        elif action == "ranged_remove":
+            scope = ask_select(
+                "Apply to:",
+                choices=[
+                    questionary.Choice(title="A chapter/number range (e.g. '103-108,110')", value="range"),
+                    questionary.Choice(title="A single title (search by filename)", value="single"),
+                ]
+            )
+            if scope == "range":
+                valid_numbers = [f["number"] for f in files]
+                chosen_numbers = ask_number_range("Which numbers should this apply to?", valid_numbers=valid_numbers)
+                targets = [f for f in files if f["number"] in chosen_numbers]
+            else:
+                search = prompt("Type part of the filename to find it (e.g. 'Prologue' or 'ch0001')")
+                if not search:
+                    continue
+                matches = [f for f in files if search.lower() in f["filename"].lower()]
+                if not matches:
+                    print_warning(f"No filename contains \"{search}\".")
+                    continue
+                if len(matches) > 1:
+                    choices = [
+                        questionary.Choice(title=f"{f['filename']}  (currently \"{f['title']}\")", value=idx)
+                        for idx, f in enumerate(matches)
+                    ]
+                    choices.append(questionary.Choice(title="Cancel", value="__cancel__"))
+                    pick = ask_select(f"{len(matches)} files match — which one?", choices=choices)
+                    if pick == "__cancel__":
+                        continue
+                    targets = [matches[pick]]
+                else:
+                    targets = [matches[0]]
+
+            if not targets:
+                print_warning("No files matched — nothing to change.")
+                continue
+
+            pattern_input = prompt("Enter word/phrase to remove (plain text, or a regex pattern)")
+            if not pattern_input:
+                continue
+            pattern = compile_removal_pattern(pattern_input)
+
+            preview = []
+            affected = 0
+            for f in targets:
+                new_title = apply_removal_pattern(pattern, f["title"])
+                if new_title is not None and new_title != f["title"]:
+                    affected += 1
+                    if len(preview) < 8:
+                        preview.append((f["filename"], f["title"], new_title))
+
+            if affected == 0:
+                print_warning(f"No selected titles contain \"{pattern_input}\" — nothing to change.")
+                continue
+
+            console.print()
+            print_info(f"This will change {affected} of {len(targets)} selected title(s). Preview:")
+            for fname, old_t, new_t in preview:
+                console.print(f"  [dim]{fname}[/dim]")
+                console.print(f"    [red]- {old_t}[/red]")
+                console.print(f"    [green]+ {new_t}[/green]")
+            if affected > len(preview):
+                print_info(f"  ...and {affected - len(preview)} more.")
+
+            console.print()
+            if ask_confirm(f"Apply this removal to all {affected} affected title(s)?", default=True):
+                for f in targets:
+                    new_title = apply_removal_pattern(pattern, f["title"])
+                    if new_title is not None:
+                        f["title"] = new_title
+                print_success(f"Updated {affected} title(s).")
+                print_files_table(files, files[0].get("_upload_type", "chapter"), group_label=files[0].get("_group_label"))
+            # else: loop back to the menu without changes
+
+        elif action == "redo_group":
+            # Group files by their current title-derivation shape so the user can
+            # pick a group of similarly-formatted files and redo the choice for all of them.
+            groups = {}
+            for f in files:
+                key = f.get("shape_key", f["title"])
+                groups.setdefault(key, []).append(f)
+
+            group_list = sorted(groups.items(), key=lambda kv: -len(kv[1]))
+            choices = []
+            for key, group_files in group_list:
+                sample_title = group_files[0]["title"]
+                sample_name = group_files[0]["filename"]
+                choices.append(questionary.Choice(
+                    title=f"({len(group_files)} file(s)) \"{sample_title}\"  e.g. '{sample_name}'",
+                    value=key
+                ))
+            choices.append(questionary.Choice(title="Cancel", value="__cancel__"))
+
+            console.print()
+            selection = ask_select("Which group do you want to redo the title for?", choices=choices)
+            if selection == "__cancel__":
+                continue
+
+            group_files = groups[selection]
+            sample = group_files[0]
+            candidates = sample.get("candidates") or [("Full title (as detected)", sample["title"])]
+
+            picker_choices = [
+                questionary.Choice(title=f"{label}: {text}", value=str(i))
+                for i, (label, text) in enumerate(candidates)
+            ]
+            picker_choices.append(questionary.Choice(title="Remove word/phrase (regex)...", value="__regex_remove__"))
+            picker_choices.append(questionary.Choice(title="Remove unnecessary leading zeros...", value="__strip_zeros__"))
+            picker_choices.append(questionary.Choice(title="Type my own...", value="__custom__"))
+
+            console.print()
+            while True:
+                pick = ask_select(
+                    f"Select new title for this group ({len(group_files)} file(s), e.g. '{sample['filename']}'):",
+                    choices=picker_choices
+                )
+                if pick == "__custom__":
+                    new_title = prompt(f"Enter custom title", default=sample["title"]).strip() or sample["title"]
+                    break
+                elif pick == "__regex_remove__":
+                    pattern_input = prompt("Enter word/phrase to remove (plain text, or a regex pattern)")
+                    if not pattern_input:
+                        continue
+                    pattern = compile_removal_pattern(pattern_input)
+                    new_title = apply_removal_pattern(pattern, candidates[0][1])
+                    if new_title is None:
+                        print_warning("Removing that would leave an empty title — try a narrower pattern.")
+                        continue
+                    break
+                elif pick == "__strip_zeros__":
+                    new_title = strip_leading_zeros_in_title(candidates[0][1])
+                    break
+                else:
+                    new_title = candidates[int(pick)][1]
+                    break
+
+            console.print()
+            if ask_confirm(f"Use \"{new_title}\" for all {len(group_files)} file(s) in this group?", default=True):
+                for f in group_files:
+                    # Re-derive per-file so files with different base text in the same
+                    # shape still get an appropriately-transformed title, not one fixed string.
+                    f_candidates = f.get("candidates") or [("Full title (as detected)", f["title"])]
+                    if pick == "__custom__":
+                        f["title"] = new_title
+                    elif pick == "__regex_remove__":
+                        f["title"] = apply_removal_pattern(pattern, f_candidates[0][1]) or f["title"]
+                    elif pick == "__strip_zeros__":
+                        f["title"] = strip_leading_zeros_in_title(f_candidates[0][1])
+                    else:
+                        f["title"] = f_candidates[min(int(pick), len(f_candidates) - 1)][1]
+                print_success(f"Updated {len(group_files)} title(s).")
+                print_files_table(files, files[0].get("_upload_type", "chapter"), group_label=files[0].get("_group_label"))
+
 def print_files_table(files, upload_type, group_label=None):
     total_size = sum(f["size"] for f in files)
     print_success(f"Found {len(files)} file(s)  ({fmt_size(total_size)} total)\n")
 
     has_groups = any(f.get("groups") for f in files) or bool(group_label)
 
-    table = Table(box=box.ROUNDED, header_style="bold cyan", border_style="cyan", row_styles=["", "dim"])
+    table = Table(box=box.ROUNDED, header_style="bold cyan", border_style="cyan")
     table.add_column("Filename", style="white", overflow="fold")
     table.add_column("Number", style="magenta", justify="right")
     table.add_column("Title", style="green", overflow="fold")
@@ -1301,30 +1949,88 @@ def _check_missing(files, upload_type):
         print_warning("Please verify this is intentional before proceeding.\n")
 
 def _check_duplicates(files, upload_type):
-    by_number = {}
-    for f in files:
-        by_number.setdefault(f["number"], []).append(f["filename"])
-    dups = {n: names for n, names in by_number.items() if len(names) > 1}
-    if dups:
-        term = "chapter" if upload_type == "chapter" else "volume"
+    """Detect duplicate chapter/volume numbers and let the user resolve them:
+    exclude a file, give it a new number, or proceed anyway. Returns the
+    (possibly modified) files list. Loops until the user is done resolving
+    or chooses to proceed with duplicates intact."""
+    term = "chapter" if upload_type == "chapter" else "volume"
+
+    while True:
+        by_number = {}
+        for f in files:
+            by_number.setdefault(f["number"], []).append(f)
+        dups = {n: flist for n, flist in by_number.items() if len(flist) > 1}
+        if not dups:
+            return files
+
         print_warning(f"Duplicate {term} number(s) detected:")
         for n in sorted(dups):
-            print_warning(f"  • {term.title()} {n:g}: {', '.join(dups[n])}")
-        print_warning("All listed files will be uploaded — remove duplicates if unintended.\n")
+            names = ", ".join(f["filename"] for f in dups[n])
+            print_warning(f"  • {term.title()} {n:g}: {names}")
+        console.print()
+
+        action = ask_select(
+            f"How do you want to handle these {len(dups)} duplicate number(s)?",
+            choices=[
+                questionary.Choice(title="Resolve them one by one (exclude or renumber)", value="resolve"),
+                questionary.Choice(title="Proceed anyway (upload all, duplicates included)", value="proceed"),
+            ]
+        )
+        if action == "proceed":
+            print_warning("All listed files will be uploaded — duplicates included.\n")
+            return files
+
+        for n in sorted(dups):
+            dup_files = [f for f in dups[n] if f in files]
+            if len(dup_files) < 2:
+                continue  # already resolved by a previous iteration
+            console.print()
+            print_info(f"{term.title()} {n:g} has {len(dup_files)} file(s):")
+            choices = []
+            for f in dup_files:
+                choices.append(questionary.Choice(title=f"Keep '{f['filename']}' -> exclude the other(s)", value=("keep", f)))
+            choices.append(questionary.Choice(title="Keep all — give them different numbers", value=("renumber", None)))
+            choices.append(questionary.Choice(title="Keep all as-is (leave this duplicate)", value=("skip", None)))
+
+            pick = ask_select(f"Resolve {term} {n:g}:", choices=choices)
+            action_type, keep_file = pick
+
+            if action_type == "keep":
+                for f in dup_files:
+                    if f is not keep_file:
+                        files.remove(f)
+                        print_info(f"Excluded '{f['filename']}'.")
+            elif action_type == "renumber":
+                for f in dup_files:
+                    while True:
+                        new_num_input = prompt(f"New number for '{f['filename']}' (currently {n:g})", default=f"{n:g}").strip()
+                        try:
+                            new_num = float(new_num_input)
+                            break
+                        except ValueError:
+                            print_error("Please enter a valid number.")
+                    f["number"] = new_num
+            # "skip": leave as-is, will be re-reported if still duplicated after this pass
+
+        files.sort(key=lambda x: x["number"])
+        console.print()
 
 def load_config():
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
-    except Exception:
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as e:
+        logging.debug("load_config: could not read %s (%s); starting with empty config.", CONFIG_PATH, e)
         return {}
 
 def save_config(cfg):
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
-    except Exception as e:
+    except (OSError, TypeError, ValueError) as e:
         logging.debug("save_config: failed to write %s: %s", CONFIG_PATH, e)
 
 def _remember_library(lib):
@@ -1414,34 +2120,24 @@ def run_dry_run(library_dir=None):
 
     chapter_naming = "extract"
     custom_regex   = None
+    custom_renames = None
+    advanced_strip_groups = False
     if upload_type == "chapter":
-        chapter_naming = ask_select("Chapter naming format?", [
-            questionary.Choice(title="Force 'Chapter X'", value="preset"),
-            questionary.Choice(title="Auto-detect title", value="extract"),
-            questionary.Choice(title="Custom regex", value="custom"),
-        ])
-        if chapter_naming == "custom":
-            print_info("Regex Tip: Use a capture group () to extract a title, or 'Find -> Replace' to rename.")
-            custom_regex_input = prompt("Enter your regex pattern")
-            custom_renames, custom_regex = parse_custom_regex_input(custom_regex_input)
-        else:
-            custom_renames = None
-    else:
-        custom_renames = None
+        chapter_naming, custom_regex, custom_renames, advanced_strip_groups = _ask_chapter_naming()
 
     console.print()
     console.rule("[dim]Files[/dim]", style="green")
     console.print()
 
     print_info("Scanning directory for files...")
-    files = get_files_in_dir(directory, upload_type, chapter_naming, custom_regex, strip_groups=False, custom_renames=custom_renames)
+    files = get_files_in_dir(directory, upload_type, chapter_naming, custom_regex, strip_groups=advanced_strip_groups, custom_renames=custom_renames, select_subset=True)
     if not files:
         print_error("No valid .cbz or .zip files found.")
         sys.exit(1)
 
     print_files_table(files, upload_type)
     _check_missing(files, upload_type)
-    _check_duplicates(files, upload_type)
+    files = _check_duplicates(files, upload_type)
 
     print_success("Dry run complete — no files were uploaded.")
     console.print()
@@ -1461,7 +2157,10 @@ def validate_session(session):
             name = profile.get("username") or profile.get("email")
             user_id = profile.get("id") or profile.get("user_id") or profile.get("uid")
             return name, user_id
-    except Exception: pass
+    except requests.exceptions.RequestException as e:
+        logging.debug("validate_session: network error: %s", e)
+    except json.JSONDecodeError as e:
+        logging.debug("validate_session: unexpected (non-JSON) response: %s", e)
     return None, None
 
 def search_manga(query, session):
@@ -1469,7 +2168,13 @@ def search_manga(query, session):
         res = session.get(f"{BASE_URL}/search.data", params={"search": query}, timeout=(10, 30))
         if res.status_code != 200: return []
         arr = res.json()
-    except Exception: return []
+    except requests.exceptions.RequestException as e:
+        print_warning(f"Network error while searching for manga: {e}")
+        return []
+    except json.JSONDecodeError as e:
+        logging.debug("search_manga: bad JSON response: %s", e)
+        print_warning("Search returned an unreadable response. The site API may have changed.")
+        return []
 
     mangas = []
     if not isinstance(arr, list): return []
@@ -1507,7 +2212,13 @@ def search_groups(query, session):
         res = session.get(f"{BASE_URL}/api/groups", params={"q": query, "limit": 25}, timeout=(10, 30))
         if res.status_code != 200: return []
         return res.json().get("groups", [])
-    except Exception: return []
+    except requests.exceptions.RequestException as e:
+        print_warning(f"Network error while searching for groups: {e}")
+        return []
+    except json.JSONDecodeError as e:
+        logging.debug("search_groups: bad JSON response: %s", e)
+        print_warning("Group search returned an unreadable response. The site API may have changed.")
+        return []
 
 def _group_search_queries(name):
     queries = [name]
@@ -1585,12 +2296,13 @@ def resolve_group_names(names, session):
     return group_ids, unresolved
 
 class SessionExpiredError(Exception): pass
+class BatchInitError(Exception): pass
 
 def _read_cookie_db_with_fallback(db_path, domains=None):
     try:
         return rookiepy.firefox_based(db_path, domains=domains)
-    except Exception:
-        pass
+    except (OSError, sqlite3.Error) as e:
+        logging.debug("_read_cookie_db_with_fallback: direct read failed for %s (%s); trying a copy.", db_path, e)
 
     tmp_dir = tempfile.mkdtemp(prefix="mangadot_zen_cookies_")
     try:
@@ -1699,7 +2411,7 @@ def _cdp_port_is_up(port, timeout=1.0):
     try:
         r = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=timeout)
         return r.status_code == 200
-    except Exception:
+    except requests.exceptions.RequestException:
         return False
 
 def _cdp_wait_for_port(port, timeout=CDP_STARTUP_WAIT):
@@ -1758,7 +2470,7 @@ def _cdp_pid_matches_expected_exe(pid, expected_exe):
                 return False
             running_name = os.path.basename(result.stdout.strip()).lower()
             return running_name == expected_name
-    except Exception:
+    except (subprocess.SubprocessError, OSError):
         return False
 
 def _cdp_kill_stale_process(browser_key):
@@ -1793,7 +2505,7 @@ def _cdp_kill_stale_process(browser_key):
                 os.kill(old_pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass  
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         pass 
     finally:
         try:
@@ -1840,7 +2552,7 @@ def _cdp_launch_browser(browser_key, url):
             proc.terminate()
             return None
         return proc
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return None
 
 def _cdp_get_targets(port):
@@ -1848,7 +2560,7 @@ def _cdp_get_targets(port):
         r = requests.get(f"http://127.0.0.1:{port}/json/list", timeout=5)
         r.raise_for_status()
         return r.json()
-    except Exception:
+    except (requests.exceptions.RequestException, json.JSONDecodeError):
         return []
 
 def _cdp_open_new_tab(port, url):
@@ -1858,7 +2570,7 @@ def _cdp_open_new_tab(port, url):
             r = requests.get(f"http://127.0.0.1:{port}/json/new?{url}", timeout=5)
         r.raise_for_status()
         return r.json()
-    except Exception:
+    except (requests.exceptions.RequestException, json.JSONDecodeError):
         return None
 
 def _cdp_get_all_cookies(port, timeout=10):
@@ -1887,7 +2599,8 @@ def _cdp_get_all_cookies(port, timeout=10):
                     return msg.get("result", {}).get("cookies", [])
         finally:
             ws.close()
-    except Exception:
+    except (websocket.WebSocketException, OSError, TimeoutError) as e:
+        logging.debug("_cdp_get_all_cookies: websocket connection to %s failed: %s", ws_url, e)
         return None
 
 def _cdp_tracked_process_alive(browser_key):
@@ -1907,7 +2620,7 @@ def _cdp_tracked_process_alive(browser_key):
                 capture_output=True, text=True, timeout=5, check=False,
             )
             return str(pid) in out.stdout
-        except Exception:
+        except (subprocess.SubprocessError, OSError):
             return False
     else:
         try:
@@ -1915,7 +2628,7 @@ def _cdp_tracked_process_alive(browser_key):
             return True
         except (ProcessLookupError, PermissionError):
             return False
-        except Exception:
+        except OSError:
             return False
 
 def get_cdp_cookies(browser_key, domains=None):
@@ -1927,8 +2640,9 @@ def get_cdp_cookies(browser_key, domains=None):
         launched_proc = _cdp_launch_browser(browser_key, BASE_URL)
         if launched_proc is None:
             print_error(f"Could not find or launch {browser_key.title()} for CDP mode.")
-            print_info(f"If {browser_key.title()} is installed in a custom location, "
-                       f"tell Claude the exact path to its .exe and it can be added directly.")
+            print_info(f"If {browser_key.title()} is installed in a custom location, add its "
+                       f"full path to the CDP_BROWSER_EXECUTABLES dict near the top of this script "
+                       f"(under \"{browser_key}\" -> your OS).")
             return []
 
         print_info(f"Launched a dedicated {browser_key.title()} debug profile.")
@@ -2008,6 +2722,7 @@ def authenticate_session(req_session, force_browser=None):
                               f"but the server didn't recognize the session as logged in.")
             else:
                 console.print(f"  [dim]· {browser_name.title()}: found {len(browser_cookies)} cookie(s), session not recognized[/dim]")
+        
         except Exception as e:
             safe_loud = force_browser or (browser_name == "zen")
             hint = ""
@@ -2016,9 +2731,9 @@ def authenticate_session(req_session, force_browser=None):
                         f"Chromium browsers encrypt cookies at rest and usually block direct decryption -- "
                         f"try '{browser_name.title()} (Cdp)' instead.[/dim]")
             if safe_loud:
-                print_warning(f"{browser_name.title()}: {type(e).__name__}: {e}{hint}")
+                print_warning(f"{browser_name.title()}: {type(e).__name__}: {_redact_home_path(e)}{hint}")
             else:
-                console.print(f"  [dim]· {browser_name.title()}: {type(e).__name__}: {e}[/dim]{hint}")
+                console.print(f"  [dim]· {browser_name.title()}: {type(e).__name__}: {_redact_home_path(e)}[/dim]{hint}")
             continue 
 
     print_error("No valid MangaDot session found. Ensure your browser is FULLY CLOSED and you are logged in.")
@@ -2071,7 +2786,8 @@ def _tus_offset(session, location):
             if off is not None:
                 return int(off)
     except SessionExpiredError: raise
-    except Exception:
+    except (requests.exceptions.RequestException, ValueError) as e:
+        logging.debug("_tus_offset(%s): %s", location, e)
         return None
     return None
 
@@ -2152,7 +2868,7 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
                 if not upload_location: raise ValueError("No Location header in TUS response")
                 break
             except SessionExpiredError: raise
-            except Exception as e:
+            except (requests.exceptions.RequestException, ValueError) as e:
                 if attempt < MAX_RETRIES - 1:
                     renderer.update_chapter_status(filename, "Create Err... Retrying", 0.0)
                     if not _interruptible_sleep(RETRY_DELAY, abort_event):
@@ -2221,7 +2937,7 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
                                 else: return {"key": filename, "success": False, "error": f"HTTP {patch_res.status_code} (Max Retries)"}
                             else: return {"key": filename, "success": False, "error": f"HTTP {patch_res.status_code}"}
                         except SessionExpiredError: raise
-                        except Exception as e:
+                        except requests.exceptions.RequestException as e:
                             if patch_attempt < MAX_RETRIES - 1:
                                 renderer.update_chapter_status(filename, f"Net Err, Retrying... ({patch_attempt + 1})", offset / size, current=offset, total=size)
                                 if not _interruptible_sleep(_compute_retry_delay(None, patch_attempt), abort_event):
@@ -2236,7 +2952,7 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
                         continue
                     if not chunk_done: return {"key": filename, "success": False, "error": "Chunk upload failed"}
         except SessionExpiredError: raise
-        except Exception as e: return {"key": filename, "success": False, "error": str(e)[:30]}
+        except OSError as e: return {"key": filename, "success": False, "error": str(e)[:30]}
 
         base_check_url = f"{BASE_URL}/api/manga/{manga_id}/volumes" if upload_type == "volume" else f"{BASE_URL}/api/manga/{manga_id}/chapters/list"
         found        = False
@@ -2311,7 +3027,7 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
 
                 except SessionExpiredError:
                     raise
-                except Exception:
+                except (requests.exceptions.RequestException, json.JSONDecodeError):
                     continue
 
         if already_exists:
@@ -2386,9 +3102,9 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                         continue
                     res.raise_for_status()
                     batch_data = res.json()
-                    if not batch_data.get("success"): raise Exception(str(batch_data))
+                    if not batch_data.get("success"): raise BatchInitError(str(batch_data)[:200])
                     batch_id = batch_data["batch_id"]
-                except Exception as e:
+                except (requests.exceptions.RequestException, json.JSONDecodeError, BatchInitError, KeyError) as e:
                     for f in chunk:
                         mark_failed(f["filename"], f"Batch init failed: {str(e)[:80]}", "❌ Batch Init Failed")
                     continue
@@ -2440,7 +3156,7 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                                 break
                             comp_res.raise_for_status()
                             break
-                        except Exception as e:
+                        except requests.exceptions.RequestException as e:
                             if comp_attempt < MAX_RETRIES - 1:
                                 if not _interruptible_sleep(_compute_retry_delay(None, comp_attempt), abort_event):
                                     break
@@ -2707,7 +3423,7 @@ def _run_upload_loop(files, req_session, manga_id, group_ids, upload_type,
                     reason = failure_reasons.get(chap, "Unknown error")
                     f.write(f"{chap}\t{reason}\n")
             print_info(f"Failed list saved to [cyan]`{failed_log_name}`[/cyan].")
-        except Exception as e:
+        except OSError as e:
             print_error(f"Could not write `{failed_log_name}`: {e}")
             break
 
@@ -2749,7 +3465,7 @@ def _check_proxy(proxy_url, verify=True):
         return False, f"Proxy connection failed: {str(e)[:80]}"
     except requests.exceptions.ConnectionError as e:
         return False, f"Could not reach proxy: {str(e)[:80]}"
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         return False, f"Proxy check error: {str(e)[:80]}"
 
 def _positive_int(value):
@@ -2805,7 +3521,7 @@ def main():
 
     if resolved_proxy:
         proxy_no_verify = args.proxy_no_verify
-        console.print(f"[yellow][PROXY] Routing all traffic through: {resolved_proxy}[/yellow]")
+        console.print(f"[yellow][PROXY] Routing all traffic through: {_redact_proxy_url(resolved_proxy)}[/yellow]")
         with console.status("[cyan]Checking proxy connectivity...[/cyan]", spinner="dots"):
             proxy_ok, proxy_err = _check_proxy(resolved_proxy, verify=not proxy_no_verify)
         if not proxy_ok:
@@ -2850,25 +3566,16 @@ def main():
 
     chapter_naming = "extract"
     custom_regex   = None
+    custom_renames = None
+    advanced_strip_groups = False
     if upload_type == "chapter":
-        chapter_naming = ask_select("Chapter naming format?", [
-            questionary.Choice(title="Force 'Chapter X'", value="preset"),
-            questionary.Choice(title="Auto-detect title", value="extract"),
-            questionary.Choice(title="Custom regex", value="custom"),
-        ])
-        if chapter_naming == "custom":
-            print_info("Regex Tip: Use a capture group () to extract a title, or 'Find -> Replace' to rename.")
-            custom_regex_input = prompt("Enter your regex pattern")
-            custom_renames, custom_regex = parse_custom_regex_input(custom_regex_input)
-        else:
-            custom_renames = None
-    else:
-        custom_renames = None
+        chapter_naming, custom_regex, custom_renames, advanced_strip_groups = _ask_chapter_naming()
 
     language = prompt("Language code", default="en")
 
     is_group, group_ids, scanlator_name, per_file_group_map, selected_group_name, strip_bracket_groups = \
     _setup_group_config(directory, req_session, upload_type)
+    strip_bracket_groups = strip_bracket_groups or advanced_strip_groups
     
     print_warning(
     "Recommended: 5 to 10 threads. But sure, slap it to 30 if you want.\n"
@@ -2887,7 +3594,7 @@ def main():
     console.print()
 
     print_info("Scanning directory for files...")
-    files = get_files_in_dir(directory, upload_type, chapter_naming, custom_regex, strip_groups=strip_bracket_groups, custom_renames=custom_renames)
+    files = get_files_in_dir(directory, upload_type, chapter_naming, custom_regex, strip_groups=strip_bracket_groups, custom_renames=custom_renames, select_subset=True)
     if not files:
         print_error("No valid .cbz or .zip files found.")
         sys.exit(1)
@@ -2896,9 +3603,15 @@ def main():
         for f in files:
             f["groups"] = []
 
+    for f in files:
+        f["_upload_type"] = upload_type
+        f["_group_label"] = selected_group_name
+
     print_files_table(files, upload_type, group_label=selected_group_name)
     _check_missing(files, upload_type)
-    _check_duplicates(files, upload_type)
+    files = _check_duplicates(files, upload_type)
+
+    files = review_and_edit_titles(files)
 
     confirm = ask_confirm("Proceed with upload?", default=True)
     if not confirm:
@@ -3033,6 +3746,7 @@ def main():
 
         else: print_info(f"View your manga here: {manga_url}\n")
     except Exception as e:
+        logging.debug("Post-upload summary rendering failed: %s: %s", type(e).__name__, e)
         print_warning(f"Could not fetch metadata: {e}")
         print_info(f"View your manga here: {manga_url}\n")
 
