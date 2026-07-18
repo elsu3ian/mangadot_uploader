@@ -1,30 +1,47 @@
-# MangaDot.net Batch Uploader version 1.3.0 [https://mangadot.net]
-# [Interactive UI, Synchronized Color Theme & High-Fidelity Inline Art Update applied]
-# [v1.2.4: Audit fix pass — custom regex, ghost-chapter verification gap, volume
-#  titles, stale-PID kill safety, connection pooling, interruptible retries,
-#  natural sort negatives, verify-timeout validation, dead import, path norm]
-# [v1.3.0: Auto-detect title now always shows a picker with dynamically-built,
-#  labeled candidates (full/without-episode-label/without-season/bare/minimal),
-#  memoized per detected filename "shape" across the batch. Core architecture
-#  patch: pagination for Ghost Chapter verifier, dynamic decimal interpolation,
-#  TUS HEAD fallback, natural sort hyphen fix, and thread pool thrashing eliminated]
-
 """
 ==============================================================================
-🚀 MANGADOT BATCH UPLOADER - ADVANCED FEATURES & USAGE
+🚀 MANGADOT UPLOADER v2.0.0 - ADVANCED FEATURES & USAGE
 ==============================================================================
+[Public Release: Standalone GUI app added alongside the CLI, sharing thes ame login/parsing/verification/upload engine. See README.md and CHANGELOG.md for full details.]
+
+[v2.0.0: Interactive title/number review pass before upload — bulk and
+  ranged find/replace with live preview, redo-title-for-group, manual
+  number overrides with duplicate warnings. Homoglyph-safe filename
+  parsing (Cyrillic/Greek look-alikes), flexible range input (e.g.
+  "103-108,110"), advanced auto-detect naming submenu, leading-zero
+  title cleanup, virtualenv-aware installer, dedicated BatchInitError,
+  centralized log/path redaction]
+
+[v1.3.0: Auto-detect title now always shows a picker with dynamically-built,
+  labeled candidates (full/without-episode-label/without-season/bare/minimal),
+  memoized per detected filename "shape" across the batch. Core architecture
+  patch: pagination for Ghost Chapter verifier, dynamic decimal interpolation,
+  TUS HEAD fallback, natural sort hyphen fix, and thread pool thrashing eliminated]
 
 WHAT THIS SCRIPT DOES:
-  A multi-threaded batch uploader for .cbz/.zip files to MangaDot.net. 
-  It extracts active browser cookies (Chrome, Firefox, Edge, Brave, Opera, Vivaldi)
-  and dynamically spoofs your exact User-Agent to natively bypass Cloudflare. 
-  Uploads are handled via the resumable TUS protocol in 5MB chunks with optional proxy tunneling.
+  A multi-threaded batch uploader for .cbz/.zip files to MangaDot.net.
+  It extracts active browser cookies (Chrome, Firefox, Edge, Brave, Opera,
+  Vivaldi, Zen) and dynamically spoofs your exact User-Agent to natively
+  bypass Cloudflare. Uploads are handled via the resumable TUS protocol in
+  5MB chunks with optional proxy tunneling.
+
+  A standalone desktop GUI is also available (same engine, no terminal
+  required) — see README.md.
 
 ADVANCED NAMING & UI:
   - Bracket Detection: Automatically detects and assigns release groups from [Bracket] tags.
   - Mixed-Group Batching: Seamlessly uploads and assigns multiple release groups in a single run.
   - Custom Regex: Use 'Pattern -> Replace' syntax to quickly rename files, or '()' to extract titles.
+  - Advanced Auto-Detect: Combine custom regex with bracket/parenthesis-group stripping independently.
+  - Homoglyph-Safe Parsing: Look-alike Cyrillic/Greek characters no longer break label detection.
   - Terminal Dashboard: Renders high-fidelity cover art directly in the terminal (requires 'chafa').
+
+REVIEW BEFORE YOU UPLOAD:
+  - Title & Number Review: Before anything uploads, bulk find/replace across all titles
+    (with live preview), scope a find/replace to a number range or single file, redo the
+    auto-detected title for a whole group, or manually override any file's number.
+  - Flexible Ranges: Accepts range syntax like '103-108,110,115-117' anywhere a chapter
+    or volume selection is asked for.
 
 SMART PROTECTIONS:
   - Auto-Session Recovery: Pauses if your token expires mid-batch, allowing browser refreshes.
@@ -118,9 +135,6 @@ def check_dependencies():
         except importlib.metadata.PackageNotFoundError:
             missing_pip.append(pkg)
         except (ValueError, TypeError) as e:
-            # Malformed package metadata (rare, but importlib.metadata can choke
-            # on broken/partial installs) - treat it like "missing" so the user
-            # gets a chance to reinstall it cleanly, instead of silently skipping.
             print(f"  ⚠️  Could not read version metadata for '{pkg}' ({e}); treating as missing.")
             missing_pip.append(pkg)
 
@@ -394,8 +408,6 @@ def _read_mac_plist(browser):
             raw = plist.get('KSVersion') or plist.get('CFBundleShortVersionString')
             return _clean_version(raw)
     except (OSError, ValueError) as e:
-        # ValueError covers plistlib's InvalidFileException (a ValueError subclass)
-        # for a corrupt/unexpected Info.plist.
         logging.debug("_read_mac_plist(%s): %s", browser, e)
         return None
 
@@ -517,8 +529,6 @@ def get_dynamic_user_agent(browser):
             fresh_config["cached_user_agents"] = cached_uas
             save_config(fresh_config)
         except OSError as e:
-            # Best-effort cache write; a failure here just means we re-detect
-            # the UA next run instead of using the cache. Not fatal.
             logging.debug("get_dynamic_user_agent: failed to persist UA cache: %s", e)
 
     return ua
@@ -543,18 +553,12 @@ def strip_ansi(text):
 
 _HOME_DIR_STR = str(Path.home())
 def _redact_home_path(text):
-    """Replace the current user's home directory (and thus their OS username)
-    with a placeholder before showing exception text on-screen or in logs.
-    Many rookiepy/sqlite3/file-I/O exceptions embed the full cookie DB path,
-    which on Windows/macOS/Linux typically includes the OS username."""
     text = str(text)
     if _HOME_DIR_STR and _HOME_DIR_STR in text:
         text = text.replace(_HOME_DIR_STR, "~")
     return text
 
 def _redact_proxy_url(proxy_url):
-    """Mask any user:pass@ credentials embedded in a proxy URL before it's
-    ever printed to the console (or would end up in a debug log/screenshot)."""
     import urllib.parse
     try:
         parsed = urllib.parse.urlsplit(proxy_url)
@@ -758,11 +762,6 @@ def ask_confirm(message, default=True):
     return ask_select(message, choices, auto_number=False)
 
 def parse_number_ranges(text, valid_numbers=None):
-    """Parse flexible range input like '103-108,110,115-117' into a set of numbers.
-    Accepts ints or floats (chapter numbers can be e.g. 100.5 for extras).
-    If valid_numbers is given (an iterable of the numbers actually present),
-    results are filtered to that set and unmatched tokens are reported.
-    Returns (matched_set, unmatched_tokens)."""
     result = set()
     unmatched = []
     valid_set = set(valid_numbers) if valid_numbers is not None else None
@@ -810,8 +809,6 @@ def parse_number_ranges(text, valid_numbers=None):
     return result, unmatched
 
 def ask_number_range(message, valid_numbers, allow_all=False):
-    """Prompt for a range string against a known set of valid numbers, retrying on
-    bad/empty input. If allow_all is True, blank input returns None (meaning 'all')."""
     valid_sorted = sorted(valid_numbers)
     lo, hi = (valid_sorted[0], valid_sorted[-1]) if valid_sorted else (None, None)
     hint = f" (available: {fmt_num(lo)}\u2013{fmt_num(hi)})" if lo is not None else ""
@@ -960,8 +957,6 @@ def parse_custom_regex_input(raw):
     return renames, extractor
 
 def _ask_chapter_naming():
-    """Ask the chapter naming format question. Returns
-    (chapter_naming, custom_regex, custom_renames, advanced_strip_groups)."""
     chapter_naming = ask_select("Chapter naming format?", [
         questionary.Choice(title="Force 'Chapter X' (Default)", value="preset"),
         questionary.Choice(title="Auto-detect title (Recommended)", value="extract"),
@@ -1008,25 +1003,12 @@ _HOMOGLYPH_MAP = {
 _HOMOGLYPH_TABLE = str.maketrans(_HOMOGLYPH_MAP)
 
 def normalize_homoglyphs(text):
-    """Return a Latin-normalized copy of text for regex matching purposes only.
-    This is a 1-to-1 character substitution (no insertions/deletions), so
-    character positions/indices stay identical to the original string -
-    match spans found against the normalized text are valid against the
-    original text too."""
     return text.translate(_HOMOGLYPH_TABLE)
 
 def strip_leading_zeros_in_title(text):
-    """Strip unnecessary leading zeros from standalone numbers in title text.
-    e.g. 'Episode 001' -> 'Episode 1', 'Ch. 113 - Stalker (01)' -> 'Ch. 113 - Stalker (1)'.
-    Uses word boundaries so it won't touch things like 'S002' (no boundary between S and 0)."""
     return re.sub(r'\b0+(\d+)\b', r'\1', text)
 
 def compile_removal_pattern(pattern_input):
-    """Compile a user-entered word/phrase into a regex pattern for removal.
-    Plain text (e.g. '(Official)') is treated literally so parens/brackets the user
-    typed as ordinary text don't get interpreted as regex groups. Only treated as a
-    real regex if it contains metacharacters unlikely to appear as plain text:
-    \\d \\w \\s * + ? | ^ $ {n,m} etc."""
     looks_like_regex = bool(re.search(r'\\[dwsSDWbB]|[*+?^$|]|\{\d*,?\d*\}', pattern_input))
     if looks_like_regex:
         try:
@@ -1037,8 +1019,6 @@ def compile_removal_pattern(pattern_input):
     return re.escape(pattern_input)
 
 def apply_removal_pattern(pattern, text):
-    """Apply a compiled removal pattern to text, cleaning up leftover empty
-    parens/brackets and extra whitespace. Returns None if the result would be empty."""
     try:
         result = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
         result = re.sub(r'\(\s*\)|\[\s*\]', '', result)
@@ -1103,13 +1083,6 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
         matched_str = matches[0].group(0).lower()
         digits_str = matches[0].group(1)
         has_explicit_label = bool(re.search(r'(?i)chapter|ch\b|episode|ep\b', matched_str))
-        # The file's own auto-generated sequence prefix always looks like a bare
-        # 'ch' immediately followed by digits with no separator (e.g. 'ch1000',
-        # 'ch0057') - lowercase, no dot/space, and not the word 'chapter'. Real
-        # chapter/episode labels almost always have a separator ('Ch. 001',
-        # 'Chapter 11') or use 'episode'/'ep'. This is more reliable than
-        # checking for zero-padding, which breaks once the sequence number
-        # reaches 4+ digits without a leading zero (e.g. 'ch1000').
         is_bare_sequence_prefix = bool(re.fullmatch(r'ch\d+', matched_str)) and not has_explicit_label
 
         if matches[0].start() == 0 and is_bare_sequence_prefix:
@@ -1294,10 +1267,6 @@ def _correct_episode_drift(parsed):
     conflicts = [item for item in parsed if item.get("episode_label_num") is not None and item["episode_label_num"] != item["number"]]
     
     if conflicts:
-        # Compute the drift (file_index - episode_label) for every conflict so the
-        # user can see whether this is one clean, consistent reset (safe to resolve
-        # with a single choice) or several different drift amounts (which a single
-        # Continuous/Trust-Labels choice can't correctly handle for the whole batch).
         drifts = [item['number'] - item['episode_label_num'] for item in conflicts]
         distinct_drifts = sorted(set(round(d, 4) for d in drifts))
 
@@ -1348,10 +1317,6 @@ def _correct_episode_drift(parsed):
             if i < len(ordered) and ordered[i]["number"] > prev_val:
                 next_val = ordered[i]["number"]
             else:
-                # No next labeled item (trailing run at the end of the list, or
-                # the file list started with unlabeled items) - leave enough
-                # room for the whole block to count up sequentially rather than
-                # collapsing everything into a 1.0-wide gap.
                 next_val = prev_val + n + 1.0
 
             gap = next_val - prev_val
@@ -1359,28 +1324,15 @@ def _correct_episode_drift(parsed):
             if n == 1:
                 block[0]["number"] = round(prev_val + gap / 2, 6)
             elif gap >= n + 1:
-                # There's enough room to continue sequential whole numbers
-                # (prev_val + 1, prev_val + 2, ...) without reaching next_val.
-                # This is the right treatment for a long run of unlabeled files
-                # that are really just sequential chapters without an explicit
-                # "Chapter N" label in the filename - not a small cluster of
-                # specials squeezed between two labeled chapters, which is what
-                # the decimal (.1/.2/.3...) scheme below is for.
                 for k, item in enumerate(block):
                     item["number"] = round(prev_val + (k + 1), 6)
             else:
-                # Multiple unlabeled items in this gap: number them prev.1, prev.2, prev.3...
-                # in file order, but only as many decimal places as needed to fit
-                # strictly within the available gap without colliding with next_val.
                 pad = 2 if n > 9 else 1
                 base = int(prev_val)
                 step = 1 / (10 ** pad)
                 for k, item in enumerate(block):
                     frac = (k + 1) * step
                     proposed = round(base + frac, pad + 4)
-                    # Guard against overshooting into or past the next real label
-                    # (can happen if prev_val's fractional part is already close
-                    # to next_val, e.g. prev=9.9, next=10.0).
                     if proposed >= next_val:
                         # Fall back to splitting the remaining gap evenly instead.
                         proposed = round(prev_val + gap * (k + 1) / (n + 1), 6)
@@ -1536,8 +1488,6 @@ def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_re
         file_groups = item["groups"]
         shape_key   = item["shape_key"]
 
-        # A range-scoped decision for this shape takes priority over the whole-shape cache,
-        # since it was made specifically for this file's number.
         matched_range_choice = None
         for number_set, chosen_label in range_choices.get(shape_key, []):
             if num in number_set:
@@ -1641,10 +1591,6 @@ def fmt_duration(seconds) -> str:
     return f"{s}s"
 
 def review_and_edit_titles(files):
-    """Post-scan review pass: let the user apply a global find/replace across
-    all titles (with a live preview before committing), redo the title for
-    a specific group of files, or override the computed number for a
-    specific file, before finally proceeding to upload."""
     while True:
         console.print()
         action = ask_select(
@@ -1816,8 +1762,6 @@ def review_and_edit_titles(files):
             # else: loop back to the menu without changes
 
         elif action == "redo_group":
-            # Group files by their current title-derivation shape so the user can
-            # pick a group of similarly-formatted files and redo the choice for all of them.
             groups = {}
             for f in files:
                 key = f.get("shape_key", f["title"])
@@ -1880,8 +1824,6 @@ def review_and_edit_titles(files):
             console.print()
             if ask_confirm(f"Use \"{new_title}\" for all {len(group_files)} file(s) in this group?", default=True):
                 for f in group_files:
-                    # Re-derive per-file so files with different base text in the same
-                    # shape still get an appropriately-transformed title, not one fixed string.
                     f_candidates = f.get("candidates") or [("Full title (as detected)", f["title"])]
                     if pick == "__custom__":
                         f["title"] = new_title
@@ -1949,10 +1891,6 @@ def _check_missing(files, upload_type):
         print_warning("Please verify this is intentional before proceeding.\n")
 
 def _check_duplicates(files, upload_type):
-    """Detect duplicate chapter/volume numbers and let the user resolve them:
-    exclude a file, give it a new number, or proceed anyway. Returns the
-    (possibly modified) files list. Loops until the user is done resolving
-    or chooses to proceed with duplicates intact."""
     term = "chapter" if upload_type == "chapter" else "volume"
 
     while True:
