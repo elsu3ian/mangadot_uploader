@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.0] - 2026-07-18
+
+### Added
+- **Desktop GUI App:** A full PySide6 desktop application, distributed as a standalone Windows `.exe` (no Python install required). It walks through the same login → folder/manga picker → group attribution → title review → upload flow as the CLI, plus:
+  - A sortable, editable table for reviewing detected chapter/volume numbers and titles before upload, with inline renaming, per-row number overrides, and duplicate-number highlighting.
+  - A right-click "Remove word/phrase" dialog with a live before/after preview, scoped to all rows or a selection.
+  - A post-upload summary screen with manga cover art, metadata, and a double-clickable table of uploaded chapters that opens each one directly on MangaDot.
+  - A startup settings dialog for proxy URL, SSL verification, and debug logging — no command-line flags needed.
+- **Interactive Title & Number Review Pass (CLI):** After scanning, the CLI now shows a review menu before upload instead of going straight to confirmation. From here you can:
+  - Remove a word/phrase from every detected title at once, with a live preview of affected titles before committing.
+  - Remove a word/phrase from a specific number range (e.g. `103-108,110`) or a single file found by filename search.
+  - Redo the auto-detected title for an entire group of similarly-named files in one action.
+  - Manually override the detected chapter/volume number for a specific file, with duplicate-number warnings.
+- **Flexible Number-Range Input:** Ranges like `103-108,110,115-117` are now accepted anywhere the uploader asks which chapters/volumes to target, with invalid or out-of-batch numbers reported individually instead of rejecting the whole input.
+- **Cyrillic/Greek Homoglyph Normalization:** Filenames containing visually-identical Cyrillic or Greek characters (e.g. a Cyrillic С standing in for a Latin C) now match chapter/episode/volume label patterns correctly instead of silently failing to parse.
+- **Advanced Auto-Detect Naming Options:** The naming-format prompt now has a dedicated "Advanced" mode exposing custom regex extraction and bracket/parenthesis-group stripping as independent, combinable toggles instead of separate top-level choices.
+- **Leading-Zero Title Cleanup:** Standalone zero-padded numbers inside detected titles (e.g. `Episode 001`) are automatically normalized to their plain form (`Episode 1`) without touching adjacent alphanumeric tokens like `S002`.
+- **Virtualenv-Aware Auto-Installer:** The dependency auto-installer now detects whether it's running inside a venv/virtualenv/conda environment and adjusts its install behavior accordingly, instead of always assuming a system-wide Python install.
+- **Dedicated Batch-Init Error Type:** Batch initialization failures now raise a specific `BatchInitError` instead of being caught by a broad generic exception handler, giving clearer log output when a batch fails to start.
+- **Log Redaction Helpers:** Home directory paths and proxy credentials are now consistently scrubbed from log output and error messages through dedicated redaction helpers, rather than being handled ad hoc at each call site.
+
+### Changed
+- **Project Versioning:** Bumped to v2.0.0 to reflect the GUI release alongside the CLI, and to mark the point where this project is being published as a public, independent fork rather than a personal script.
+- **Repository Structure:** `mangadot.py` is now the sole maintained CLI script going forward; the legacy ANSI-console build is kept only as an archived reference (see [Repository Structure](README.md#repository-structure) in the README).
+
+---
+
 ## [1.3.0] - 2026-07-12
 
 ### Added
