@@ -1,8 +1,41 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "requests>=2.34.2",
+#     "rookiepy>=0.5.6",
+#     "questionary>=2.1.1",
+#     "rich>=15.0.0",
+#     "websocket-client>=1.9.0",
+# ]
+# ///
 """
 ==============================================================================
-🚀 MANGADOT UPLOADER v2.0.0 - ADVANCED FEATURES & USAGE
+🚀 MANGADOT UPLOADER v2.1.0 - ADVANCED FEATURES & USAGE
 ==============================================================================
 [Public Release: Standalone GUI app added alongside the CLI, sharing thes ame login/parsing/verification/upload engine. See README.md and CHANGELOG.md for full details.]
+
+[v2.1.0: CBZ Optimizer — re-compresses images inside .cbz/.zip archives
+  (JPEG/PNG/WebP/BMP), run standalone with --optimize-only or chained
+  straight into the upload flow with --optimize. STRICTLY LOSSLESS BY
+  DEFAULT: JPEGs are re-optimized via mozjpeg (Huffman/entropy coding
+  only, pixel-identical output), PNG/WEBP use their native lossless
+  encoders, BMP is losslessly repacked to PNG. Pixel data is only ever
+  altered if --optimize-lossy is explicitly passed. Fully isolated from
+  the upload pipeline: Pillow/mozjpeg are imported lazily and only when
+  one of these flags is used, so normal uploads are unaffected.
+  Also: uv + PEP 723 support — run via 'uv run mangadot.py' with zero setup
+  (isolated, cached environment, no system/venv installs); plain 'python
+  mangadot.py' still works exactly as before. New --refresh-uv-cache flag
+  clears uv's cached resolution on demand. Weekly (non-blocking, offline-safe)
+  PyPI freshness check reports if a dependency floor is behind the latest
+  release — informational only, never auto-updates anything. Language code
+  and parallel-upload thread count are now remembered across runs, with the
+  language prompt upgraded to type-to-filter autocomplete. New one-time
+  "which file picker do you prefer" setting: choose between the existing
+  range-syntax picker (e.g. '103-108,110') or a checkbox picker (tick
+  individual files) when not uploading everything; the choice is remembered.
+  All dependency version floors bumped to latest-published.]
 
 [v2.0.0: Interactive title/number review pass before upload — bulk and
   ranged find/replace with live preview, redo-title-for-group, manual
@@ -58,6 +91,24 @@ COMMAND LINE FLAGS:
   py -3.12 mangadot.py --verify-timeout X : Overrides the default 60s timeout for verifying server-side chapter ingestion.
   py -3.12 mangadot.py --proxy <url>      : Routes all HTTP traffic through a specified proxy.
   py -3.12 mangadot.py --proxy-no-verify  : Disables SSL certificate verification (use only if your proxy intercepts TLS).
+  uv run mangadot.py                      : Runs the script via uv using its PEP 723 inline metadata — no pip/venv setup needed; all flags above work identically.
+  uv run mangadot.py --refresh-uv-cache   : Clears uv's cached environment for this script and exits, forcing the next run to re-resolve dependencies.
+
+CBZ OPTIMIZER (lossless by default; requires: pip install Pillow mozjpeg-lossless-optimization):
+  py -3.12 mangadot.py --optimize-only              : Prompts for a folder, losslessly shrinks every .cbz/.zip inside it, then exits.
+  py -3.12 mangadot.py --optimize-only <path>       : Same, but skips the folder prompt.
+  py -3.12 mangadot.py --optimize <path>            : Losslessly shrinks the folder, then continues straight into the normal upload flow on it.
+  py -3.12 mangadot.py --optimize-lossy             : OPT-IN ONLY. Allows lossy JPEG/WEBP re-encoding for bigger savings — pixel data WILL change. Off unless typed explicitly.
+  py -3.12 mangadot.py --optimize-replace           : Overwrites originals in-place instead of writing to an 'optimized' subfolder. Asks for confirmation before doing so.
+  py -3.12 mangadot.py --optimize-jpeg-quality 90   : JPEG quality, only used with --optimize-lossy (default: 85).
+  py -3.12 mangadot.py --optimize-webp-quality 90   : WEBP quality, only used with --optimize-lossy (default: 85).
+  py -3.12 mangadot.py --optimize-threads 8         : Archives optimized in parallel (default: 4; CPU-bound, separate from upload threads).
+
+  --pingo is a MODIFIER, not a standalone command — it must be combined with
+  --optimize-only or --optimize, otherwise it does nothing on its own:
+  py -3.12 mangadot.py --optimize-only --pingo             : Use a local pingo binary (next to mangadot.py) instead of mozjpeg/Pillow. Win/Linux only; falls back with a visible notice elsewhere.
+  py -3.12 mangadot.py --optimize-only <path> --pingo      : Same, on a specific folder.
+  py -3.12 mangadot.py --optimize <path> --pingo --optimize-replace : Pingo backend, overwriting originals in-place (after confirmation), then continuing into upload.
 ==============================================================================
 """
 import os
@@ -85,15 +136,55 @@ from collections import deque, Counter
 from pathlib import Path
 
 # ==============================================================================
+# 🔄 UV CACHE REFRESH (handled before the dependency check, on purpose: this
+# needs to work even if none of REQUIRED_PACKAGES are installed yet)
+# ==============================================================================
+if "--refresh-uv-cache" in sys.argv:
+    import shutil as _shutil
+    sep = "=" * 62
+    print(sep)
+    print("  🔄 Refreshing uv's cached environment for this script")
+    print(sep)
+    uv_path = _shutil.which("uv")
+    if uv_path is None:
+        print("  ❌ 'uv' was not found on PATH — nothing to refresh.")
+        print("     (This flag only does something when the script is run via uv,")
+        print("      e.g. 'uv run mangadot.py --refresh-uv-cache'.)")
+        sys.exit(1)
+    try:
+        script_path = os.path.abspath(__file__)
+    except NameError:
+        script_path = os.path.abspath(sys.argv[0])
+    print(f"  Running: uv cache clean")
+    result = subprocess.run([uv_path, "cache", "clean"])
+    if result.returncode != 0:
+        print("  ❌ 'uv cache clean' failed — see output above.")
+        sys.exit(result.returncode)
+    print("  ✅ uv cache cleared.")
+    print()
+    print("  Next 'uv run mangadot.py' will re-resolve every dependency in the")
+    print("  PEP 723 block to the newest version that satisfies each floor, and")
+    print("  re-cache it. This does NOT change the floors themselves — to bump")
+    print("  a floor (e.g. require a newer rich), edit the '# dependencies ='")
+    print("  block at the top of this file, or run:")
+    print(f"      uv add --script {os.path.basename(script_path)} <package>>=<version>")
+    print(sep)
+    sys.exit(0)
+
+# ==============================================================================
 # ⚙️  DEPENDENCY CHECK
 # ==============================================================================
 
 REQUIRED_PACKAGES = {
-    "requests":         "2.28.0",
-    "rookiepy":         "0.5.0",
-    "questionary":      "2.0.0",
-    "rich":             "13.0.0",
-    "websocket-client": "1.6.0",
+    "requests":         "2.34.2",
+    "rookiepy":         "0.5.6",
+    "questionary":      "2.1.1",
+    "rich":             "15.0.0",
+    "websocket-client": "1.9.0",
+}
+OPTIMIZER_PACKAGES = {
+    "Pillow":                        "12.3.0",
+    "mozjpeg-lossless-optimization": "1.3.2",
 }
 
 def _parse_version_tuple(version_str):
@@ -111,14 +202,42 @@ def _version_lt(installed, required):
     return a < b
 
 def _in_virtualenv():
-    """True if running inside a venv/virtualenv/conda env, where auto-installing
-    packages only affects this isolated environment rather than the user's
-    system-wide Python."""
     return (
         hasattr(sys, "real_prefix")
         or sys.base_prefix != sys.prefix
         or bool(os.environ.get("CONDA_DEFAULT_ENV"))
     )
+
+def _pip_available():
+    try:
+        import importlib.util
+        return importlib.util.find_spec("pip") is not None
+    except Exception:
+        return False
+
+def _running_under_uv():
+    if os.environ.get("UV") or os.environ.get("UV_RUN_RECURSION_DEPTH"):
+        return True
+    prefix = (getattr(sys, "prefix", "") or "").replace("\\", "/").lower()
+    return "/uv/" in prefix and ("environments-" in prefix or "archive-" in prefix)
+
+def _script_name():
+    try:
+        return os.path.basename(sys.argv[0]) or "mangadot.py"
+    except Exception:
+        return "mangadot.py"
+
+def _print_uv_dep_hint(sep, packages):
+    name = _script_name()
+    print(sep)
+    print("  ℹ️   Dependencies are declared in this script's PEP 723 metadata block.")
+    print("  Since you're running under uv, the fix is to (re)declare the")
+    print("  dependency there instead of pip-installing it:")
+    print()
+    print(f"      uv add --script {name} {' '.join(packages)}")
+    print()
+    print(f"  Or just: uv run {name}   (uv will provision everything declared)")
+    print(sep)
 
 def check_dependencies():
     sep   = "=" * 62
@@ -154,31 +273,39 @@ def check_dependencies():
 
         to_install = missing_pip + [p for p, _, _ in outdated_pip]
 
-        if not _in_virtualenv():
-            print("\n  ℹ️   You're not inside a virtual environment - installing now would")
-            print("      affect your system-wide Python packages.")
-            print(f"\n      requirements.txt is included next to this script. You can instead run:")
-            print(f"        python -m venv .venv")
-            print(f"        .venv\\Scripts\\activate      (Windows)   OR   source .venv/bin/activate  (macOS/Linux)")
-            print(f"        pip install -r requirements.txt\n")
-            proceed = input("  Install these packages to your system Python anyway? [y/N]: ").strip().lower()
-            if proceed != "y":
-                print("\n  Skipped. Install the packages above, then re-run this script.")
-                print(sep)
-                return False
+        if _running_under_uv() or not _pip_available():
+            print("\n  ℹ️   pip is not available in this environment, so packages can't be")
+            print("      auto-installed here.")
+            _print_uv_dep_hint(sep, to_install)
+            print()
+            
+        else:
+            if not _in_virtualenv():
+                print("\n  ℹ️   You're not inside a virtual environment - installing now would")
+                print("      affect your system-wide Python packages.")
+                print(f"\n      requirements.txt is included next to this script. You can instead run:")
+                print(f"        python -m venv .venv")
+                print(f"        .venv\\Scripts\\activate      (Windows)   OR   source .venv/bin/activate  (macOS/Linux)")
+                print(f"        pip install -r requirements.txt\n")
+                print(f"      Or, with uv installed:  uv run {_script_name()}\n")
+                proceed = input("  Install these packages to your system Python anyway? [y/N]: ").strip().lower()
+                if proceed != "y":
+                    print("\n  Skipped. Install the packages above, then re-run this script.")
+                    print(sep)
+                    return False
 
-        print(f"\n  🔧 Installing missing/outdated packages: {' '.join(to_install)}...")
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade"] + to_install)
-            print("  ✅ All dependencies verified and updated.\n")
-            ok = True
-        except subprocess.CalledProcessError as e:
-            print(f"  ❌ Auto-install failed (pip exited with code {e.returncode}).")
-            print(f"    Try running this manually:")
-            print(f"    pip install --upgrade {' '.join(to_install)}\n")
-        except FileNotFoundError:
-            print("  ❌ Could not find pip for this Python interpreter.")
-            print(f"    Try running manually: pip install --upgrade {' '.join(to_install)}\n")
+            print(f"\n  🔧 Installing missing/outdated packages: {' '.join(to_install)}...")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade"] + to_install)
+                print("  ✅ All dependencies verified and updated.\n")
+                ok = True
+            except subprocess.CalledProcessError as e:
+                print(f"  ❌ Auto-install failed (pip exited with code {e.returncode}).")
+                print(f"    Try running this manually:")
+                print(f"    pip install --upgrade {' '.join(to_install)}\n")
+            except FileNotFoundError:
+                print("  ❌ Could not find pip for this Python interpreter.")
+                print(f"    Try running manually: pip install --upgrade {' '.join(to_install)}\n")
 
     if shutil.which("chafa") is None:
         _sys = platform.system()
@@ -198,6 +325,77 @@ def check_dependencies():
         print(sep)
         print("  Script cannot start until required packages are installed.")
         print(sep)
+
+    return ok
+
+def check_optimizer_dependencies(need_mozjpeg=True):
+    sep = "=" * 62
+    ok  = True
+
+    packages = dict(OPTIMIZER_PACKAGES)
+    if not need_mozjpeg:
+        packages.pop("mozjpeg-lossless-optimization", None)
+
+    missing_pip  = []
+    outdated_pip = []
+
+    for pkg, min_version in packages.items():
+        try:
+            installed = importlib.metadata.version(pkg)
+            if _version_lt(installed, min_version):
+                outdated_pip.append((pkg, min_version, installed))
+        except importlib.metadata.PackageNotFoundError:
+            missing_pip.append(pkg)
+        except (ValueError, TypeError) as e:
+            print(f"  ⚠️  Could not read version metadata for '{pkg}' ({e}); treating as missing.")
+            missing_pip.append(pkg)
+
+    if missing_pip or outdated_pip:
+        ok = False
+        print(sep)
+        print("  ⚠️  MISSING / OUTDATED OPTIMIZER PACKAGES")
+        print(sep)
+        if missing_pip:
+            print("\n  Not installed:")
+            for pkg in missing_pip:
+                print(f"    ✗  {pkg}")
+        if outdated_pip:
+            print("\n  Outdated (need upgrade):")
+            for pkg, req, inst in outdated_pip:
+                print(f"    ✗  {pkg}  (have {inst}, need >= {req})")
+
+        to_install = missing_pip + [p for p, _, _ in outdated_pip]
+
+        if _running_under_uv() or not _pip_available():
+            print("\n  ℹ️   pip is not available in this environment, so packages can't be")
+            print("      auto-installed here.")
+            _print_uv_dep_hint(sep, to_install)
+            print()
+            ok = False
+        else:
+            if not _in_virtualenv():
+                print("\n  ℹ️   You're not inside a virtual environment - installing now would")
+                print("      affect your system-wide Python packages.")
+                proceed = input("  Install these packages to your system Python anyway? [y/N]: ").strip().lower()
+                if proceed != "y":
+                    print("\n  Skipped. Install the packages above, then re-run with --optimize/--optimize-only.")
+                    print(sep)
+                    return False
+
+            print(f"\n  🔧 Installing missing/outdated packages: {' '.join(to_install)}...")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade"] + to_install)
+                print("  ✅ Optimizer dependencies verified and updated.\n")
+                ok = True
+            except subprocess.CalledProcessError as e:
+                print(f"  ❌ Auto-install failed (pip exited with code {e.returncode}).")
+                print("    Try running this manually:")
+                print(f"    pip install --upgrade {' '.join(to_install)}\n")
+                ok = False
+            except FileNotFoundError:
+                print("  ❌ Could not find pip for this Python interpreter.")
+                print(f"    Try running manually: pip install --upgrade {' '.join(to_install)}\n")
+                ok = False
 
     return ok
 
@@ -306,6 +504,7 @@ MAX_VERIFY_SECONDS   = 60
 DEFAULT_CHAPTERS_DIR = "chapters"
 DEFAULT_LIBRARY_DIR  = ""
 CONFIG_PATH          = Path.home() / ".mangadot_uploader.json"
+DB_PATH               = Path.home() / ".mangadot_uploader_db.json"
 
 DEFAULT_USER_AGENTS = {
     "chrome":  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
@@ -737,6 +936,68 @@ def prompt(text, default=None, required=True):
             continue
         return user_input
 
+# ==============================================================================
+# 🌍 LANGUAGES (full list used by the language autocomplete prompt; folder-name
+# auto-guess also uses this list to pre-fill a default)
+# ==============================================================================
+LANGUAGES = [
+    ("ar", "Arabic"), ("bn", "Bengali"), ("bg", "Bulgarian"), ("my", "Burmese"),
+    ("zh", "Chinese (Simplified)"), ("zh-hk", "Chinese (Traditional)"), ("cs", "Czech"),
+    ("da", "Danish"), ("nl", "Dutch"), ("en", "English"), ("tl", "Filipino"),
+    ("fi", "Finnish"), ("fr", "French"), ("ka", "Georgian"), ("de", "German"),
+    ("el", "Greek"), ("he", "Hebrew"), ("hi", "Hindi"), ("hu", "Hungarian"),
+    ("id", "Indonesian"), ("it", "Italian"), ("ja", "Japanese"), ("ko", "Korean"),
+    ("la", "Latin"), ("lt", "Lithuanian"), ("ms", "Malay"), ("mn", "Mongolian"),
+    ("no", "Norwegian"), ("fa", "Persian"), ("pl", "Polish"), ("pt", "Portuguese"),
+    ("pt-br", "Portuguese (Brazil)"), ("ro", "Romanian"), ("ru", "Russian"),
+    ("es", "Spanish"), ("es-la", "Spanish (Latin America)"), ("sv", "Swedish"),
+    ("th", "Thai"), ("tr", "Turkish"), ("uk", "Ukrainian"), ("vi", "Vietnamese"),
+]
+
+def _guess_language_from_path(directory):
+    """Checks folder names in the path (right to left) for a language code or
+    name match (e.g. a folder named 'French' or 'fr') to pre-fill a default.
+    Falls back to None (caller decides the ultimate default) if nothing matches."""
+    if not directory:
+        return None
+    lang_map = {}
+    for code, name in LANGUAGES:
+        lang_map[code.lower()] = code
+        lang_map[name.lower()] = code
+    for part in reversed(Path(directory).parts):
+        clean_part = part.strip().lower()
+        if clean_part in lang_map:
+            return lang_map[clean_part]
+    return None
+
+def ask_autocomplete(message, choices, default=None, required=True, meta_information=None):
+    """Like prompt(), but with type-to-filter suggestions (questionary.autocomplete).
+    meta_information (optional): dict of {choice: hint_text}, shown alongside each
+    suggestion when the list is displayed (e.g. Tab pressed with empty input)."""
+    while True:
+        try:
+            answer = questionary.autocomplete(
+                message,
+                choices=choices,
+                default=default or "",
+                qmark="?",
+                meta_information=meta_information,
+            ).ask()
+        except KeyboardInterrupt:
+            answer = None
+
+        if answer is None:
+            print_warning("No selection made — exiting.")
+            sys.exit(0)
+
+        answer = answer.strip()
+        if not answer and default is not None:
+            return default
+        if required and not answer:
+            print_warning("This field is required.")
+            continue
+        return answer
+
 def ask_select(message, choices, default=None, auto_number=True):
     use_shortcuts = auto_number if len(choices) <= 36 else False
     try:
@@ -1065,10 +1326,49 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
     if upload_type == "volume":
         num_pattern = r'(?i)(?:(?:\b|_)?(?:volume|vol)|(?:\b|_)v)[\.\-_\s]*(\d+(?:\.\d+)?)'
     else:
-        num_pattern = r'(?i)(?:(?:\b|_)?(?:chapter|ch|episode|ep)|(?:\b|_)c)[\.\-_\s]*(\d+(?:\.\d+)?)'
+        # Latin-script chapter labels: English/British (chapter/chap/ch),
+        # German (kapitel/kap), French (chapitre/chap), Spanish/Portuguese
+        # (capitulo/capítulo/cap), plus episode/ep.
+        num_pattern = (
+            r"(?i)(?:(?:\b|_)?"
+            r"(?:chap['\-]?t?er|chapter|chap|ch"  # incl. "chap'er"/"chaper" stylized typo
+            r'|kapitel|kap'
+            r'|chapitre'
+            r'|cap[ií]tulo|cap'
+            r'|episode|ep)'
+            r'|(?:\b|_)c)'
+            r'[\.\-_\s]*(\d+(?:\.\d+)?)'
+        )
 
     matches = list(re.finditer(num_pattern, normalize_homoglyphs(name_clean)))
-    
+
+    # CJK chapter labels (Chinese/Japanese/Korean) have no Latin word boundary
+    # and the number sits between marker characters (e.g. "第5章", "5話",
+    # "제5화"), so they need a separate pattern rather than a regex alternate.
+    # Only checked as a fallback when the Latin pattern above finds nothing,
+    # so behavior for existing/working Latin-script filenames is unchanged.
+    if upload_type != "volume" and not matches:
+        cjk_pattern = (
+            r'第?\s*(\d+(?:\.\d+)?)\s*(?:章|話|话|回)'   # Chinese/Japanese
+            r'|제?\s*(\d+(?:\.\d+)?)\s*(?:화|장)'          # Korean
+        )
+        cjk_matches = list(re.finditer(cjk_pattern, name_clean))
+        if cjk_matches:
+            # Normalize into the same shape as a single Latin match so the
+            # logic below (single-match branch) can handle it unchanged:
+            # fabricate an object with .group(0)/.group(1)/.start()/.end().
+            class _CjkMatch:
+                def __init__(self, m):
+                    self._m = m
+                    self._num = m.group(1) or m.group(2)
+                def group(self, i):
+                    return self._m.group(0) if i == 0 else self._num
+                def start(self):
+                    return self._m.start()
+                def end(self):
+                    return self._m.end()
+            matches = [_CjkMatch(m) for m in cjk_matches]
+
     if len(matches) > 1:
         num = float(matches[0].group(1))
         num_source = "sequence_index"
@@ -1351,7 +1651,7 @@ def _correct_episode_drift(parsed):
                 updated_candidates.append((label, text))
             item["candidates"] = updated_candidates
 
-def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_regex=None, strip_groups=False, validate=True, custom_renames=None, select_subset=False):
+def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_regex=None, strip_groups=False, validate=True, custom_renames=None, select_subset=False, picker_style="range"):
     valid_extensions = ('.cbz', '.zip')
     parsed = []
 
@@ -1395,15 +1695,50 @@ def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_re
         unit = "volume" if upload_type == "volume" else "chapter"
         console.print()
         print_info(f"Found {len(parsed)} {unit}(s) in this folder.")
-        upload_all = ask_confirm(f"Upload all {len(parsed)} {unit}(s)?", default=True)
-        if not upload_all:
-            valid_numbers = [item["number"] for item in parsed]
-            chosen_numbers = ask_number_range(
-                f"Which {unit}s do you want to upload? (e.g. '103-108,110,115-117')",
-                valid_numbers=valid_numbers
-            )
-            parsed = [item for item in parsed if item["number"] in chosen_numbers]
-            print_success(f"Selected {len(parsed)} {unit}(s) to upload.\n")
+
+        if picker_style == "checkbox":
+            plan_choice = ask_select(f"Upload all {len(parsed)} {unit}(s)?", [
+                questionary.Choice(title=f"Upload all {len(parsed)} file(s)", value="all"),
+                questionary.Choice(title="Choose files to upload…", value="pick"),
+                questionary.Choice(title="Cancel", value="cancel"),
+            ], auto_number=False)
+            if plan_choice == "cancel":
+                print_info("Upload aborted by user.")
+                sys.exit(0)
+            if plan_choice == "pick":
+                while True:
+                    try:
+                        picked = questionary.checkbox(
+                            f"Select the {unit}(s) to upload:",
+                            choices=[
+                                questionary.Choice(
+                                    title=item["filename"], value=item["filename"], checked=True,
+                                ) for item in parsed
+                            ],
+                            qmark="?",
+                        ).ask()
+                    except KeyboardInterrupt:
+                        picked = None
+                    if picked is None:
+                        print_warning("No selection made — exiting.")
+                        sys.exit(0)
+                    if not picked:
+                        print_warning("No files selected — pick at least one, or cancel.")
+                        continue
+                    picked_set = set(picked)
+                    parsed = [item for item in parsed if item["filename"] in picked_set]
+                    print_success(f"Selected {len(parsed)} {unit}(s) to upload.\n")
+                    break
+        else:
+            upload_all = ask_confirm(f"Upload all {len(parsed)} {unit}(s)?", default=True)
+            if not upload_all:
+                valid_numbers = [item["number"] for item in parsed]
+                chosen_numbers = ask_number_range(
+                    f"Which {unit}s do you want to upload? (e.g. '103-108,110,115-117')",
+                    valid_numbers=valid_numbers
+                )
+                parsed = [item for item in parsed if item["number"] in chosen_numbers]
+                print_success(f"Selected {len(parsed)} {unit}(s) to upload.\n")
 
     shape_key_counts = Counter(item["shape_key"] for item in parsed)
 
@@ -1980,6 +2315,211 @@ def _remember_library(lib):
         cfg["library"] = lib
         save_config(cfg)
 
+def _remember_setting(key, value):
+    """Generic settings-memory helper (mirrors _remember_library above, but
+    for any scalar setting — language code, thread count, picker preference)."""
+    if not value:
+        return
+    cfg = load_config()
+    if cfg.get(key) != value:
+        cfg[key] = value
+        save_config(cfg)
+
+# ==============================================================================
+# 📚 UPLOAD HISTORY DB (~/.mangadot_uploader_db.json)
+# Tracks which chapter/volume numbers have already been confirmed-uploaded to a
+# given manga+type+language+group/scanlator target, so repeat runs on the same
+# folder (e.g. a weekly re-upload) can skip files that already made it up
+# without re-verifying them over the network.
+# ==============================================================================
+
+def load_db():
+    try:
+        with open(DB_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"version": 1, "uploaded": {}}
+        data.setdefault("version", 1)
+        if not isinstance(data.get("uploaded"), dict):
+            data["uploaded"] = {}
+        # Normalize every bucket to a compact sorted list of numbers, migrating
+        # any legacy dict-shaped bucket in place. Persisted on the next save_db.
+        uploaded = data["uploaded"]
+        for k in list(uploaded.keys()):
+            uploaded[k] = _normalize_uploaded_bucket(uploaded[k])
+        return data
+    except FileNotFoundError:
+        return {"version": 1, "uploaded": {}}
+    except (OSError, json.JSONDecodeError) as e:
+        logging.debug("load_db: could not read %s (%s); starting with empty DB.", DB_PATH, e)
+        return {"version": 1, "uploaded": {}}
+
+def save_db(db):
+    """Write the DB atomically (temp file + os.replace) so an interrupted write
+    can never corrupt the accumulated upload history."""
+    try:
+        fd, tmp = tempfile.mkstemp(
+            dir=str(DB_PATH.parent), prefix=".mangadot_db_", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(db, f, indent=2)
+            os.replace(tmp, DB_PATH)
+        finally:
+            if os.path.exists(tmp):
+                try: os.remove(tmp)
+                except OSError: pass
+    except (OSError, TypeError, ValueError) as e:
+        logging.debug("save_db: failed to write %s: %s", DB_PATH, e)
+
+def _chapter_number_key(number):
+    """Canonical string key for a chapter/volume number, matching how the
+    server compares numbers: '340' / '342.5', trailing zeros dropped."""
+    try:
+        f = float(number)
+    except (TypeError, ValueError):
+        return str(number).strip()
+    if f.is_integer():
+        return str(int(f))
+    return format(f, "g")
+
+def _chapter_number_value(number):
+    """JSON-friendly numeric form of a chapter number for compact storage: int
+    when whole (340) else float (342.5); None if it can't be parsed."""
+    try:
+        f = float(number)
+    except (TypeError, ValueError):
+        return None
+    return int(f) if f.is_integer() else f
+
+def _uploaded_sort_key(v):
+    try:
+        return (0, float(v))
+    except (TypeError, ValueError):
+        return (1, 0.0)
+
+def _normalize_uploaded_bucket(bucket):
+    """Return an uploaded bucket as a de-duplicated, sorted list of chapter
+    numbers, tolerating a legacy dict-shaped bucket by reading its keys."""
+    if isinstance(bucket, dict):
+        raw = list(bucket.keys())
+    elif isinstance(bucket, list):
+        raw = bucket
+    else:
+        return []
+    seen, out = set(), []
+    for x in raw:
+        key = _chapter_number_key(x)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        val = _chapter_number_value(x)
+        out.append(val if val is not None else key)
+    out.sort(key=_uploaded_sort_key)
+    return out
+
+def _make_target_key(manga_id, upload_type, language, group_ids, scanlator_name):
+    """Identity for a specific upload target: same manga + type + language +
+    attribution. Scoping by attribution means a chapter uploaded under one
+    group isn't treated as already-done under a different group/scanlator."""
+    if group_ids:
+        group_key = ",".join(str(g) for g in sorted(group_ids))
+    elif scanlator_name:
+        group_key = f"s:{scanlator_name.strip().lower()}"
+    else:
+        group_key = "none"
+    return f"{manga_id}|{upload_type}|{language}|{group_key}"
+
+def db_uploaded_numbers(target_key):
+    db = load_db()  # load_db normalizes every bucket to a list of numbers
+    bucket = db.get("uploaded", {}).get(target_key, [])
+    return {_chapter_number_key(x) for x in bucket}
+
+def db_record_uploaded(target_key, files):
+    """Record the given file dicts (each with a 'number') as uploaded under
+    target_key, stored compactly as a sorted list of chapter numbers. Merges
+    into existing history rather than overwriting it."""
+    if not files:
+        return
+    db = load_db()
+    bucket = db.setdefault("uploaded", {}).setdefault(target_key, [])
+    if not isinstance(bucket, list):
+        bucket = _normalize_uploaded_bucket(bucket)
+        db["uploaded"][target_key] = bucket
+    existing = {_chapter_number_key(x) for x in bucket}
+    for f in files:
+        key = _chapter_number_key(f.get("number"))
+        if not key or key in existing:
+            continue
+        existing.add(key)
+        val = _chapter_number_value(f.get("number"))
+        bucket.append(val if val is not None else key)
+    bucket.sort(key=_uploaded_sort_key)
+    save_db(db)
+
+def _check_for_updates():
+    """Once every 7 days, check PyPI for newer versions of our dependencies
+    than the floors declared in REQUIRED_PACKAGES/OPTIMIZER_PACKAGES, and
+    print a short FYI if any are behind. Purely informational:
+      - never installs anything, never changes the PEP 723/REQUIRED floors
+      - never blocks startup — any failure (offline, firewall, bad response,
+        slow PyPI) is swallowed silently and the script proceeds as normal
+      - on non-check days this does nothing at all (no network call)
+    """
+    cfg = load_config()
+    last_checked = cfg.get("last_update_check")
+    now = time.time()
+    if isinstance(last_checked, (int, float)) and (now - last_checked) < 7 * 24 * 3600:
+        return  # checked within the last week; skip silently
+
+    try:
+        all_pkgs = dict(REQUIRED_PACKAGES)
+        all_pkgs.update(OPTIMIZER_PACKAGES)
+        outdated = []
+        for pkg, floor in all_pkgs.items():
+            try:
+                resp = requests.get(f"https://pypi.org/pypi/{pkg}/json", timeout=3)
+                if resp.status_code != 200:
+                    continue
+                latest = resp.json().get("info", {}).get("version")
+                if latest and _version_lt(floor, latest):
+                    outdated.append((pkg, floor, latest))
+            except Exception:
+                continue  # one package failing shouldn't skip the rest
+
+        if outdated:
+            sep = "=" * 62
+            print(sep)
+            print("  ℹ️   Newer versions available (weekly check, informational only)")
+            for pkg, floor, latest in outdated:
+                print(f"      {pkg}: floor is {floor}, PyPI has {latest}")
+            print("  This doesn't affect this run. To adopt a newer version, bump the")
+            print("  floor in the '# dependencies =' block / REQUIRED_PACKAGES, or:")
+            print(f"      uv add --script {_script_name()} <package>>=<version>")
+            print(sep)
+            print()
+    except Exception:
+        pass  # never let the update-check itself interfere with startup
+    finally:
+        # Record the check attempt regardless of outcome, so a flaky network
+        # doesn't cause retries every single run.
+        cfg["last_update_check"] = now
+        save_config(cfg)
+
+def _get_picker_style():
+    """Ask (once) whether the user prefers the range-based picker (type e.g.
+    '103-108,110') or the checkbox picker (tick individual files), remember
+    the answer, and reuse it on future runs without asking again."""
+    cfg = load_config()
+    style = cfg.get("file_picker")
+    if style in ("range", "checkbox"):
+        return style
+    style = ask_select("Which file picker do you prefer, when not uploading everything?", [
+        questionary.Choice(title="Range syntax (e.g. '103-108,110,115-117')", value="range"),
+        questionary.Choice(title="Checkbox list (tick individual files)", value="checkbox"),
+    ])
+    _remember_setting("file_picker", style)
+    return style
+
 def _count_archives(path):
     try:
         return sum(1 for f in os.listdir(path)
@@ -2068,7 +2608,7 @@ def run_dry_run(library_dir=None):
     console.print()
 
     print_info("Scanning directory for files...")
-    files = get_files_in_dir(directory, upload_type, chapter_naming, custom_regex, strip_groups=advanced_strip_groups, custom_renames=custom_renames, select_subset=True)
+    files = get_files_in_dir(directory, upload_type, chapter_naming, custom_regex, strip_groups=advanced_strip_groups, custom_renames=custom_renames, select_subset=True, picker_style=_get_picker_style())
     if not files:
         print_error("No valid .cbz or .zip files found.")
         sys.exit(1)
@@ -2081,6 +2621,507 @@ def run_dry_run(library_dir=None):
     console.print()
     input("Press Enter to exit... ")
     sys.exit(0)
+
+# ==============================================================================
+# 🗜️  CBZ OPTIMIZER  (--optimize-only / --optimize)
+# ==============================================================================
+# Re-compresses images inside .cbz/.zip archives before upload. STRICTLY
+# LOSSLESS BY DEFAULT — pixel data is never altered unless --optimize-lossy
+# is explicitly passed. Deliberately isolated from the upload pipeline:
+# nothing in this section is imported or touched unless the user explicitly
+# passes --optimize-only or --optimize, so a normal upload run pays zero
+# cost for this feature (Pillow / mozjpeg-lossless-optimization are only
+# imported lazily, inside _ensure_optimizer_deps()).
+#
+# Lossless mode (default):
+#   - JPEG : Huffman-table / entropy-coding re-optimization via mozjpeg
+#            (jpegtran-equivalent transform). Pixels are NEVER re-quantized
+#            or re-encoded — decoding the output produces byte-identical
+#            pixel data to the original. Typical savings: ~5-15%.
+#   - PNG  : Pillow's optimize=True + max compress_level. PNG's DEFLATE
+#            stream is inherently lossless; this only searches for a
+#            better filter/compression strategy. Typical savings: 5-25%.
+#   - WEBP : Pillow's lossless=True encoder. Typical savings varies widely.
+#   - BMP  : Losslessly repacked into PNG (BMP is uncompressed, so this is
+#            a pure size win with zero pixel change).
+#
+# Lossy mode (--optimize-lossy, opt-in only):
+#   - JPEG : full re-encode at --optimize-jpeg-quality (default 85).
+#   - PNG  : unchanged (PNG has no meaningful "lossy" mode in Pillow).
+#   - WEBP : re-encode at --optimize-webp-quality (default 85).
+#   This mode DOES alter pixel data and is never used unless the user
+#   types --optimize-lossy on the command line.
+
+OPTIMIZE_IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp')
+_PILLOW_MODULE = None       # cached lazy import, set by _ensure_optimizer_deps()
+_MOZJPEG_MODULE = None      # cached lazy import, set by _ensure_optimizer_deps()
+_MOZJPEG_AVAILABLE = None   # tri-state: None=unchecked, True/False=checked
+
+# --pingo: alternate optimizer backend that shells out to a local pingo
+# binary (https://css-ig.net/pingo) instead of using mozjpeg/Pillow at all.
+# Pingo ships official builds for Windows and Linux only — no macOS build
+# exists. On unsupported platforms (or if the binary can't be found) this
+# falls back to the normal mozjpeg/Pillow path, but ALWAYS prints a visible
+# notice first: a silent fallback would mean the user believes they got a
+# pingo pass when they actually got mozjpeg, which is exactly the kind of
+# quiet behavior-swap this script avoids elsewhere (see _ensure_optimizer_deps).
+_PINGO_BINARY_CACHE = None  # tri-state: None=unchecked, ""=checked-not-found, path=found
+
+def _pingo_binary_name():
+    return "pingo.exe" if platform.system() == "Windows" else "pingo"
+
+def _find_pingo_binary():
+    global _PINGO_BINARY_CACHE
+    if _PINGO_BINARY_CACHE is not None:
+        return _PINGO_BINARY_CACHE or None
+
+    script_dir = Path(__file__).resolve().parent
+    candidate = script_dir / _pingo_binary_name()
+    if candidate.is_file():
+        _PINGO_BINARY_CACHE = str(candidate)
+    else:
+        _PINGO_BINARY_CACHE = ""
+    return _PINGO_BINARY_CACHE or None
+
+def _pingo_supported_here():
+    return platform.system() in ("Windows", "Linux")
+
+def _ensure_pingo_ready():
+    if not _pingo_supported_here():
+        print_warning(
+            f"--pingo was requested, but pingo has no official build for {platform.system()}. "
+            "Falling back to the built-in mozjpeg/Pillow optimizer instead (still lossless by default)."
+        )
+        return None
+
+    path = _find_pingo_binary()
+    if path is None:
+        print_warning(
+            f"--pingo was requested, but '{_pingo_binary_name()}' wasn't found next to mangadot.py. "
+            "Falling back to the built-in mozjpeg/Pillow optimizer instead (still lossless by default)."
+        )
+        return None
+
+    return path
+
+def _ensure_optimizer_deps(require_mozjpeg=False):
+    global _PILLOW_MODULE, _MOZJPEG_MODULE, _MOZJPEG_AVAILABLE
+    needs_check = _PILLOW_MODULE is None or (require_mozjpeg and _MOZJPEG_AVAILABLE is None)
+    if needs_check:
+        check_optimizer_dependencies(need_mozjpeg=require_mozjpeg)
+
+    if _PILLOW_MODULE is None:
+        try:
+            from PIL import Image
+            _PILLOW_MODULE = Image
+        except ImportError:
+            print_error("Pillow is required for --optimize / --optimize-only but isn't installed.")
+            print_info("Install it with:  pip install Pillow")
+            sys.exit(1)
+
+    if _MOZJPEG_AVAILABLE is None:
+        try:
+            import mozjpeg_lossless_optimization as mz
+            _MOZJPEG_MODULE = mz
+            _MOZJPEG_AVAILABLE = True
+        except ImportError:
+            _MOZJPEG_AVAILABLE = False
+
+    if require_mozjpeg and not _MOZJPEG_AVAILABLE:
+        print_error("mozjpeg-lossless-optimization is required for lossless JPEG re-optimization.")
+        print_info("Install it with:  pip install mozjpeg-lossless-optimization")
+        print_info("(Or pass --optimize-lossy to allow lossy JPEG re-encoding instead — this DOES change pixel data.)")
+        sys.exit(1)
+
+    return _PILLOW_MODULE, _MOZJPEG_MODULE
+
+def _optimize_image_bytes(Image, mozjpeg, name, data, lossy, jpeg_quality, png_level, webp_quality):
+    import io
+    ext = os.path.splitext(name)[1].lower()
+
+    try:
+        if ext in ('.jpg', '.jpeg'):
+            if not lossy:
+                new_bytes = mozjpeg.optimize(data)
+            else:
+                with Image.open(io.BytesIO(data)) as im:
+                    im.load()
+                    if im.mode not in ('RGB', 'L'):
+                        im = im.convert('RGB')
+                    out = io.BytesIO()
+                    im.save(out, format='JPEG', quality=jpeg_quality,
+                             optimize=True, progressive=True)
+                    new_bytes = out.getvalue()
+
+        elif ext == '.png':
+            with Image.open(io.BytesIO(data)) as im:
+                im.load()
+                out = io.BytesIO()
+                im.save(out, format='PNG', optimize=True, compress_level=png_level)
+                new_bytes = out.getvalue()
+
+        elif ext == '.webp':
+            with Image.open(io.BytesIO(data)) as im:
+                im.load()
+                out = io.BytesIO()
+                if not lossy:
+                    im.save(out, format='WEBP', lossless=True, method=6, quality=100)
+                else:
+                    im.save(out, format='WEBP', quality=webp_quality, method=6)
+                new_bytes = out.getvalue()
+
+        elif ext == '.bmp':
+            with Image.open(io.BytesIO(data)) as im:
+                im.load()
+                if im.mode not in ('RGB', 'RGBA', 'L'):
+                    im = im.convert('RGB')
+                out = io.BytesIO()
+                im.save(out, format='PNG', optimize=True, compress_level=png_level)
+                new_bytes = out.getvalue()
+
+        else:
+            return data, False
+
+    except Exception:
+        return data, False
+
+    if len(new_bytes) < len(data):
+        return new_bytes, True
+    return data, False
+
+def _resolve_optimized_output_path(input_path, replace):
+    if replace:
+        return input_path
+
+    out_dir = input_path.parent / "optimized"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir / input_path.name
+
+def optimize_cbz_pingo(filepath, pingo_path, replace=False, lossy=False, jpeg_quality=85, webp_quality=85):
+    input_path = Path(filepath)
+
+    try:
+        with zipfile.ZipFile(input_path, 'r') as zin:
+            entries = zin.infolist()
+            originals = {info.filename: zin.read(info.filename) for info in entries}
+    except (zipfile.BadZipFile, OSError) as e:
+        return {"filename": input_path.name, "error": str(e)}
+
+    original_size = input_path.stat().st_size
+
+    with tempfile.TemporaryDirectory(prefix="mangadot_pingo_") as tmp_dir:
+        tmp_dir_path = Path(tmp_dir)
+        image_files = []
+        for name, data in originals.items():
+            if name.endswith('/'):
+                continue
+            dest = tmp_dir_path / name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+            if os.path.splitext(name)[1].lower() in OPTIMIZE_IMAGE_EXTS:
+                image_files.append(dest)
+
+        if not image_files:
+            return {"filename": input_path.name, "skipped": True,
+                    "original_size": original_size, "optimized_size": original_size}
+
+        cmd = [pingo_path]
+        if lossy:
+            cmd += [f"-jpeg={100 - jpeg_quality}", f"-webp={100 - webp_quality}"]
+        else:
+            cmd += ["-s8", "-lossless"]
+        cmd += [str(p) for p in image_files]
+
+        try:
+            subprocess.run(
+                cmd, capture_output=True, text=True, timeout=600, check=False
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return {"filename": input_path.name, "error": f"pingo failed to run: {e}"}
+
+        new_entries = {}
+        changed_any = False
+        for name, data in originals.items():
+            if name.endswith('/'):
+                continue
+            path_on_disk = tmp_dir_path / name
+            try:
+                new_data = path_on_disk.read_bytes()
+            except OSError:
+                new_data = data
+            new_entries[name] = new_data
+            if new_data != data:
+                changed_any = True
+
+        if not changed_any:
+            return {"filename": input_path.name, "skipped": True,
+                    "original_size": original_size, "optimized_size": original_size}
+
+        tmp_fd, tmp_zip_path = tempfile.mkstemp(suffix='.cbz', dir=str(input_path.parent))
+        os.close(tmp_fd)
+        try:
+            with zipfile.ZipFile(tmp_zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as zout:
+                for name, data in new_entries.items():
+                    zout.writestr(name, data)
+
+            optimized_size = os.path.getsize(tmp_zip_path)
+
+            if optimized_size >= original_size:
+                os.remove(tmp_zip_path)
+                return {"filename": input_path.name, "skipped": True,
+                        "original_size": original_size, "optimized_size": original_size}
+
+            output_path = _resolve_optimized_output_path(input_path, replace)
+            os.replace(tmp_zip_path, output_path)
+
+        except Exception as e:
+            if os.path.exists(tmp_zip_path):
+                os.remove(tmp_zip_path)
+            return {"filename": input_path.name, "error": str(e)}
+
+    return {
+        "filename": input_path.name,
+        "output_name": str(output_path.relative_to(input_path.parent)) if not replace else output_path.name,
+        "original_size": original_size,
+        "optimized_size": optimized_size,
+    }
+
+def optimize_cbz(filepath, lossy=False, jpeg_quality=85, png_level=9, webp_quality=85, replace=False):
+    Image, mozjpeg = _ensure_optimizer_deps(require_mozjpeg=not lossy)
+    input_path = Path(filepath)
+
+    try:
+        with zipfile.ZipFile(input_path, 'r') as zin:
+            entries = zin.infolist()
+            originals = {info.filename: zin.read(info.filename) for info in entries}
+    except (zipfile.BadZipFile, OSError) as e:
+        return {"filename": input_path.name, "error": str(e)}
+
+    original_size = input_path.stat().st_size
+    new_entries = {}
+    changed_any = False
+
+    for name, data in originals.items():
+        if name.endswith('/'):
+            continue
+        ext = os.path.splitext(name)[1].lower()
+        if ext in OPTIMIZE_IMAGE_EXTS:
+            new_data, changed = _optimize_image_bytes(
+                Image, mozjpeg, name, data, lossy, jpeg_quality, png_level, webp_quality
+            )
+            out_name = name
+            if changed and ext == '.bmp':
+                out_name = os.path.splitext(name)[0] + '.png'
+            new_entries[out_name] = new_data
+            changed_any = changed_any or changed
+        else:
+            new_entries[name] = data
+
+    if not changed_any:
+        return {"filename": input_path.name, "skipped": True,
+                "original_size": original_size, "optimized_size": original_size}
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.cbz', dir=str(input_path.parent))
+    os.close(tmp_fd)
+    try:
+        with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as zout:
+            for name, data in new_entries.items():
+                zout.writestr(name, data)
+
+        optimized_size = os.path.getsize(tmp_path)
+
+        if optimized_size >= original_size:
+            os.remove(tmp_path)
+            return {"filename": input_path.name, "skipped": True,
+                    "original_size": original_size, "optimized_size": original_size}
+
+        output_path = _resolve_optimized_output_path(input_path, replace)
+        os.replace(tmp_path, output_path)
+
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return {"filename": input_path.name, "error": str(e)}
+
+    return {
+        "filename": input_path.name,
+        "output_name": str(output_path.relative_to(input_path.parent)) if not replace else output_path.name,
+        "original_size": original_size,
+        "optimized_size": optimized_size,
+    }
+
+def run_optimize(directory, replace=False, lossy=False, jpeg_quality=85, png_level=9,
+                  webp_quality=85, thread_count=4, then_upload=False, use_pingo=False):
+    console.print()
+    console.rule("[bold magenta]MangaDot CBZ Optimizer[/bold magenta]", style="green")
+    console.print()
+
+    pingo_path = None
+    if use_pingo:
+        pingo_path = _ensure_pingo_ready()
+        if pingo_path:
+            console.print()
+
+    if not pingo_path:
+        _ensure_optimizer_deps(require_mozjpeg=not lossy)  # fail fast before scanning
+
+    backend_label = "PINGO" if pingo_path else "BUILT-IN (mozjpeg/Pillow)"
+    console.print(f"[bold white on blue] BACKEND: {backend_label} [/bold white on blue]")
+    if pingo_path:
+        print_info(f"pingo binary: {pingo_path}")
+    console.print()
+
+    if lossy:
+        print_warning(
+            "LOSSY mode enabled (--optimize-lossy): JPEG/WEBP pixel data WILL be "
+            "re-encoded and quality will be reduced. This cannot be undone once "
+            "originals are overwritten."
+        )
+        console.print()
+
+    valid_extensions = ('.cbz', '.zip')
+    try:
+        targets = sorted(
+            (e.path for e in os.scandir(directory)
+             if e.is_file() and e.name.lower().endswith(valid_extensions)),
+            key=natural_sort_key
+        )
+    except OSError as e:
+        print_error(f"Error scanning directory {directory}: {e}")
+        if not then_upload:
+            sys.exit(1)
+        return
+
+    if not targets:
+        print_error("No .cbz or .zip files found in this directory.")
+        if not then_upload:
+            sys.exit(1)
+        return
+
+    if replace:
+        print_warning(
+            f"--optimize-replace will overwrite {len(targets)} original archive(s) "
+            "in place. This cannot be undone."
+        )
+        if not ask_confirm(
+            f"Really overwrite all {len(targets)} original(s) in place? "
+            "(No = write to an 'optimized' subfolder instead)",
+            default=False
+        ):
+            print_info("Keeping originals — writing to an 'optimized' subfolder instead.")
+            replace = False
+        console.print()
+
+    mode_desc = "IN-PLACE (originals overwritten)" if replace else "SUBFOLDER (optimized/)"
+    if pingo_path:
+        quality_desc = f"lossy JPEG q{jpeg_quality}/WEBP q{webp_quality}" if lossy else "lossless"
+    else:
+        quality_desc = f"lossy JPEG q{jpeg_quality}/WEBP q{webp_quality}" if lossy else "lossless (pixel-identical)"
+    console.print(f"[bold white on dark_green] MODE: {mode_desc} [/bold white on dark_green]")
+    print_info(f"Found {len(targets)} archive(s) · {quality_desc} · {thread_count} thread(s)")
+    console.print()
+
+    results = []
+    start = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=thread_count) as pool:
+        if pingo_path:
+            futures = {
+                pool.submit(optimize_cbz_pingo, path, pingo_path, replace, lossy, jpeg_quality, webp_quality): path
+                for path in targets
+            }
+        else:
+            futures = {
+                pool.submit(optimize_cbz, path, lossy, jpeg_quality, png_level, webp_quality, replace): path
+                for path in targets
+            }
+        with console.status("[cyan]Optimizing archives...[/cyan]", spinner="dots") as status:
+            done = 0
+            for future in concurrent.futures.as_completed(futures):
+                done += 1
+                result = future.result()
+                results.append(result)
+                status.update(f"[cyan]Optimizing archives... ({done}/{len(targets)})[/cyan]")
+    elapsed = time.time() - start
+
+    table_title = f"Optimization Results — {backend_label} · {mode_desc}"
+    table = Table(title=table_title, box=box.SIMPLE_HEAVY)
+    table.add_column("File", overflow="fold")
+    table.add_column("Original", justify="right")
+    table.add_column("Optimized", justify="right")
+    table.add_column("Saved", justify="right")
+    table.add_column("Status", justify="center")
+
+    total_original = 0
+    total_optimized = 0
+    error_count = 0
+    skipped_count = 0
+    carried_forward = []  # filenames copied into optimized/ untouched (skip/error), when then_upload
+
+    for r in sorted(results, key=lambda x: natural_sort_key(x["filename"])):
+        if r.get("error"):
+            error_count += 1
+            table.add_row(r["filename"], "-", "-", "-", "[red]error[/red]")
+            continue
+
+        orig = r["original_size"]
+        opt = r["optimized_size"]
+        total_original += orig
+        total_optimized += opt
+
+        if r.get("skipped"):
+            skipped_count += 1
+            table.add_row(r["filename"], fmt_size(orig), fmt_size(opt), "-", "[dim]no gain[/dim]")
+        else:
+            saved = orig - opt
+            pct = (saved / orig * 100) if orig else 0
+            table.add_row(
+                r["filename"], fmt_size(orig), fmt_size(opt),
+                f"-{fmt_size(saved)} ({pct:.1f}%)", "[green]optimized[/green]"
+            )
+
+    console.print(table)
+    console.print()
+
+    output_dir = directory
+    if then_upload and not replace:
+        optimized_dir = os.path.join(directory, "optimized")
+        for r in results:
+            if r.get("skipped") or r.get("error"):
+                src = os.path.join(directory, r["filename"])
+                dst = os.path.join(optimized_dir, r["filename"])
+                if os.path.exists(src) and not os.path.exists(dst):
+                    try:
+                        os.makedirs(optimized_dir, exist_ok=True)
+                        shutil.copy2(src, dst)
+                        carried_forward.append(r["filename"])
+                    except OSError as e:
+                        print_warning(f"Could not copy '{r['filename']}' into optimized/ for upload: {e}")
+        output_dir = optimized_dir
+        if carried_forward:
+            print_info(
+                f"Copied {len(carried_forward)} skipped/errored file(s) into optimized/ "
+                "unchanged, so the upload sees the complete set."
+            )
+
+    optimized_count = len(results) - error_count - skipped_count
+    total_saved = total_original - total_optimized
+    total_pct = (total_saved / total_original * 100) if total_original else 0
+
+    print_info(
+        f"{optimized_count} optimized · {skipped_count} skipped (no gain) · "
+        f"{error_count} error(s) · {fmt_duration(elapsed)}"
+    )
+    if total_saved > 0:
+        print_success(f"Total saved: {fmt_size(total_saved)} ({total_pct:.1f}% smaller)")
+    console.print()
+
+    if not then_upload:
+        input("Press Enter to exit... ")
+        sys.exit(0)
+
+    return output_dir
+
+
 
 # ==============================================================================
 # 🔑 AUTH & API HELPERS
@@ -2147,7 +3188,7 @@ def search_manga(query, session):
 
 def search_groups(query, session):
     try:
-        res = session.get(f"{BASE_URL}/api/groups", params={"q": query, "limit": 25}, timeout=(10, 30))
+        res = session.get(f"{BASE_URL}/api/groups/lookup", params={"q": query, "limit": 25}, timeout=(10, 30))
         if res.status_code != 200: return []
         return res.json().get("groups", [])
     except requests.exceptions.RequestException as e:
@@ -3378,7 +4419,7 @@ def _run_upload_loop(files, req_session, manga_id, group_ids, upload_type,
 # ==============================================================================
 
 def _check_proxy(proxy_url, verify=True):
-    test_url = "https://www.google.com/generate_204"
+    test_url = "https://mangadot.net"
     try:
         r = requests.get(
             test_url,
@@ -3388,7 +4429,7 @@ def _check_proxy(proxy_url, verify=True):
             allow_redirects=False,
             verify=verify,
         )
-        if r.status_code == 204:
+        if r.status_code == 200 or r.status_code == 204:
             return True, None
         elif r.status_code == 407:
             return False, "Proxy returned 407 — credentials are wrong or missing."
@@ -3423,6 +4464,43 @@ def build_arg_parser():
     parser.add_argument("--library", default=DEFAULT_LIBRARY_DIR or None, metavar="DIR", help="Parent folder of manga subfolders; pick one interactively instead of typing a path.")
     parser.add_argument("--proxy", default=None, help="Tunnel all HTTP/HTTPS requests through a specific proxy server.")
     parser.add_argument("--proxy-no-verify", action="store_true", help="Disable SSL certificate verification when using a proxy (use only if the proxy does TLS interception).")
+    parser.add_argument("--optimize-only", nargs="?", const="__prompt__", default=None, metavar="DIR",
+                         help="Losslessly re-compress images inside every .cbz/.zip in DIR, then exit (no "
+                              "login, no upload). Omit DIR to pick a folder interactively. Pixel data is "
+                              "never altered unless --optimize-lossy is also passed. Requires Pillow "
+                              "(pip install Pillow) and, for true lossless JPEG re-optimization, "
+                              "mozjpeg-lossless-optimization (pip install mozjpeg-lossless-optimization).")
+    parser.add_argument("--optimize", nargs="?", const="__prompt__", default=None, metavar="DIR",
+                         help="Same as --optimize-only, but continues straight into the normal upload flow "
+                              "on that folder afterward, so you can shrink and upload in one run.")
+    parser.add_argument("--optimize-lossy", action="store_true",
+                         help="Opt-in ONLY: allow lossy JPEG/WEBP re-encoding (pixel data changes, quality "
+                              "reduced) for larger size savings. Without this flag, optimization is always "
+                              "strictly lossless. This flag alone is what enables quality loss — nothing else does.")
+    parser.add_argument("--optimize-replace", action="store_true",
+                         help="Overwrite originals in-place instead of writing to an 'optimized' subfolder "
+                              "(the default). You'll be asked to confirm before any originals are "
+                              "overwritten — declining falls back to the subfolder instead.")
+    parser.add_argument("--optimize-jpeg-quality", type=_positive_int, default=85, metavar="1-95",
+                         help="JPEG quality when --optimize-lossy is used (default: 85). Ignored in the default lossless mode.")
+    parser.add_argument("--optimize-webp-quality", type=_positive_int, default=85, metavar="1-100",
+                         help="WEBP quality when --optimize-lossy is used (default: 85). Ignored in the default lossless mode.")
+    parser.add_argument("--optimize-threads", type=_positive_int, default=4, metavar="N",
+                         help="Parallel archives to optimize at once (default: 4). Separate from the "
+                              "interactive upload thread-count prompt.")
+    parser.add_argument("--pingo", action="store_true",
+                         help="Modifier for --optimize/--optimize-only — has no effect on its own. "
+                              "Use a local pingo binary (must sit next to mangadot.py) instead of the "
+                              "built-in mozjpeg/Pillow optimizer — replaces that pipeline entirely for "
+                              "this run. Pingo has no official macOS build; on unsupported platforms or "
+                              "if the binary isn't found, this falls back to mozjpeg/Pillow with a "
+                              "visible notice rather than failing silently.")
+    parser.add_argument("--refresh-uv-cache", action="store_true",
+                         help="Clear uv's cached environment for this script and exit (only relevant "
+                              "when running via 'uv run'). Forces the next run to re-resolve every "
+                              "dependency in the PEP 723 block to its newest version satisfying the "
+                              "declared floor. Handled before any other startup logic, so it works even "
+                              "if dependencies aren't installed yet.")
     return parser
 
 def main():
@@ -3432,11 +4510,70 @@ def main():
     saved_config     = load_config()
     resolved_library = args.library or saved_config.get("library") or (DEFAULT_LIBRARY_DIR or None)
 
+    _check_for_updates()
+
     resolved_proxy = args.proxy
 
     if args.dry_run: 
         run_dry_run(resolved_library)
         sys.exit(0)
+
+    # --optimize-only: shrink images and exit. No auth, no session, no upload
+    # code below this block is ever reached for this mode.
+    if args.optimize_only is not None:
+        target_dir = args.optimize_only
+        if target_dir == "__prompt__":
+            target_dir = select_directory(resolved_library)
+        elif not os.path.isdir(target_dir):
+            print_error(f"Directory does not exist: {target_dir}")
+            sys.exit(1)
+        run_optimize(
+            target_dir,
+            replace=args.optimize_replace,
+            lossy=args.optimize_lossy,
+            jpeg_quality=args.optimize_jpeg_quality,
+            webp_quality=args.optimize_webp_quality,
+            thread_count=args.optimize_threads,
+            then_upload=False,
+            use_pingo=args.pingo,
+        )
+        # run_optimize() calls sys.exit(0) itself once the summary is shown.
+
+    # --optimize: shrink images first, then fall through into the normal
+    # interactive upload flow below, pre-selecting the folder that actually
+    # holds the optimized files (target_dir itself if --optimize-replace was
+    # confirmed, or target_dir/optimized otherwise — run_optimize() reports
+    # back which one so we never point the uploader at stale originals).
+    preselected_dir = None
+    # Carries the original source folder's name through to the title-guess
+    # step below, since preselected_dir may end up pointing at <target>/optimized
+    # — a name that makes a terrible manga-title guess. Kept separate from
+    # preselected_dir on purpose: one is "where to scan files", the other is
+    # "what to call this thing", and they diverge exactly when replace=False.
+    preselected_title_source = None
+    if args.optimize is not None:
+        target_dir = args.optimize
+        if target_dir == "__prompt__":
+            target_dir = select_directory(resolved_library)
+        elif not os.path.isdir(target_dir):
+            print_error(f"Directory does not exist: {target_dir}")
+            sys.exit(1)
+        upload_dir = run_optimize(
+            target_dir,
+            replace=args.optimize_replace,
+            lossy=args.optimize_lossy,
+            jpeg_quality=args.optimize_jpeg_quality,
+            webp_quality=args.optimize_webp_quality,
+            thread_count=args.optimize_threads,
+            then_upload=True,
+            use_pingo=args.pingo,
+        )
+        upload_desc = "this same folder" if upload_dir == target_dir else "the 'optimized' subfolder"
+        if not ask_confirm(f"Optimization done. Continue into upload for {upload_desc}?", default=True):
+            print_info("Stopping here — nothing was uploaded.")
+            sys.exit(0)
+        preselected_dir = upload_dir
+        preselected_title_source = Path(target_dir).name
 
     if args.debug:
         log_handler = logging.handlers.RotatingFileHandler(
@@ -3486,13 +4623,17 @@ def main():
     console.rule("[dim]Setup[/dim]", style="green")
     console.print()
 
-    library_dir = resolved_library
-    if library_dir and not args.library and library_dir == saved_config.get("library"):
-        print_info(f"Using remembered library folder: [cyan]{library_dir}[/cyan]")
-    directory = select_directory(library_dir)
+    if preselected_dir:
+        directory = preselected_dir
+        print_info(f"Using just-optimized folder: [cyan]{directory}[/cyan]")
+    else:
+        library_dir = resolved_library
+        if library_dir and not args.library and library_dir == saved_config.get("library"):
+            print_info(f"Using remembered library folder: [cyan]{library_dir}[/cyan]")
+        directory = select_directory(library_dir)
     flush_input_buffer()
 
-    guessed_title = Path(directory).name if directory else ""
+    guessed_title = preselected_title_source or (Path(directory).name if directory else "")
     manga_id = _select_manga(req_session, guessed_title)
 
     req_session.headers.update({"Referer": f"{BASE_URL}/manga/{manga_id}/upload"})
@@ -3509,7 +4650,23 @@ def main():
     if upload_type == "chapter":
         chapter_naming, custom_regex, custom_renames, advanced_strip_groups = _ask_chapter_naming()
 
-    language = prompt("Language code", default="en")
+    guessed_lang_code = _guess_language_from_path(directory)
+    remembered_lang   = str(saved_config.get("language") or "en")
+    default_lang_code = guessed_lang_code or remembered_lang
+
+    # Single field: type to filter (autocomplete), or press Tab with nothing
+    # typed to reveal the full list of all languages to pick from — no
+    # separate dropdown mode needed, questionary/prompt_toolkit does this
+    # natively for any autocomplete field with a completer attached.
+    lang_codes = [code for code, _name in LANGUAGES]
+    lang_meta  = {code: name for code, name in LANGUAGES}
+    language = ask_autocomplete(
+        "Language code (type to filter, or press Tab to see all)",
+        choices=lang_codes,
+        default=default_lang_code,
+        meta_information=lang_meta,
+    )
+    _remember_setting("language", language)
 
     is_group, group_ids, scanlator_name, per_file_group_map, selected_group_name, strip_bracket_groups = \
     _setup_group_config(directory, req_session, upload_type)
@@ -3520,19 +4677,22 @@ def main():
     "Cloudflare's banhammer is feeling lonely today, and I'm sure the admins\n"
     "won't mind you trying to single-handedly melt their infrastructure."
     )
+    saved_threads = saved_config.get("threads")
+    default_threads = str(saved_threads) if isinstance(saved_threads, int) and 1 <= saved_threads <= 30 else "5"
     while True:
         try:
-            thread_count = int(prompt("Number of parallel uploads (1-30)", default="5"))
+            thread_count = int(prompt("Number of parallel uploads (1-30)", default=default_threads))
             if 1 <= thread_count <= 30: break
             print_error("Please enter a number between 1 and 30.")
         except ValueError: print_error("Invalid input.")
+    _remember_setting("threads", thread_count)
 
     console.print()
     console.rule("[dim]Files[/dim]", style="green")
     console.print()
 
     print_info("Scanning directory for files...")
-    files = get_files_in_dir(directory, upload_type, chapter_naming, custom_regex, strip_groups=strip_bracket_groups, custom_renames=custom_renames, select_subset=True)
+    files = get_files_in_dir(directory, upload_type, chapter_naming, custom_regex, strip_groups=strip_bracket_groups, custom_renames=custom_renames, select_subset=True, picker_style=_get_picker_style())
     if not files:
         print_error("No valid .cbz or .zip files found.")
         sys.exit(1)
@@ -3544,6 +4704,27 @@ def main():
     for f in files:
         f["_upload_type"] = upload_type
         f["_group_label"] = selected_group_name
+
+    target_key = _make_target_key(manga_id, upload_type, language, group_ids, scanlator_name)
+    already_uploaded = db_uploaded_numbers(target_key)
+    if already_uploaded:
+        skip_candidates = [f for f in files if _chapter_number_key(f["number"]) in already_uploaded]
+        if skip_candidates:
+            console.print()
+            print_info(
+                f"[cyan]{len(skip_candidates)}[/cyan] file(s) match numbers already recorded as "
+                f"uploaded to this exact target (manga/type/language/group) — from a previous run."
+            )
+            skip_them = ask_confirm(
+                f"Skip these {len(skip_candidates)} already-uploaded file(s)?", default=True
+            )
+            if skip_them:
+                skip_names = {f["filename"] for f in skip_candidates}
+                files = [f for f in files if f["filename"] not in skip_names]
+                if not files:
+                    print_success("Nothing left to upload — everything in this batch was already recorded.")
+                    sys.exit(0)
+                print_info(f"Skipped {len(skip_names)}; [bold]{len(files)}[/bold] file(s) remain to upload.")
 
     print_files_table(files, upload_type, group_label=selected_group_name)
     _check_missing(files, upload_type)
@@ -3574,6 +4755,11 @@ def main():
 
     uploaded_files = [f for f in files if f["filename"] not in final_failed]
     uploaded_bytes = sum(f["size"] for f in uploaded_files)
+
+    # Record confirmed uploads so future runs on this same target can skip them.
+    if uploaded_files:
+        db_record_uploaded(target_key, uploaded_files)
+
     if uploaded_files:
         avg = uploaded_bytes / upload_elapsed if upload_elapsed > 0 else 0
         print_info(
