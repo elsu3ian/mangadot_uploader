@@ -535,7 +535,6 @@ def upload_file_tus(session, file_info, manga_id, group_ids,
         except SessionExpiredError: raise
         except OSError as e: return {"key": filename, "success": False, "error": str(e)[:30]}
 
-        base_check_url = f"{BASE_URL}/api/manga/{manga_id}/volumes" if upload_type == "volume" else f"{BASE_URL}/api/manga/{manga_id}/chapters/list"
         found        = False
         found_item   = None
         verify_start = time.time()
@@ -594,7 +593,17 @@ def upload_file_tus(session, file_info, manga_id, group_ids,
             # actually set and actually sees ticking in the "Verifying...
             # (Ns)" label, so the check and the label now agree exactly.
             elapsed_verify = int(time.time() - verify_start)
-            if elapsed_verify >= verify_timeout: return {"key": filename, "success": False, "error": "Verification timeout reached."}
+            if elapsed_verify >= verify_timeout:
+                if already_exists:
+                    label = "✅ Already Exists"
+                else:
+                    label = "✅ Uploaded (Pending Index)"
+                progress_callback(filename, label, 1.0, current=size, total=size, speed=0.0, eta=0.0)
+                return {
+                    "key": filename,
+                    "success": True,
+                    "warning": None if already_exists else "Upload completed via TUS; awaiting server indexing in /api/uploads/mine."
+                }
 
             # Report to the GUI at most once per RETRY_DELAY (5s), NOT
             # once per semaphore-retry iteration. upload_progress_screen
@@ -702,95 +711,7 @@ def upload_file_tus(session, file_info, manga_id, group_ids,
                 if found:
                     break
 
-                page = 1
-                while True:
-                    # elapsed_verify is only re-checked between OUTER
-                    # while-not-found passes (top of this function's
-                    # while loop). A single inner pagination sweep here
-                    # can otherwise run past verify_timeout entirely
-                    # unchecked on a manga with a large chapter/volume
-                    # list - e.g. a real case that sat "Verifying...
-                    # (639s)" on-screen well past a configured 60s
-                    # timeout, because the inner loop kept fetching page
-                    # after page (no match ever found) without ever
-                    # returning control to the outer loop's timeout
-                    # check. Checking it here too closes that gap: the
-                    # timeout now fires within one page-fetch of the
-                    # real deadline, regardless of how many pages a
-                    # single sweep would otherwise need.
-                    if int(time.time() - verify_start) >= verify_timeout:
-                        return {"key": filename, "success": False, "error": "Verification timeout reached."}
-                    _req_start = time.time()
-                    fetch_check = worker_session.get(f"{base_check_url}?page={page}&limit=100&_t={int(time.time())}", timeout=10)
-                    _req_elapsed = time.time() - _req_start
-                    # Diagnostic only: separates "the verify GET itself
-                    # was slow" (server/network side) from "this file
-                    # just waited a long time for a semaphore slot"
-                    # (app-side queuing) - the two look identical in
-                    # elapsed_verify alone. Logged at INFO so it shows
-                    # up without needing debug logging enabled; safe to
-                    # downgrade to DEBUG once the server-vs-app question
-                    # is settled.
-                    logging.info(
-                        "verify GET page=%d for %s took %.2fs (status=%s)",
-                        page, filename, _req_elapsed, fetch_check.status_code,
-                    )
-
-                    if fetch_check.status_code in (401, 403): raise SessionExpiredError()
-                    if fetch_check.status_code != 200: break
-
-                    items_list = fetch_check.json()
-                    if isinstance(items_list, dict): items_list = items_list.get("volumes", items_list.get("chapters", []))
-                    if not isinstance(items_list, list) or not items_list:
-                        break
-
-                    for item in items_list:
-                        try:
-                            if upload_type == "volume":
-                                match = math.isclose(float(item.get("volume_number", -1)), float(file_info["number"]), abs_tol=0.001)
-                            else:
-                                match = math.isclose(float(item.get("chapter_number", -1)), float(file_info["number"]), abs_tol=0.001)
-                        except (ValueError, TypeError): match = False
-
-                        if match:
-                            item_group_ids = []
-                            if item.get("group_id"): item_group_ids.append(item["group_id"])
-                            for g in item.get("groups", []):
-                                if isinstance(g, dict) and g.get("id"): item_group_ids.append(g["id"])
-                                elif isinstance(g, int): item_group_ids.append(g)
-                            item_scanlator = item.get("scanlator_name") or item.get("scanlator")
-
-                            if group_ids and any(gid in item_group_ids for gid in group_ids):
-                                found_item = item; found = True; break
-
-                            if not group_ids and scanlator_name:
-                                if isinstance(item_scanlator, str) and item_scanlator.strip().lower() == scanlator_name.strip().lower():
-                                    found_item = item; found = True; break
-
-                    if found:
-                        break
-                    # Advance to the next page once per page actually
-                    # fetched - NOT once per item scanned. This used to
-                    # sit inside the `for item in items_list:` loop
-                    # above (indented one level deeper, right after the
-                    # `if found: break`), which meant a single 100-item
-                    # page bumped `page` by up to 100 in one pass - e.g.
-                    # after scanning page 1's 100 items with no match,
-                    # `page` was already 101, so the very next fetch
-                    # jumped straight past every real page (2, 3, 4, ...)
-                    # straight to a near-certainly-empty page far beyond
-                    # the manga's actual chapter count. That empty
-                    # response immediately hit the `break` above,
-                    # ending the whole pagination scan having only ever
-                    # really looked at page 1 - so a chapter that
-                    # genuinely existed on page 2+ was never found, no
-                    # matter how long verify_timeout was set to. This is
-                    # the real reason verification was failing/timing
-                    # out, independent of the timeout-accounting fix
-                    # elsewhere in this function.
-                    page += 1
-
-                if not found and not _interruptible_sleep(RETRY_DELAY, abort_event):
+                if not _interruptible_sleep(min(2.0, RETRY_DELAY), abort_event):
                     return {"key": filename, "success": False, "error": "Aborted"}
             except SessionExpiredError:
                 raise
