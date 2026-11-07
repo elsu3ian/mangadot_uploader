@@ -987,7 +987,7 @@ class GroupConfigScreen(QWidget):
                 return
 
         # Warning for untagged files that have no group assigned
-        if self._untagged_files and not has_untagged_assigned:
+        if self._untagged_files and not has_untagged_assigned and not self._resolved_group_ids:
             file_list = "\n".join(f"  • {os.path.basename(p)}" for p in self._untagged_files[:10])
             if len(self._untagged_files) > 10:
                 file_list += f"\n  … and {len(self._untagged_files) - 10} more"
@@ -1002,7 +1002,7 @@ class GroupConfigScreen(QWidget):
             )
             msg.setInformativeText("Go back and select a group for untagged chapters, or continue without group?")
             go_back_btn = msg.addButton("Go back and assign group", QMessageBox.RejectRole)
-            msg.addButton("Continue without group", QMessageBox.AcceptRole)
+            cont_btn = msg.addButton("Continue without group", QMessageBox.AcceptRole)
             msg.setDefaultButton(go_back_btn)
             msg.exec()
             if msg.clickedButton() == go_back_btn:
@@ -1011,6 +1011,9 @@ class GroupConfigScreen(QWidget):
                 self._render_search_results_for_active_target()
                 self.search_input.setFocus()
                 return
+            elif msg.clickedButton() == cont_btn:
+                self._resolved_group_ids = []
+                self._resolved_group_name = None
 
         per_file_map = dict(self._per_file_group_map_result)
         per_file_names = parser_mod.resolve_per_file_group_names(
@@ -1026,6 +1029,11 @@ class GroupConfigScreen(QWidget):
                     per_file_map[uf] = list(untagged_ids)
                     if untagged_gnames:
                         per_file_names[uf] = list(untagged_gnames)
+        elif self._resolved_group_ids and not self._per_file_names:
+            for uf in self._untagged_files:
+                per_file_map[uf] = list(self._resolved_group_ids)
+                if self._resolved_group_name:
+                    per_file_names[uf] = [g.strip() for g in self._resolved_group_name.split(",") if g.strip()]
 
         self.config_finished.emit({
             "is_group_upload": True,

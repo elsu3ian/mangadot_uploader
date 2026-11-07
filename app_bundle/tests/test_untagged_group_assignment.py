@@ -174,6 +174,45 @@ class UntaggedGroupAssignmentTest(unittest.TestCase):
         self.assertEqual(review.table.item(1, 4).text(), "None (no group)")
         review.close()
 
+    def test_untagged_files_assigned_via_fallback_group_does_not_warn(self):
+        # Create a directory with ONLY untagged files
+        untagged_dir = tempfile.mkdtemp()
+        try:
+            for fname in ["ch0001 - chapter 000.cbz", "ch0002 - chapter 001.cbz"]:
+                with open(os.path.join(untagged_dir, fname), "wb") as f:
+                    f.write(b"PK\x05\x06" + b"\x00" * 18)
+
+            screen = GroupConfigScreen(MagicMock(), untagged_dir)
+            self.assertEqual(len(screen._untagged_files), 2)
+            self.assertEqual(len(screen._detected_names), 0)
+
+            # User picks group via fallback (target_name=None)
+            screen._apply_group_choice_to_target({"id": 9210, "name": "KeiichiCAT"})
+            self.assertEqual(screen._resolved_group_ids, [9210])
+
+            emitted = []
+            screen.config_finished.connect(lambda p: emitted.append(p))
+
+            # _on_continue must NOT trigger warning popup and must emit immediately
+            with patch("mangadot_app.gui.group_config_dialog.QMessageBox") as mock_msg:
+                screen._on_continue()
+                # QMessageBox warning should NOT be instantiated
+                mock_msg.assert_not_called()
+
+            self.assertEqual(len(emitted), 1)
+            cfg = emitted[0]
+            self.assertEqual(cfg["group_ids"], [9210])
+            self.assertEqual(cfg["group_name"], "KeiichiCAT")
+            # All untagged files are mapped
+            for uf in screen._untagged_files:
+                self.assertEqual(cfg["per_file_group_map"][uf], [9210])
+                self.assertEqual(cfg["per_file_group_names"][uf], ["KeiichiCAT"])
+
+            screen.stop_background_work()
+            screen.close()
+        finally:
+            shutil.rmtree(untagged_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
