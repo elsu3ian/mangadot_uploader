@@ -53,8 +53,9 @@ They share the exact same login, parsing, verification, and upload engine undern
 
 - **`mangadot.py`** — The standalone, feature-complete terminal CLI uploader with interactive `rich` dashboards, live speed/ETA meters, automated dependency management, and lossless image optimization.
 - **`app_bundle/`** — The modular PySide6 desktop GUI application source tree, featuring multi-screen workflows, group attribution pickers, title review dialogs, and built-in upload history.
-- **`Start MangaDot GUI.bat`** — 1-click launcher for the desktop GUI.
-- **`Run MangaDot Uploader.bat`** — Smart launcher for the CLI with automatic `uv` / `py -3.12` / `python` detection.
+- **`Setup_Runtime.bat`** — Automated 1-click runtime & dependency provisioner: downloads portable Python 3.12 (if no Python is found on your PC) and installs all dependencies into an isolated local folder.
+- **`Start MangaDot GUI.bat`** — 1-click launcher for the desktop GUI (with automatic runtime provisioning on first run).
+- **`Run MangaDot Uploader.bat`** — Smart launcher for the CLI (with automatic runtime provisioning on first run).
 
 ## Prerequisites
 
@@ -63,17 +64,20 @@ They share the exact same login, parsing, verification, and upload engine undern
 - Either way, you must be **logged in** to [MangaDot.net](https://mangadot.net) in your web browser — Chrome, Firefox, Brave, Edge, Opera, Vivaldi, and Zen are all supported.
 - **`chafa`** *(CLI only, optional)* — Enables inline cover art rendering in the terminal. Install instructions are shown at startup if missing.
 
-## Installation
+## Installation & Setup
 
-### GUI App (Windows)
+### ⚡ 1-Click Zero-Config Setup (Windows — Recommended)
 
-1. Go to the [Releases page](https://github.com/elsu3ian/mangadot_uploader/releases/latest) and download `MangaDotUploader.exe`.
-2. Make sure your browser is fully **closed** so the app can read your session cookies (unless you use the CDP option for a Chromium browser — see [Troubleshooting Cookies](#troubleshooting-cookies-windows) below).
-3. Double-click the `.exe` to run it.
+No Python installed? No problem. You don't need administrator permissions or manual Python installs:
 
-> **Note:** Windows Defender or SmartScreen may flag the `.exe` as unrecognized because it's a new, unsigned executable that reads browser cookies. This is expected for an independently-published tool — click "More info" → "Run anyway" if you trust the source.
+1. Clone or download this repository.
+2. Double-click **`Setup_Runtime.bat`** (or simply double-click **`Start MangaDot GUI.bat`** or **`Run MangaDot Uploader.bat`**).
+3. The script will automatically detect your environment:
+   - If Python 3.12+ is installed, it sets up an isolated `.venv` and installs all dependencies.
+   - If **no Python** is installed on your computer, it downloads an official standalone Python 3.12 runtime (~11 MB) into a local `runtime/` folder, bootstraps pip, and installs all dependencies automatically.
+4. Launch the GUI or CLI anytime with 1 click!
 
-### CLI
+### Manual Installation (Power Users / macOS / Linux)
 
 1. Clone the repository:
 
@@ -85,10 +89,14 @@ cd mangadot_uploader
 2. Install the required dependencies:
 
 ```bash
-pip install --upgrade requests rookiepy questionary rich websocket-client
+# For CLI only:
+pip install -r requirements.txt
+
+# For both GUI and CLI:
+pip install -r requirements.txt -r app_bundle/requirements.txt
 ```
 
-> **Note:** The script also auto-installs missing or outdated packages on launch. Manual installation is only necessary for the very first run.
+> **Note:** When running via Astral's `uv`, zero setup is needed — just run `uv run mangadot.py`.
 
 3. Ensure your browser is completely **closed** before running the script so it can successfully extract your session cookies — unless you're using **CDP mode** for a Chromium browser (see [Troubleshooting Cookies](#troubleshooting-cookies-windows) below), which launches its own isolated debug profile instead.
 
