@@ -4492,7 +4492,6 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
         except SessionExpiredError: raise
         except OSError as e: return {"key": filename, "success": False, "error": str(e)[:30]}
 
-        base_check_url = f"{BASE_URL}/api/manga/{manga_id}/volumes" if upload_type == "volume" else f"{BASE_URL}/api/manga/{manga_id}/chapters/list"
         found        = False
         found_item   = None
         verify_start = time.time()
@@ -4519,30 +4518,30 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
         while not found:
             if abort_event.is_set(): return {"key": filename, "success": False, "error": "Aborted"}
             
-            elapsed_verify = int(time.time() - verify_start - total_semaphore_wait)
-            if elapsed_verify >= verify_timeout: return {"key": filename, "success": False, "error": "Verification timeout reached."}
+            elapsed_verify = int(time.time() - verify_start)
+            if elapsed_verify >= verify_timeout:
+                label = "✅ Already Exists" if already_exists else "✅ Uploaded (Pending Index)"
+                renderer.update_chapter_status(filename, label, 1.0, current=size, total=size, speed=0.0, eta=0.0)
+                return {
+                    "key": filename,
+                    "success": True,
+                    "warning": None if already_exists else "Upload completed via TUS; awaiting server indexing in /api/uploads/mine."
+                }
             
             renderer.update_chapter_status(filename, f"Verifying... ({elapsed_verify}s)", 1.0, current=size, total=size, speed=0.0, eta=0.0)
-            if not _interruptible_sleep(RETRY_DELAY, abort_event):
-                return {"key": filename, "success": False, "error": "Aborted"}
-            
-            wait_start = time.time()
             with get_verify_sem():
-                total_semaphore_wait += (time.time() - wait_start)
                 try:
-                    page = 1
-                    while True:
-                        fetch_check = worker_session.get(f"{base_check_url}?page={page}&limit=100&_t={int(time.time())}", timeout=10)
-
-                        if fetch_check.status_code in (401, 403): raise SessionExpiredError()
-                        if fetch_check.status_code != 200: break
-
-                        items_list = fetch_check.json()
-                        if isinstance(items_list, dict): items_list = items_list.get("volumes", items_list.get("chapters", []))
-                        if not isinstance(items_list, list) or not items_list: 
-                            break
-
-                        for item in items_list:
+                    # Query /api/uploads/mine directly (authoritative even while awaiting moderation)
+                    mine_res = worker_session.get(
+                        f"{BASE_URL}/api/uploads/mine",
+                        params={"manga_id": manga_id, "limit": 50},
+                        timeout=(10, 30)
+                    )
+                    if mine_res.status_code in (401, 403): raise SessionExpiredError()
+                    if mine_res.status_code == 200:
+                        mine_data = mine_res.json()
+                        mine_items = mine_data.get("uploads") if isinstance(mine_data, dict) else (mine_data if isinstance(mine_data, list) else [])
+                        for item in mine_items or []:
                             try:
                                 if upload_type == "volume":
                                     match = math.isclose(float(item.get("volume_number", -1)), float(file_info["number"]), abs_tol=0.001)
@@ -4564,13 +4563,19 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
                                 if not group_ids and scanlator_name:
                                     if isinstance(item_scanlator, str) and item_scanlator.strip().lower() == scanlator_name.strip().lower():
                                         found_item = item; found = True; break
-                        
-                        if found: break
-                        page += 1
 
+                                if not group_ids and not scanlator_name:
+                                    found_item = item; found = True; break
+
+                    if found: break
+
+                    if not _interruptible_sleep(2.0, abort_event):
+                        return {"key": filename, "success": False, "error": "Aborted"}
                 except SessionExpiredError:
                     raise
                 except (requests.exceptions.RequestException, json.JSONDecodeError):
+                    if not _interruptible_sleep(2.0, abort_event):
+                        return {"key": filename, "success": False, "error": "Aborted"}
                     continue
 
         if already_exists:
