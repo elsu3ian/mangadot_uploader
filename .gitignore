@@ -36,3 +36,8 @@ Thumbs.db
 .idea/
 tempCodeRunnerFile.py
 tempCoderRunnerFile.py
+
+# Internal API schemas and architecture handbooks
+MANGADOT_API_AND_RULES.md
+mangadot-upload-api.json
+
