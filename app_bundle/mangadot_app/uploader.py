@@ -7,6 +7,7 @@ import re
 import json
 import time
 import math
+import random
 import logging
 import threading
 import concurrent.futures
@@ -195,14 +196,21 @@ def get_verify_sem(thread_count=None):
 
 
 def _compute_retry_delay(response, attempt):
+    jitter = random.uniform(0.5, 2.5)
     if response is not None:
         ra = response.headers.get("Retry-After")
         if ra:
             try:
-                return max(0.0, min(float(ra), 120.0))
+                return max(0.0, min(float(ra), 120.0)) + jitter
             except (TypeError, ValueError):
                 pass
-    return min(RETRY_DELAY * (2 ** attempt), 60)
+        try:
+            body = response.json()
+            if isinstance(body, dict) and "retry_after" in body:
+                return max(0.0, min(float(body["retry_after"]), 120.0)) + jitter
+        except Exception:
+            pass
+    return min(RETRY_DELAY * (2 ** attempt), 60) + jitter
 
 
 def _interruptible_sleep(delay, abort_event, slice_seconds=0.1):
@@ -420,7 +428,7 @@ def upload_file_tus(session, file_info, manga_id, group_ids,
         # baseline so speed reflects only what actually moved just now.
         bytes_at_session_start = offset
 
-        chunk_size = 5 * 1024 * 1024
+        chunk_size = 20 * 1024 * 1024  # 20 MB native chunks matching site uploader
 
         try:
             with open(filepath, 'rb') as f:
@@ -499,15 +507,20 @@ def upload_file_tus(session, file_info, manga_id, group_ids,
                                 else: return {"key": filename, "success": False, "error": "HTTP 409 (Offset Conflict)"}
                             elif patch_res.status_code in RETRYABLE_STATUSES:
                                 if patch_attempt < MAX_RETRIES - 1:
-                                    progress_callback(filename, f"Retrying chunk... ({patch_attempt + 1})", offset / size, current=offset, total=size)
+                                    progress_callback(filename, f"Retrying chunk (HTTP {patch_res.status_code}, attempt {patch_attempt + 1})...", offset / size, current=offset, total=size)
                                     if not _interruptible_sleep(_compute_retry_delay(patch_res, patch_attempt), abort_event):
                                         return {"key": filename, "success": False, "error": "Aborted"}
+                                    server_off = _tus_offset(worker_session, upload_location)
+                                    if server_off is not None and server_off > offset:
+                                        offset   = server_off
+                                        resynced = True
+                                        break
                                 else: return {"key": filename, "success": False, "error": f"HTTP {patch_res.status_code} (Max Retries)"}
                             else: return {"key": filename, "success": False, "error": f"HTTP {patch_res.status_code}"}
                         except SessionExpiredError: raise
                         except requests.exceptions.RequestException as e:
                             if patch_attempt < MAX_RETRIES - 1:
-                                progress_callback(filename, f"Net Err, Retrying... ({patch_attempt + 1})", offset / size, current=offset, total=size)
+                                progress_callback(filename, f"Net Err, Retrying... (attempt {patch_attempt + 1})", offset / size, current=offset, total=size)
                                 if not _interruptible_sleep(_compute_retry_delay(None, patch_attempt), abort_event):
                                     return {"key": filename, "success": False, "error": "Aborted"}
                                 server_off = _tus_offset(worker_session, upload_location)
@@ -1130,31 +1143,54 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                     raise
 
                 if batch_id and not session_expired and chunk_had_success:
-                    MAX_COMPLETE_RETRIES = 5
-                    for comp_attempt in range(MAX_COMPLETE_RETRIES):
-                        comp_res = None
-                        try:
-                            if not _pace_batch_complete(abort_event):
-                                break
-                            comp_res = req_session.post(f"{BASE_URL}/api/uploads/batch/{batch_id}/complete", timeout=(10, 30))
-                            if comp_res.status_code in (401, 403):
-                                session_expired = True
-                                break
-                            comp_res.raise_for_status()
-                            break
-                        except requests.exceptions.RequestException as e:
-                            resp = e.response if hasattr(e, 'response') and e.response is not None else comp_res
-                            delay = _compute_retry_delay(resp, comp_attempt)
-                            if resp is not None and resp.status_code == 429:
-                                delay = max(delay, 30.0)
-
-                            if comp_attempt < MAX_COMPLETE_RETRIES - 1:
-                                logging.warning(f"Batch complete hit rate limit/error. Retrying in {delay}s (Attempt {comp_attempt + 1}/{MAX_COMPLETE_RETRIES})...")
-                                if not _interruptible_sleep(delay, abort_event):
+                    def _send_complete_worker(b_id, cookies_snap, headers_snap, proxies_snap, verify_opt, a_event, ev_cb):
+                        MAX_COMPLETE_RETRIES = 5
+                        with requests.Session() as s:
+                            s.cookies.update(cookies_snap)
+                            s.headers.update(headers_snap)
+                            if proxies_snap:
+                                s.proxies.update(proxies_snap)
+                            s.verify = verify_opt
+                            for comp_attempt in range(MAX_COMPLETE_RETRIES):
+                                comp_res = None
+                                try:
+                                    if not _pace_batch_complete(a_event):
+                                        break
+                                    comp_res = s.post(f"{BASE_URL}/api/uploads/batch/{b_id}/complete", timeout=(10, 30))
+                                    if comp_res.status_code in (401, 403):
+                                        break
+                                    comp_res.raise_for_status()
+                                    logging.debug(f"Batch {b_id} completion housekeeping succeeded.")
                                     break
-                            else:
-                                on_batch_event("batch_complete_failed", batch_id=batch_id, error=str(e))
-                                logging.warning(f"Batch {batch_id} complete call failed after {MAX_COMPLETE_RETRIES} attempts: {e}")
+                                except requests.exceptions.RequestException as e:
+                                    resp = e.response if hasattr(e, 'response') and e.response is not None else comp_res
+                                    delay = _compute_retry_delay(resp, comp_attempt)
+                                    if resp is not None and resp.status_code == 429:
+                                        delay = max(delay, 30.0)
+
+                                    if comp_attempt < MAX_COMPLETE_RETRIES - 1:
+                                        logging.warning(f"Batch complete hit rate limit/error. Retrying in {delay:.1f}s (Attempt {comp_attempt + 1}/{MAX_COMPLETE_RETRIES})...")
+                                        if not _interruptible_sleep(delay, a_event):
+                                            break
+                                    else:
+                                        if ev_cb:
+                                            ev_cb("batch_complete_failed", batch_id=b_id, error=str(e))
+                                        logging.warning(f"Batch {b_id} complete call failed after {MAX_COMPLETE_RETRIES} attempts: {e}")
+
+                    # Decoupled / asynchronous housekeeping call: does not block the UI or subsequent upload batches
+                    threading.Thread(
+                        target=_send_complete_worker,
+                        args=(
+                            batch_id,
+                            dict(req_session.cookies),
+                            dict(req_session.headers),
+                            dict(req_session.proxies) if req_session.proxies else {},
+                            req_session.verify,
+                            abort_event,
+                            on_batch_event,
+                        ),
+                        daemon=True,
+                    ).start()
     except KeyboardInterrupt:
         abort_event.set()
         raise
