@@ -1,29 +1,38 @@
-# Python ignores
+# Python & environments
 __pycache__/
 *.py[cod]
 *$py.class
-venv/
-env/
+.venv*/
+venv*/
+env*/
 .env
+runtime/
+dist/
+build/
+*.spec.bak
 
-# Logs and output files
+# Archives & binaries
+*.zip
+*.7z
+*.tar.gz
+
+# Logs, caches, and runtime state
 api_requests.log
 failed.txt
 cookies.txt
 failed_manga_*.txt
-# Ignore chapter files inside the chapters folder, but keep the folder itself
+logs/
+cache/
+.cache/
+
+# Chapter folder data
 chapters/*
 !chapters/.gitkeep
 
-# OS generated files
+# OS & Editor generated files
 .DS_Store
 Thumbs.db
-
-# IDEs
 .vscode/
 .idea/
 tempCodeRunnerFile.py
 tempCoderRunnerFile.py
-#failed_manga_*.txt
-logs/
-requirements.txt
