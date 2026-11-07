@@ -11,9 +11,19 @@
 # ///
 """
 ==============================================================================
-🚀 MANGADOT UPLOADER v2.1.0 - ADVANCED FEATURES & USAGE
+🚀 MANGADOT UPLOADER v2.1.0: ADVANCED FEATURES & USAGE
 ==============================================================================
-[Public Release: Standalone GUI app added alongside the CLI, sharing thes ame login/parsing/verification/upload engine. See README.md and CHANGELOG.md for full details.]
+[Public Release: Full Site Update Compatibility, 20MB Native TUS Chunks,
+  Authoritative Fast Verification via /api/uploads/mine, Decoupled Paced
+  Background Batch Complete, and Modular Desktop GUI (app_bundle v3).
+  See README.md and CHANGELOG.md for full details.]
+
+[v2.1.0: Upgraded to 100% compliance with MangaDot site update:
+  - 20MB native TUS chunks (73% fewer requests, eliminates edge throttling).
+  - TUS offset resync via HEAD on retryable errors (429, 500, 502, 504, 524).
+  - Decoupled background batch complete with 2.5s cross-worker pacing.
+  - Authoritative fast verification via /api/uploads/mine (1-second checks).
+  - 1-click zero-config runtime provisioner (Setup_Runtime.bat).]
 
 [v2.1.0: CBZ Optimizer — re-compresses images inside .cbz/.zip archives
   (JPEG/PNG/WebP/BMP), run standalone with --optimize-only or chained

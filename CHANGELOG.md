@@ -2,18 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
-## [3.0.0] - 2026-11-07
+## [2.1.0] - 2026-11-08
 
 ### Added
-- **Full Site Update Compatibility:** Upgraded to 100% compliance with MangaDot's latest API update and official OpenAPI 3.1.2 schema:
+- **20 MB Native TUS Engine:** Upgraded default chunk size from 5MB to 20MB (matching MangaDot's official web uploader), reducing HTTP round-trip requests by 73% and eliminating Cloudflare edge throttling.
+- **TUS Offset Resync on Retry:** Added automatic `HEAD /api/tus/{id}` offset recovery on retryable edge errors (HTTP 429, 500, 502, 504, 524) to eliminate HTTP 409 Conflict retries.
+- **Decoupled Background Batch Completion:** `POST /api/uploads/batch/{id}/complete` is now dispatched to an asynchronous daemon thread with cross-worker rate-limit pacing (`_pace_batch_complete`, 2.5s minimum interval), removing serialization bottlenecks so the upload queue and UI never stall.
+- **Authoritative Fast Verification (`/api/uploads/mine`):** Replaced slow 10-page public chapter list loop with direct `GET /api/uploads/mine` verification (supporting `pending`, `processing`, and `approved` moderation statuses) for instant ~1-second verification.
+- **Thread Ceiling & Safe Zones:** Defaulted GUI thread picker safe ceiling to 12 threads with an **Unlock max (90)** power-user override.
+- **1-Click Zero-Config Runtime (`Setup_Runtime.bat`):** Added automated environment provisioner that downloads portable standalone Python 3.12 and sets up dependencies with zero user configuration.
+- **Full Site Update Compatibility:** Upgraded to 100% compliance with MangaDot's latest API update:
   - **Batch Init (`/api/uploads/batch/init`):** Adapted to accept `batch_id` directly on HTTP 200 without requiring `"success": true`.
   - **MangaBaka Prefill (`/api/manga/fetch-mangabaka`):** Added URL normalization, adapted to HTTP 200 `{"data": ...}`, and added RFC 7807 problem details parsing on HTTP 409 Conflict for existing titles.
   - **Group Directory Lookup (`/api/groups/lookup`):** Enforced required `Referer: https://mangadot.net/` header to natively pass Cloudflare WAF checks, with safe integer casting for group IDs.
-  - **Rate Limit Pacing:** Added `_pace_batch_complete()` (2.5s interval + 30s 429 backoff) on `/api/uploads/batch/{id}/complete` to stay strictly within MangaDot's write rate limit budget.
   - **Chapter Title Fallback:** Empty or whitespace-only chapter titles automatically fall back to `Chapter {num}` to satisfy strict server-side non-empty string constraints.
-  - **Verification Deadlock Eliminated:** Defaulted `skip_verification=True` (with optional `--verify` flag) matching MangaDot's asynchronous post-finish hook architecture, eliminating stalled verification timeouts.
 - **Modular Desktop GUI Source Code (`app_bundle/`):** Imported the full, clean PySide6 desktop GUI source code into the repository, replacing the legacy zip archive.
 - **Smart Launchers:** Added `Start MangaDot GUI.bat` and upgraded `Run MangaDot Uploader.bat` with auto-detection for `uv`, `py -3.12`, or `python`.
+
+### Fixed
+- **Attribution Screen False Warning:** Fixed a bug in `group_config_dialog.py` where untagged files with a group selected in the search picker triggered a false "Untagged chapters without group" modal warning.
+- **Continue Without Group Support:** Ensured selecting "Continue without group" properly clears assigned group IDs to guarantee 100% genuine zero-attribution uploads.
 
 ### Removed
 - **Repository Bloat:** Purged `MangaDot Uploder GUI source code.zip` and obsolete `mangadot_v1.1.3.py`.
