@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.0.0] - 2026-11-07
+
+### Added
+- **Full Site Update Compatibility:** Upgraded to 100% compliance with MangaDot's latest API update and official OpenAPI 3.1.2 schema:
+  - **Batch Init (`/api/uploads/batch/init`):** Adapted to accept `batch_id` directly on HTTP 200 without requiring `"success": true`.
+  - **MangaBaka Prefill (`/api/manga/fetch-mangabaka`):** Added URL normalization, adapted to HTTP 200 `{"data": ...}`, and added RFC 7807 problem details parsing on HTTP 409 Conflict for existing titles.
+  - **Group Directory Lookup (`/api/groups/lookup`):** Enforced required `Referer: https://mangadot.net/` header to natively pass Cloudflare WAF checks, with safe integer casting for group IDs.
+  - **Rate Limit Pacing:** Added `_pace_batch_complete()` (2.5s interval + 30s 429 backoff) on `/api/uploads/batch/{id}/complete` to stay strictly within MangaDot's write rate limit budget.
+  - **Chapter Title Fallback:** Empty or whitespace-only chapter titles automatically fall back to `Chapter {num}` to satisfy strict server-side non-empty string constraints.
+  - **Verification Deadlock Eliminated:** Defaulted `skip_verification=True` (with optional `--verify` flag) matching MangaDot's asynchronous post-finish hook architecture, eliminating stalled verification timeouts.
+- **Modular Desktop GUI Source Code (`app_bundle/`):** Imported the full, clean PySide6 desktop GUI source code into the repository, replacing the legacy zip archive.
+- **Smart Launchers:** Added `Start MangaDot GUI.bat` and upgraded `Run MangaDot Uploader.bat` with auto-detection for `uv`, `py -3.12`, or `python`.
+
+### Removed
+- **Repository Bloat:** Purged `MangaDot Uploder GUI source code.zip` and obsolete `mangadot_v1.1.3.py`.
+
+---
+
 ## [2.0.0] - 2026-07-18
 
 ### Added

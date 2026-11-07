@@ -51,9 +51,10 @@ They share the exact same login, parsing, verification, and upload engine undern
 
 ## Repository Structure
 
-- **`mangadot.py`** — The actively maintained CLI release. It features the full interactive `rich` dashboard, live progress bars, automated dependency checks, and the hardened network layer.
-- **`mangadot_v1.1.3.py`** — An archived, legacy backup of the older v1.1.3 build. It uses a manual ANSI console logger and lacks the v1.2.x+ automation and review features, preserved strictly for regression testing.
-- **GUI App** — Distributed separately as a prebuilt Windows executable on the [Releases page](https://github.com/elsu3ian/mangadot_uploader/releases); not part of this repository's source tree.
+- **`mangadot.py`** — The standalone, feature-complete terminal CLI uploader with interactive `rich` dashboards, live speed/ETA meters, automated dependency management, and lossless image optimization.
+- **`app_bundle/`** — The modular PySide6 desktop GUI application source tree, featuring multi-screen workflows, group attribution pickers, title review dialogs, and built-in upload history.
+- **`Start MangaDot GUI.bat`** — 1-click launcher for the desktop GUI.
+- **`Run MangaDot Uploader.bat`** — Smart launcher for the CLI with automatic `uv` / `py -3.12` / `python` detection.
 
 ## Prerequisites
 
@@ -103,18 +104,14 @@ pip install --upgrade requests rookiepy questionary rich websocket-client
 
 1. Put your `.cbz` or `.zip` files into a dedicated folder. Ensure your files are named reasonably, e.g., `Chapter 1 - The Beginning.cbz` or `[GroupName] Volume 2.cbz`.
 
-2. **GUI:** Launch the `.exe`, log in, then pick your folder and target manga from the on-screen picker.
+2. **GUI:** Double-click `Start MangaDot GUI.bat` (or run `python app_bundle/main.py`), log in, then pick your folder and target manga from the on-screen picker.
 
-   **CLI:** Run your preferred version of the script:
+   **CLI:** Double-click `Run MangaDot Uploader.bat`, or run via terminal:
 
    ```bash
+   uv run mangadot.py
+   # or
    py -3.12 mangadot.py
-   ```
-
-   or, for the archived legacy build:
-
-   ```bash
-   py -3.12 mangadot_v1.1.3.py
    ```
 
 3. Both scan every installed browser for a valid MangaDot session automatically and log in with the first one that works. If none succeed, you'll get a manual picker (including a CDP option for Chromium browsers — see [Troubleshooting Cookies](#troubleshooting-cookies-windows) below).
@@ -132,6 +129,8 @@ pip install --upgrade requests rookiepy questionary rich websocket-client
 | `--debug` | Dumps all HTTP traffic to `api_requests.log` using a rotating 10MB file system (3-file backup limit). |
 | `--library <path>` | Opens the interactive manga picker directly inside your parent library folder instead of typing a path manually. |
 | `--verify-timeout <seconds>` | Overrides how long the script waits for the server to confirm a successful upload before marking it as timed out (default: 60 seconds). Must be a positive integer. |
+| `--skip-verification` | *(Default: true)* Skips post-upload verification polling because MangaDot's backend converts images asynchronously in a post-finish hook. Eliminates false-positive timeouts. |
+| `--verify` | Enables legacy synchronous post-upload verification polling. |
 | `--proxy <url>` | *(Optional)* Tunnel all HTTP/HTTPS traffic through a specific custom proxy server to bypass regional ISP restrictions or server-side Cloudflare blocks. |
 | `--proxy-no-verify` | *(Optional)* Disables SSL certificate verification. Use only if your proxy actively intercepts TLS traffic (MITM). |
 
