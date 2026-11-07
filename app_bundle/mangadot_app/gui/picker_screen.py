@@ -1491,7 +1491,7 @@ class PickerScreen(QWidget):
         else:
             self.lang_combo.setEditText(saved_lang)
 
-        self.THREAD_CAP_SAFE = 30
+        self.THREAD_CAP_SAFE = 12
         self.THREAD_CAP_MAX = 90
 
         saved_unlocked = bool(cfg.get("threads_unlocked", False))
@@ -1503,12 +1503,12 @@ class PickerScreen(QWidget):
         try:
             self.thread_spinner.setValue(int(saved_threads))
         except (ValueError, TypeError):
-            self.thread_spinner.setValue(5)
+            self.thread_spinner.setValue(6)
 
         self.thread_unlock_cb = QCheckBox("Unlock\nmax (90)")
         self.thread_unlock_cb.setStyleSheet(self._compact_checkbox_style())
         self.thread_unlock_cb.setToolTip(
-            "Raises the thread cap from 30 to 90. High thread counts can trigger rate-limiting "
+            f"Raises the thread cap from {self.THREAD_CAP_SAFE} to {self.THREAD_CAP_MAX}. High thread counts can trigger rate-limiting "
             "or get your account flagged for abuse \u2014 only do this if you know what you're doing."
         )
         self.thread_warning_label = QLabel("\u26a0\ufe0f High thread counts risk rate-limits / account flags")
