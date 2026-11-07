@@ -455,17 +455,30 @@ def _cdp_port_for(browser_key):
 def _cdp_profile_dir_for(browser_key):
     return os.path.join(CDP_PROFILE_ROOT, browser_key)
 
-def _default_cdp_profile_dir():
+def _platform_data_root():
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
     elif sys.platform == "darwin":
         base = os.path.expanduser("~/Library/Application Support")
     else:
         base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return os.path.join(base, "MangaDotUploader", "cdp_profile")
+    return base
+
+def _default_cdp_profile_dir():
+    return os.path.join(_platform_data_root(), "MangaDotUploader", "cdp_profile")
+
+def _default_gecko_debug_profile_dir():
+    return os.path.join(_platform_data_root(), "MangaDotUploader", "gecko_debug_profile")
 
 CDP_PROFILE_ROOT = _default_cdp_profile_dir()
-CDP_STARTUP_WAIT = 20  
+GECKO_DEBUG_PROFILE_ROOT = _default_gecko_debug_profile_dir()
+CDP_STARTUP_WAIT = 20
+# Generous on purpose: a human needs time to actually log in through a
+# Cloudflare managed challenge in the opened debug window.
+GECKO_DEBUG_STARTUP_WAIT = 180
+
+def _gecko_debug_profile_dir_for(browser_key):
+    return os.path.join(GECKO_DEBUG_PROFILE_ROOT, browser_key)
 
 CDP_BROWSER_EXECUTABLES = {
     "chrome": {
@@ -493,18 +506,60 @@ CDP_BROWSER_EXECUTABLES = {
         "darwin": ["/Applications/Vivaldi.app/Contents/MacOS/Vivaldi"],
         "linux":  ["vivaldi", "vivaldi-stable"],
     },
-    "opera": {
-        "win32":  [r"%PROGRAMFILES%\Opera\opera.exe",
-                   r"%LOCALAPPDATA%\Programs\Opera\opera.exe"],
-        "darwin": ["/Applications/Opera.app/Contents/MacOS/Opera"],
-        "linux":  ["opera"],
+        "opera": {
+            "win32":  [r"%PROGRAMFILES%\Opera\opera.exe",
+                       r"%LOCALAPPDATA%\Programs\Opera\opera.exe"],
+            "darwin": ["/Applications/Opera.app/Contents/MacOS/Opera"],
+            "linux":  ["opera"],
+        },
+}
+
+CHROMIUM_BROWSERS = {"chrome", "brave", "edge", "opera", "vivaldi"}
+
+GECKO_REGISTRY_APP_NAMES = {
+    "firefox": "firefox.exe",
+    "zen":     "zen.exe",
+}
+
+GECKO_BROWSER_EXECUTABLES = {
+    "firefox": {
+        "win32":  [r"%PROGRAMFILES%\Mozilla Firefox\firefox.exe",
+                   r"%PROGRAMFILES(X86)%\Mozilla Firefox\firefox.exe",
+                   r"%LOCALAPPDATA%\Mozilla Firefox\firefox.exe"],
+        "darwin": ["/Applications/Firefox.app/Contents/MacOS/firefox"],
+        "linux":  ["firefox"],
+    },
+    "zen": {
+        "win32":  [r"%PROGRAMFILES%\Zen Browser\zen.exe",
+                   r"%LOCALAPPDATA%\Programs\Zen Browser\zen.exe",
+                   r"%LOCALAPPDATA%\zen-browser\zen.exe"],
+        "darwin": ["/Applications/Zen Browser.app/Contents/MacOS/zen"],
+        "linux":  ["zen", "zen-browser"],
     },
 }
+# Gecko debug-profile login: MangaDot serves a Cloudflare *managed* challenge
+# (Cf-Mitigated: challenge) that requires executing JavaScript in a real
+# browser engine to earn a fresh cf_clearance cookie - no HTTP client,
+# however well it spoofs its TLS fingerprint, can clear it. Chromium browsers
+# get past this via the CDP path (a real Chromium engine is driven); this
+# Gecko section gives Zen/Firefox the same capability using a dedicated,
+# isolated debug profile (-profile + -no-remote), NOT Marionette on the
+# person's real profile - enabling remote-debugging there changes fingerprint
+# signals (navigator.webdriver etc.) in a way that can make Cloudflare MORE
+# suspicious. The dedicated profile logs in once; its cookies.sqlite is then
+# read like any other profile.
+
 MAX_VERIFY_SECONDS   = 60
 DEFAULT_CHAPTERS_DIR = "chapters"
 DEFAULT_LIBRARY_DIR  = ""
 CONFIG_PATH          = Path.home() / ".mangadot_uploader.json"
 DB_PATH               = Path.home() / ".mangadot_uploader_db.json"
+PAUSED_UPLOAD_PATH    = Path.home() / ".mangadot_paused_upload.json"
+PAUSED_UPLOAD_SCHEMA_VERSION = 1
+
+# Guards paused_upload.json against concurrent writes (same rationale as GUI's
+# config.py — only one batch runs at once, so a plain threading.Lock is enough).
+_paused_upload_lock = threading.Lock()
 
 DEFAULT_USER_AGENTS = {
     "chrome":  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
@@ -2325,6 +2380,99 @@ def _remember_setting(key, value):
         cfg[key] = value
         save_config(cfg)
 
+def _remember_setting_force(key, value):
+    """Like _remember_setting but also persists explicit False / 0 — needed
+    for boolean flags such as proxy_no_verify where clearing the flag is
+    meaningful and must not be treated as 'nothing to remember'."""
+    cfg = load_config()
+    if cfg.get(key) != value:
+        cfg[key] = value
+        save_config(cfg)
+
+# ==============================================================================
+# ⏸️  PAUSED UPLOAD STATE — crash-safe resume (CLI mirror of GUI's config.py)
+# Persists enough of an in-flight batch to resume it after the script exits,
+# crashes, or the terminal is closed. Only one paused upload is tracked.
+# On resume files restart from zero; already-finished files are caught by
+# the server's 409 Already-Exists dedup and marked instantly as done — so
+# this gives true crash safety with a minimal, safe change to the worker.
+# ==============================================================================
+
+def load_paused_upload():
+    """Return paused state dict or None (nothing paused / corrupt / wrong
+    schema — all treated as 'no usable pause, do a fresh upload')."""
+    with _paused_upload_lock:
+        try:
+            with open(PAUSED_UPLOAD_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError) as e:
+            logging.debug("load_paused_upload: could not read %s (%s)", PAUSED_UPLOAD_PATH, e)
+            return None
+        if not isinstance(data, dict):
+            return None
+        if data.get("schema_version") != PAUSED_UPLOAD_SCHEMA_VERSION:
+            logging.debug("load_paused_upload: schema mismatch (found %r, expected %r); discarding.",
+                          data.get("schema_version"), PAUSED_UPLOAD_SCHEMA_VERSION)
+            return None
+        if not isinstance(data.get("files"), list):
+            return None
+        return data
+
+def save_paused_upload(batch_config, files):
+    """Persist batch_config + files atomically so a crash mid-write cannot
+    corrupt the pause file. Files are full file-info dicts (filepath, size,
+    number, title, groups, etc.) — all JSON-serializable."""
+    # Strip any non-serializable DirEntry that get_files_in_dir may have left
+    # before finalize (defensive — finalized entries already popped it).
+    clean_files = []
+    for f in files:
+        cf = {k: v for k, v in f.items() if k != "entry"}
+        clean_files.append(cf)
+    data = {
+        "schema_version": PAUSED_UPLOAD_SCHEMA_VERSION,
+        "paused_at": time.time(),
+        "batch_config": batch_config,
+        "files": clean_files,
+    }
+    with _paused_upload_lock:
+        try:
+            fd, tmp = tempfile.mkstemp(dir=str(PAUSED_UPLOAD_PATH.parent),
+                                       prefix=".mangadot_paused_", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh, indent=2, default=str)
+                os.replace(tmp, PAUSED_UPLOAD_PATH)
+            finally:
+                if os.path.exists(tmp):
+                    try: os.remove(tmp)
+                    except OSError: pass
+        except (OSError, TypeError, ValueError) as e:
+            logging.warning("save_paused_upload: failed to write %s: %s", PAUSED_UPLOAD_PATH, e)
+
+def clear_paused_upload():
+    with _paused_upload_lock:
+        try:
+            os.remove(PAUSED_UPLOAD_PATH)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logging.debug("clear_paused_upload: failed to remove %s: %s", PAUSED_UPLOAD_PATH, e)
+
+def _format_paused_age(paused_at):
+    seconds = max(0, time.time() - paused_at)
+    if seconds < 60:
+        return "less than a minute ago"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+    hours = int(minutes // 60)
+    if hours < 24:
+        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+    days = int(hours // 24)
+    return f"{days} day{'s' if days != 1 else ''} ago"
+
 # ==============================================================================
 # 📚 UPLOAD HISTORY DB (~/.mangadot_uploader_db.json)
 # Tracks which chapter/volume numbers have already been confirmed-uploaded to a
@@ -3188,9 +3336,23 @@ def search_manga(query, session):
 
 def search_groups(query, session):
     try:
-        res = session.get(f"{BASE_URL}/api/groups/lookup", params={"q": query, "limit": 25}, timeout=(10, 30))
+        res = session.get(
+            f"{BASE_URL}/api/groups/lookup",
+            params={"q": query, "limit": 25},
+            headers={"Referer": f"{BASE_URL}/"},
+            timeout=(10, 30),
+        )
         if res.status_code != 200: return []
-        return res.json().get("groups", [])
+        raw_groups = res.json().get("groups", [])
+        cleaned = []
+        for g in raw_groups:
+            if isinstance(g, dict) and "id" in g:
+                try:
+                    g["id"] = int(g["id"])
+                except (ValueError, TypeError):
+                    pass
+                cleaned.append(g)
+        return cleaned
     except requests.exceptions.RequestException as e:
         print_warning(f"Network error while searching for groups: {e}")
         return []
@@ -3198,6 +3360,150 @@ def search_groups(query, session):
         logging.debug("search_groups: bad JSON response: %s", e)
         print_warning("Group search returned an unreadable response. The site API may have changed.")
         return []
+
+# ---------------------------------------------------------------------------
+# MangaBaka -> MangaDot create flow (CLI mirror of GUI's net.py helpers)
+# Direct create with no metadata editing; manual entry just prints the link.
+# ---------------------------------------------------------------------------
+MANGABAKA_API_BASE = "https://api.mangabaka.org"
+
+def _mangabaka_primary_title(titles):
+    if not isinstance(titles, list) or not titles:
+        return ""
+    for t in titles:
+        if t.get("is_primary") and t.get("language") == "ja-Latn":
+            return t.get("title", "")
+    for t in titles:
+        if t.get("is_primary"):
+            return t.get("title", "")
+    return titles[0].get("title", "")
+
+def _mangabaka_thumbnail_url(cover):
+    if not isinstance(cover, dict):
+        return None
+    for size_key in ("x150", "x250", "x350", "raw"):
+        size = cover.get(size_key)
+        if isinstance(size, dict):
+            url = size.get("x1") or size.get("url")
+            if url:
+                return url
+        elif isinstance(size, str) and size:
+            return size
+    return None
+
+def search_mangabaka(query, limit=12):
+    try:
+        res = requests.get(
+            f"{MANGABAKA_API_BASE}/v2/series/search",
+            params={"q": query, "limit": limit},
+            timeout=(10, 30),
+        )
+        if res.status_code != 200:
+            error = f"MangaBaka returned HTTP {res.status_code}."
+            logging.error(f"search_mangabaka: {error} (query={query!r})")
+            return [], error
+        payload = res.json()
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Network error while searching MangaBaka: {e}")
+        return [], "Couldn't reach MangaBaka."
+    except json.JSONDecodeError as e:
+        logging.error(f"MangaBaka search returned an unreadable response: {e}")
+        return [], "MangaBaka sent back something unreadable."
+    raw_results = payload.get("data")
+    if not isinstance(raw_results, list):
+        error = "MangaBaka's response wasn't in the expected shape."
+        logging.error(f"search_mangabaka: {error} (query={query!r}, payload keys={list(payload.keys())})")
+        return [], error
+    results = []
+    for item in raw_results:
+        if not isinstance(item, dict) or "id" not in item:
+            continue
+        series_id = item["id"]
+        results.append({
+            "id": series_id,
+            "title": _mangabaka_primary_title(item.get("titles")) or "Untitled",
+            "status": item.get("status", ""),
+            "cover_url": _mangabaka_thumbnail_url(item.get("cover")),
+            "mangabaka_url": f"https://mangabaka.org/{series_id}",
+        })
+    return results, None
+
+def _normalize_mangabaka_url(url: str) -> str:
+    if not url:
+        return ""
+    url = url.split("?")[0].split("#")[0].rstrip("/")
+    m = re.search(r"/manga/([^/]+)(?:/([^/]+))?", url)
+    if m:
+        manga_id = m.group(1)
+        slug = m.group(2)
+        if slug:
+            return f"https://mangabaka.com/manga/{manga_id}/{slug}"
+        return f"https://mangabaka.com/manga/{manga_id}"
+    return url
+
+def fetch_mangabaka_metadata(mangabaka_url, session):
+    norm_url = _normalize_mangabaka_url(mangabaka_url)
+    try:
+        res = session.post(
+            f"{BASE_URL}/api/manga/fetch-mangabaka",
+            json={"url": norm_url},
+            timeout=(10, 30),
+        )
+        try:
+            payload = res.json()
+        except json.JSONDecodeError as e:
+            logging.error(f"fetch_mangabaka_metadata: unreadable response (HTTP {res.status_code}): {e}")
+            return {"ok": False, "error": "MangaDot sent back something unreadable."}
+
+        # 1. Successful fetch: MangaDot returns {"data": {...}} (success field omitted in new API)
+        if res.status_code == 200:
+            if isinstance(payload.get("data"), dict):
+                return {"ok": True, "duplicate": False, "data": payload["data"]}
+            if payload.get("success") and isinstance(payload.get("data"), dict):
+                return {"ok": True, "duplicate": False, "data": payload["data"]}
+
+        # 2. Duplicate detection: MangaDot returns 409 Conflict with RFC 7807 problem JSON:
+        # {"code": "duplicate_manga", "existing": {"id": 123, "title": "..."}}
+        if (
+            res.status_code == 409
+            or payload.get("code") == "duplicate_manga"
+            or payload.get("detail") == "duplicate"
+            or payload.get("error") == "duplicate"
+        ):
+            dup = payload.get("existing") or payload.get("duplicate") or {}
+            if isinstance(dup, dict) and dup.get("id"):
+                return {"ok": True, "duplicate": True, "id": dup.get("id"), "title": dup.get("title")}
+
+        err_msg = payload.get("detail") or payload.get("error") or f"HTTP {res.status_code}"
+        return {"ok": False, "error": str(err_msg)}
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"fetch_mangabaka_metadata: network error: {e}")
+        return {"ok": False, "error": "Couldn't reach MangaDot."}
+
+def create_manga_from_mangabaka(metadata, session):
+    try:
+        res = session.post(
+            f"{BASE_URL}/api/manga/create-from-mangabaka",
+            json=metadata,
+            timeout=(10, 30),
+        )
+        try:
+            payload = res.json()
+        except json.JSONDecodeError as e:
+            logging.error(f"create_manga_from_mangabaka: unreadable response (HTTP {res.status_code}): {e}")
+            return {"ok": False, "error": "MangaDot sent back something unreadable."}
+        if res.status_code in (200, 201):
+            manga = payload.get("manga")
+            if isinstance(manga, dict):
+                return {"ok": True, "id": manga.get("id"), "title": manga.get("title")}
+            if payload.get("success") and isinstance(payload.get("manga"), dict):
+                manga = payload["manga"]
+                return {"ok": True, "id": manga.get("id"), "title": manga.get("title")}
+        return {"ok": False, "error": payload.get("detail") or payload.get("error") or f"HTTP {res.status_code}"}
+    except requests.exceptions.RequestException as e:
+        logging.error(f"create_manga_from_mangabaka: network error: {e}")
+        return {"ok": False, "error": "Couldn't reach MangaDot."}
 
 def _group_search_queries(name):
     queries = [name]
@@ -3277,53 +3583,90 @@ def resolve_group_names(names, session):
 class SessionExpiredError(Exception): pass
 class BatchInitError(Exception): pass
 
-def _read_cookie_db_with_fallback(db_path, domains=None):
+def _read_cookie_db_safely(db_path, domains=None):
+    """Reads a Gecko cookies.sqlite: rookiepy direct first (works when the
+    browser is fully closed), then a SQLite Backup-API copy of the live DB.
+    IMPORTANT: the source is opened mode=ro, never immutable=1 - immutable
+    skips locking AND ignores pending -wal contents, so recently-created
+    session cookies (which Firefox/Zen keep in WAL until checkpointed)
+    would be silently missed."""
     try:
-        return rookiepy.firefox_based(db_path, domains=domains)
-    except (OSError, sqlite3.Error) as e:
-        logging.debug("_read_cookie_db_with_fallback: direct read failed for %s (%s); trying a copy.", db_path, e)
+        result = rookiepy.firefox_based(db_path, domains=domains)
+        logging.debug(
+            "rookiepy direct read of %s succeeded, %d cookie(s) for domains=%s",
+            db_path, len(result), domains,
+        )
+        return result
+    except Exception as e:
+        logging.debug("rookiepy direct read failed for %s: %s: %s", db_path, type(e).__name__, e)
 
-    tmp_dir = tempfile.mkdtemp(prefix="mangadot_zen_cookies_")
+    tmp_dir = tempfile.mkdtemp(prefix="mangadot_gecko_")
     try:
         tmp_db = os.path.join(tmp_dir, "cookies.sqlite")
-        shutil.copy2(db_path, tmp_db)
-        for sidecar_ext in ("-wal", "-shm"):
-            sidecar_src = db_path + sidecar_ext
-            if os.path.isfile(sidecar_src):
-                shutil.copy2(sidecar_src, tmp_db + sidecar_ext)
+        db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+        try:
+            with sqlite3.connect(db_uri, uri=True, timeout=5) as src, \
+                 sqlite3.connect(tmp_db) as dst:
+                src.backup(dst)
+        except sqlite3.Error as e:
+            logging.debug("SQLite backup failed for %s: %s: %s", db_path, type(e).__name__, e)
+            return []
 
-        return rookiepy.firefox_based(tmp_db, domains=domains)
+        result = rookiepy.firefox_based(tmp_db, domains=domains)
+        logging.debug(
+            "Fallback (mode=ro backup) read of %s succeeded, %d cookie(s) for domains=%s",
+            db_path, len(result), domains,
+        )
+        return result
+    except Exception as e:
+        logging.debug("Fallback read failed for %s: %s: %s", db_path, type(e).__name__, e)
+        return []
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-def get_zen_cookies(domains=None):
+def get_gecko_cookies(browser_name, domains=None):
+    """Passive cookie read from any real Firefox/Zen profile on disk.
+    Databases are tried newest-first so the active profile wins."""
     if sys.platform == 'win32':
-        profile_roots = [
-            os.path.expandvars(r'%LOCALAPPDATA%\zen\Profiles'),
-            os.path.expandvars(r'%APPDATA%\Zen\Profiles'),
-            os.path.expandvars(r'%APPDATA%\zen\Profiles'),
-        ]
+        if browser_name == "firefox":
+            profile_roots = [os.path.expandvars(r'%APPDATA%\Mozilla\Firefox\Profiles')]
+        else:  # Zen
+            profile_roots = [
+                os.path.expandvars(r'%LOCALAPPDATA%\zen\Profiles'),
+                os.path.expandvars(r'%APPDATA%\Zen\Profiles'),
+                os.path.expandvars(r'%APPDATA%\zen\Profiles'),
+                os.path.expandvars(r'%APPDATA%\zen-browser\Profiles'),
+                os.path.expandvars(r'%APPDATA%\ZenBrowser\Profiles'),
+                os.path.expandvars(r'%LOCALAPPDATA%\ZenBrowser\Profiles'),
+            ]
     elif sys.platform == 'darwin':
-        profile_roots = [
-            os.path.expanduser('~/Library/Application Support/zen/Profiles'),
-            os.path.expanduser('~/Library/Application Support/Zen/Profiles'),
-        ]
+        if browser_name == "firefox":
+            profile_roots = [os.path.expanduser('~/Library/Application Support/Firefox/Profiles')]
+        else:
+            profile_roots = [
+                os.path.expanduser('~/Library/Application Support/zen/Profiles'),
+                os.path.expanduser('~/Library/Application Support/Zen/Profiles'),
+            ]
     else:
-        profile_roots = [os.path.expanduser('~/.zen')]
+        profile_roots = ([os.path.expanduser('~/.mozilla/firefox')] if browser_name == "firefox"
+                         else [os.path.expanduser('~/.zen')])
 
+    all_dbs = []
     for root in profile_roots:
         if not os.path.isdir(root):
             continue
-        entries = sorted(os.listdir(root))
-        default_entries = [e for e in entries if 'default' in e.lower()]
-        ordered = default_entries + [e for e in entries if e not in default_entries]
-
-        for entry in ordered:
+        for entry in os.listdir(root):
             db_path = os.path.join(root, entry, 'cookies.sqlite')
             if os.path.isfile(db_path):
-                cookies = _read_cookie_db_with_fallback(db_path, domains=domains)
-                if cookies:
-                    return cookies
+                all_dbs.append(db_path)
+
+    # Newest first, so the profile the user actually uses gets tried first.
+    all_dbs.sort(key=lambda x: os.path.getmtime(x) if os.path.exists(x) else 0, reverse=True)
+
+    for db_path in all_dbs:
+        cookies = _read_cookie_db_safely(db_path, domains=domains)
+        if cookies:
+            return cookies
 
     return []
 # ==============================================================================
@@ -3363,18 +3706,21 @@ def _find_browser_via_registry(app_exe_name):
             continue
     return None
 
-def _find_browser_executable(browser_key):
+def _find_executable(browser_key, registry_app_names, executables_table):
+    """Shared lookup for both the CDP (Chromium) and Gecko finders: Windows
+    registry App Paths first, then the per-platform candidate list (PATH
+    search on Linux, literal file check elsewhere)."""
     plat = sys.platform
     plat_key = "win32" if plat == "win32" else ("darwin" if plat == "darwin" else "linux")
 
     if plat_key == "win32":
-        app_exe = CDP_REGISTRY_APP_NAMES.get(browser_key)
+        app_exe = registry_app_names.get(browser_key)
         if app_exe:
             found = _find_browser_via_registry(app_exe)
             if found:
                 return found
 
-    candidates = CDP_BROWSER_EXECUTABLES.get(browser_key, {}).get(plat_key, [])
+    candidates = executables_table.get(browser_key, {}).get(plat_key, [])
     for candidate in candidates:
         expanded = os.path.expandvars(candidate)
         if plat_key == "linux":
@@ -3385,6 +3731,12 @@ def _find_browser_executable(browser_key):
             if os.path.isfile(expanded):
                 return expanded
     return None
+
+def _find_browser_executable(browser_key):
+    return _find_executable(browser_key, CDP_REGISTRY_APP_NAMES, CDP_BROWSER_EXECUTABLES)
+
+def _find_gecko_executable(browser_key):
+    return _find_executable(browser_key, GECKO_REGISTRY_APP_NAMES, GECKO_BROWSER_EXECUTABLES)
 
 def _cdp_port_is_up(port, timeout=1.0):
     try:
@@ -3449,11 +3801,34 @@ def _cdp_pid_matches_expected_exe(pid, expected_exe):
                 return False
             running_name = os.path.basename(result.stdout.strip()).lower()
             return running_name == expected_name
-    except (subprocess.SubprocessError, OSError):
+    except (subprocess.SubprocessError, OSError, RuntimeError):
+        # RuntimeError: subprocess.run can fail with "can't create new thread"
+        # when one of these lookups runs from an atexit handler during
+        # interpreter shutdown - nothing to do but give up quietly.
         return False
 
-def _cdp_kill_stale_process(browser_key):
-    pid_file = _cdp_pid_file(browser_key)
+def _wait_for_process_exit(pid, timeout=0.5, poll_interval=0.05):
+    """Polls whether `pid` is still alive, returning as soon as it exits or
+    once `timeout` seconds have passed - used after SIGTERM so a browser gets
+    a real chance to exit cleanly before escalating to SIGKILL."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        time.sleep(poll_interval)
+    return False
+
+def _gecko_pid_file(browser_key):
+    return os.path.join(_gecko_debug_profile_dir_for(browser_key), ".gecko_launch.pid")
+
+def _kill_stale_tracked_process(pid_file, expected_exe):
+    """Shared body of _cdp_kill_stale_process/_gecko_kill_stale_process:
+    reads the launch-time pid file, verifies the pid really is our browser
+    (not a recycled pid), force-kills it, and removes the pid file."""
     if not os.path.isfile(pid_file):
         return
     try:
@@ -3462,7 +3837,6 @@ def _cdp_kill_stale_process(browser_key):
     except (ValueError, OSError):
         return
 
-    expected_exe = _find_browser_executable(browser_key)
     if not _cdp_pid_matches_expected_exe(old_pid, expected_exe):
         try:
             os.remove(pid_file)
@@ -3480,22 +3854,110 @@ def _cdp_kill_stale_process(browser_key):
             import signal
             try:
                 os.kill(old_pid, signal.SIGTERM)
-                time.sleep(0.5)
+                _wait_for_process_exit(old_pid, timeout=0.5)
                 os.kill(old_pid, signal.SIGKILL)
             except ProcessLookupError:
-                pass  
-    except (OSError, subprocess.SubprocessError):
-        pass 
+                pass
+    except (OSError, subprocess.SubprocessError, RuntimeError):
+        pass
     finally:
         try:
             os.remove(pid_file)
         except OSError:
             pass
 
-def _cleanup_all_cdp_processes():
+def _cdp_kill_stale_process(browser_key):
+    _kill_stale_tracked_process(_cdp_pid_file(browser_key),
+                                _find_browser_executable(browser_key))
+
+def _gecko_kill_stale_process(browser_key):
+    _kill_stale_tracked_process(_gecko_pid_file(browser_key),
+                                _find_gecko_executable(browser_key))
+
+def _kill_processes_by_profile_dir(profile_dir):
+    """Kills every process whose command line references profile_dir,
+    regardless of PID - the fallback for browsers that re-exec/hand off to
+    a fresh child right after launch (common with a fresh --user-data-dir),
+    leaving the launch-time pid pointing at a long-dead process. Matching on
+    profile_dir keeps this safe: it is this app's own dedicated per-browser
+    directory that only ever appears on a command line because THIS script
+    passed it as --user-data-dir/-profile, so normal browsing windows can
+    never match it."""
+    try:
+        if sys.platform == "win32":
+            # wmic is deprecated but still present on Windows 10/11 as of
+            # this writing; tasklist has no command-line filter. Falls back
+            # to PowerShell's CIM cmdlet. The profile dir reaches PowerShell
+            # through an ENV VAR rather than string interpolation - no
+            # quoting scheme survives every possible path, but an env var
+            # needs none at all: apostrophes/backslashes/spaces pass through
+            # untouched and no crafted path can break out of the -like
+            # comparison.
+            pids = []
+            if "'" not in profile_dir:
+                # A WQL string literal cannot escape an apostrophe at all,
+                # so paths containing ' skip straight to PowerShell.
+                escaped = profile_dir.replace("\\", "\\\\")  # WQL LIKE treats \ as its escape char
+                result = subprocess.run(
+                    ["wmic", "process", "where",
+                     f"CommandLine like '%{escaped}%'", "get", "ProcessId"],
+                    capture_output=True, text=True, timeout=10, check=False,
+                )
+                if result.returncode == 0:
+                    pids = [int(p) for p in re.findall(r'\d+', result.stdout)]
+            if not pids:
+                env = dict(os.environ)
+                env["MANGADOT_PROFILE_DIR"] = profile_dir
+                ps_cmd = (
+                    "Get-CimInstance Win32_Process | "
+                    "Where-Object { $_.CommandLine -like ('*' + $env:MANGADOT_PROFILE_DIR + '*') } | "
+                    "Select-Object -ExpandProperty ProcessId"
+                )
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps_cmd],
+                    capture_output=True, text=True, timeout=10, check=False, env=env,
+                )
+                pids = [int(p) for p in re.findall(r'\d+', result.stdout)]
+            for pid in pids:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/F", "/T"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+                )
+        else:
+            result = subprocess.run(
+                ["pgrep", "-f", re.escape(profile_dir)],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            pids = [int(p) for p in result.stdout.split()]
+            for pid in pids:
+                try:
+                    import signal
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    continue
+            for pid in pids:
+                if _wait_for_process_exit(pid, timeout=0.5):
+                    continue
+                try:
+                    import signal
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+    except (subprocess.SubprocessError, OSError, ValueError, RuntimeError) as e:
+        logging.debug("_kill_processes_by_profile_dir(%r): %s", profile_dir, e)
+
+def cleanup_all_cdp_processes():
     for browser in ["chrome", "edge", "brave", "vivaldi", "opera"]:
         _cdp_kill_stale_process(browser)
-atexit.register(_cleanup_all_cdp_processes)        
+        _kill_processes_by_profile_dir(_cdp_profile_dir_for(browser))
+
+def cleanup_all_gecko_debug_processes():
+    for browser in ["zen", "firefox"]:
+        _gecko_kill_stale_process(browser)
+        _kill_processes_by_profile_dir(_gecko_debug_profile_dir_for(browser))
+
+atexit.register(cleanup_all_cdp_processes)
+atexit.register(cleanup_all_gecko_debug_processes)
 
 def _cdp_launch_browser(browser_key, url):
     exe = _find_browser_executable(browser_key)
@@ -3582,8 +4044,8 @@ def _cdp_get_all_cookies(port, timeout=10):
         logging.debug("_cdp_get_all_cookies: websocket connection to %s failed: %s", ws_url, e)
         return None
 
-def _cdp_tracked_process_alive(browser_key):
-    pid_file = _cdp_pid_file(browser_key)
+def _tracked_process_alive(pid_file):
+    """Shared body of _cdp_tracked_process_alive/_gecko_tracked_process_alive."""
     if not os.path.isfile(pid_file):
         return False
     try:
@@ -3599,7 +4061,8 @@ def _cdp_tracked_process_alive(browser_key):
                 capture_output=True, text=True, timeout=5, check=False,
             )
             return str(pid) in out.stdout
-        except (subprocess.SubprocessError, OSError):
+        except (subprocess.SubprocessError, OSError, RuntimeError):
+            # RuntimeError: possible interpreter-shutdown race (atexit).
             return False
     else:
         try:
@@ -3609,6 +4072,12 @@ def _cdp_tracked_process_alive(browser_key):
             return False
         except OSError:
             return False
+
+def _cdp_tracked_process_alive(browser_key):
+    return _tracked_process_alive(_cdp_pid_file(browser_key))
+
+def _gecko_tracked_process_alive(browser_key):
+    return _tracked_process_alive(_gecko_pid_file(browser_key))
 
 def get_cdp_cookies(browser_key, domains=None):
     port = _cdp_port_for(browser_key)
@@ -3645,13 +4114,84 @@ def get_cdp_cookies(browser_key, domains=None):
     ]
     return filtered
 
-def authenticate_session(req_session, force_browser=None):
-    CHROMIUM_BROWSERS = {"chrome", "brave", "edge", "opera", "vivaldi"}
+# --- Dedicated debug-profile launch for Gecko browsers (Zen/Firefox) ------
+# MangaDot's Cloudflare managed challenge needs a real browser engine; this
+# gives Gecko browsers what CDP gives Chromium: a window WE launch with an
+# isolated profile that can clear the challenge once, whose cookies.sqlite
+# we then read like any other profile.
 
+def _launch_gecko_debug_browser(browser_key, url):
+    exe = _find_gecko_executable(browser_key)
+    if not exe:
+        return None
+
+    _gecko_kill_stale_process(browser_key)
+
+    profile_dir = _gecko_debug_profile_dir_for(browser_key)
+    os.makedirs(profile_dir, exist_ok=True)
+    args = [
+        exe,
+        "-profile", profile_dir,
+        "-no-remote",
+        "-new-instance",
+        url,
+    ]
+    try:
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if sys.platform == "win32" else 0
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+        try:
+            with open(_gecko_pid_file(browser_key), "w", encoding="utf-8") as f:
+                f.write(str(proc.pid))
+        except OSError:
+            proc.terminate()
+            return None
+        return proc
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+def get_gecko_debug_cookies(browser_key, domains=None):
+    """Reads cookies from a dedicated debug profile this script launches and
+    controls - not any of the person's real profiles - so a real Gecko engine
+    can clear MangaDot's Cloudflare challenge once and we reuse the session."""
+    profile_dir = _gecko_debug_profile_dir_for(browser_key)
+    already_running = _gecko_tracked_process_alive(browser_key)
+
+    if not already_running:
+        launched_proc = _launch_gecko_debug_browser(browser_key, BASE_URL)
+        if launched_proc is None:
+            print_error(f"Could not find or launch {browser_key.title()} for the debug-profile login flow.")
+            print_info(f"If {browser_key.title()} is installed in a custom location, add its full path "
+                       f"to GECKO_BROWSER_EXECUTABLES near the top of this script.")
+            return []
+        print_info(f"Opened a dedicated {browser_key.title()} window for MangaDot sign-in.")
+        print_info("Log into MangaDot in that window (solve the Cloudflare check if it appears), "
+                   "then come back here.")
+
+    db_path = os.path.join(profile_dir, "cookies.sqlite")
+    deadline = time.time() + GECKO_DEBUG_STARTUP_WAIT
+    cookies = []
+    while time.time() < deadline:
+        if os.path.isfile(db_path):
+            cookies = _read_cookie_db_safely(db_path, domains=domains)
+            if cookies:
+                break
+        time.sleep(1.0)
+
+    return cookies
+
+def authenticate_session(req_session, force_browser=None):
     supported_browsers = {
-        "zen": get_zen_cookies,
+        "zen": lambda domains=None: get_gecko_cookies("zen", domains=domains),
         "chrome": rookiepy.chrome,
-        "firefox": rookiepy.firefox,
+        # Firefox/Zen read passively off disk first (newest profile wins);
+        # if Cloudflare or a locked DB gets in the way, the dedicated
+        # "(debug)" variants below launch a real Gecko engine instead.
+        "firefox": lambda domains=None: get_gecko_cookies("firefox", domains=domains),
         "brave": rookiepy.brave,
         "edge": rookiepy.edge,
         "opera": rookiepy.opera,
@@ -3666,7 +4206,12 @@ def authenticate_session(req_session, force_browser=None):
         "opera (cdp)":   lambda domains=None: get_cdp_cookies("opera", domains=domains),
     }
 
-    all_browsers = {**supported_browsers, **cdp_browsers}
+    gecko_debug_browsers = {
+        "zen (debug)":     lambda domains=None: get_gecko_debug_cookies("zen", domains=domains),
+        "firefox (debug)": lambda domains=None: get_gecko_debug_cookies("firefox", domains=domains),
+    }
+
+    all_browsers = {**supported_browsers, **cdp_browsers, **gecko_debug_browsers}
     browsers_to_try = {force_browser: all_browsers[force_browser]} if force_browser else supported_browsers
 
     if not force_browser:
@@ -3675,7 +4220,7 @@ def authenticate_session(req_session, force_browser=None):
     for browser_name, get_cookies_fn in browsers_to_try.items():
         try:
             req_session.cookies.clear()
-            ua_key = browser_name.replace(" (cdp)", "")
+            ua_key = browser_name.replace(" (cdp)", "").replace(" (debug)", "")
             req_session.headers.update({"User-Agent": get_dynamic_user_agent(ua_key)})
 
             loud = force_browser or (browser_name == "zen")
@@ -3716,8 +4261,9 @@ def authenticate_session(req_session, force_browser=None):
             continue 
 
     print_error("No valid MangaDot session found. Ensure your browser is FULLY CLOSED and you are logged in.")
-    print_info("Zen/Firefox are read directly and should just work if you're logged in there. "
-               "Chrome/Brave/Edge/Opera/Vivaldi usually can't be read directly (encrypted cookie store) -- "
+    print_info("Zen/Firefox are read directly and should just work if you're logged in there; "
+               "if Cloudflare blocks them, try 'Zen (Debug)' / 'Firefox (Debug)' (opens a real browser window). "
+               "Chrome/Brave/Edge/Opera/Vivaldi usually can't be read directly (encrypted cookie store) — "
                "use their '(CDP)' option instead of the plain one.")
     
     browser_choices = [questionary.Choice(title=name.title(), value=name) for name in all_browsers.keys()]
@@ -3789,7 +4335,7 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
                            upload_type, batch_id, language, scanlator_name, abort_event,
                            verify_timeout=MAX_VERIFY_SECONDS, current_user_id=None,
                            is_group_upload=False, has_file_specific_group=True,
-                           upload_session=None):
+                           upload_session=None, skip_verification=True):
     filename = file_info["filename"]
     filepath = file_info["filepath"]
     size     = file_info["size"]
@@ -3939,6 +4485,11 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
         verify_start = time.time()
         total_semaphore_wait = 0
 
+        if skip_verification or verify_timeout <= 0:
+            label = "✅ Already Exists" if already_exists else "✅ Uploaded"
+            renderer.update_chapter_status(filename, label, 1.0, current=size, total=size, speed=0.0, eta=0.0)
+            return {"key": filename, "success": True}
+
         if not group_ids and not scanlator_name:
             if is_group_upload and not has_file_specific_group:
                 label = "⚠️ Uploaded (Unverified — no group)"
@@ -4029,10 +4580,31 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
 # 🔄 PROCESS UPLOADS
 # ==============================================================================
 
+_BATCH_COMPLETE_LOCK = threading.Lock()
+_LAST_BATCH_COMPLETE_TIME = 0.0
+_BATCH_COMPLETE_MIN_INTERVAL = 2.5
+
+def _pace_batch_complete(abort_event=None) -> bool:
+    """Paces batch completion calls across all workers/threads.
+    Ensures that consecutive POST /api/uploads/batch/{id}/complete requests
+    have at least _BATCH_COMPLETE_MIN_INTERVAL (2.5s) between them, preventing
+    MangaDot HTTP 429 rate limits during concurrent uploads.
+    Returns False if abort_event is set during pacing, True otherwise."""
+    global _LAST_BATCH_COMPLETE_TIME
+    with _BATCH_COMPLETE_LOCK:
+        now = time.time()
+        elapsed = now - _LAST_BATCH_COMPLETE_TIME
+        if elapsed < _BATCH_COMPLETE_MIN_INTERVAL:
+            wait_time = _BATCH_COMPLETE_MIN_INTERVAL - elapsed
+            if not _interruptible_sleep(wait_time, abort_event):
+                return False
+        _LAST_BATCH_COMPLETE_TIME = time.time()
+        return True
+
 def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                     upload_type, language, scanlator_name, thread_count,
                     per_file_group_map=None, verify_timeout=MAX_VERIFY_SECONDS, current_user_id=None,
-                    is_group_upload=None):
+                    is_group_upload=None, skip_verification=True):
     per_file_group_map = per_file_group_map or {}
     if is_group_upload is None:
         is_group_upload = bool(group_ids) or any(per_file_group_map.values())
@@ -4062,7 +4634,17 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                         mark_failed(f["filename"], "Paused — session expired before upload", "⏸️ Paused (Session)")
                     continue
 
-                chapters_payload = [{"chapter_number": f["number"] if upload_type == "chapter" else 0, "volume_number": f["number"] if upload_type == "volume" else None, "chapter_title": f["title"]} for f in chunk]
+                chapters_payload = []
+                for f in chunk:
+                    c_title = (f.get("title") or "").strip()
+                    if not c_title:
+                        num = f.get("number", 0)
+                        c_title = f"Chapter {int(num) if isinstance(num, (int, float)) and float(num).is_integer() else num}"
+                    chapters_payload.append({
+                        "chapter_number": f["number"] if upload_type == "chapter" else 0,
+                        "volume_number": f["number"] if upload_type == "volume" else None,
+                        "chapter_title": c_title,
+                    })
 
                 chunk_group_ids = set(group_ids) if group_ids else set()
                 for f in chunk:
@@ -4081,8 +4663,13 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                         continue
                     res.raise_for_status()
                     batch_data = res.json()
-                    if not batch_data.get("success"): raise BatchInitError(str(batch_data)[:200])
-                    batch_id = batch_data["batch_id"]
+                    batch_id = batch_data.get("batch_id")
+                    if not batch_id and not batch_data.get("success"):
+                        raise BatchInitError(str(batch_data)[:200])
+                    if not batch_id and isinstance(batch_data.get("data"), dict):
+                        batch_id = batch_data["data"].get("batch_id")
+                    if not batch_id:
+                        raise BatchInitError(f"Missing batch_id in response: {str(batch_data)[:200]}")
                 except (requests.exceptions.RequestException, json.JSONDecodeError, BatchInitError, KeyError) as e:
                     for f in chunk:
                         mark_failed(f["filename"], f"Batch init failed: {str(e)[:80]}", "❌ Batch Init Failed")
@@ -4100,7 +4687,7 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                         upload_type, batch_id, language, scanlator_name, abort_event,
                         verify_timeout, current_user_id,
                         is_group_upload, has_file_specific_group,
-                        shared_upload_session
+                        shared_upload_session, skip_verification
                     )
                     futures[future] = f
                 chunk_had_success = False
@@ -4127,9 +4714,14 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                     raise
 
                 if batch_id and not session_expired and chunk_had_success:
+                    _pace_batch_complete(abort_event)
                     for comp_attempt in range(MAX_RETRIES):
                         try:
                             comp_res = req_session.post(f"{BASE_URL}/api/uploads/batch/{batch_id}/complete", timeout=(10, 30))
+                            if comp_res.status_code == 429:
+                                if not _interruptible_sleep(30.0, abort_event):
+                                    break
+                                continue
                             if comp_res.status_code in (401, 403):
                                 session_expired = True
                                 break
@@ -4152,6 +4744,75 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
 # ==============================================================================
 # 🎛️  INTERACTIVE SETUP HELPERS
 # ==============================================================================
+
+def _create_manga_from_mangabaka_interactive(session, initial_query):
+    """Interactive MangaBaka -> MangaDot direct create (no metadata editing).
+    Returns the new (or duplicate) manga ID on success, None otherwise."""
+    query = initial_query.strip() if initial_query else ""
+    while True:
+        if not query:
+            query = prompt("Search MangaBaka by title")
+            if not query:
+                return None
+        with console.status(f"[cyan]Searching MangaBaka for '{query}'...[/cyan]", spinner="dots"):
+            results, err = search_mangabaka(query)
+        if err:
+            print_warning(err)
+            if not ask_confirm("Try a different search query?", default=True):
+                return None
+            query = prompt("Search MangaBaka by title")
+            continue
+        if not results:
+            print_warning(f"No results on MangaBaka for '{query}'.")
+            if not ask_confirm("Try a different search query?", default=True):
+                return None
+            query = prompt("Search MangaBaka by title")
+            continue
+        # Build picker
+        choices = []
+        for r in results:
+            title = r.get("title", "Untitled")
+            mid = r.get("id", "?")
+            status = r.get("status", "")
+            label = f"{title}  (MangaBaka ID: {mid})" + (f"  [{status}]" if status else "")
+            choices.append(questionary.Choice(title=label, value=r))
+        choices.append(questionary.Choice(title="🔍 Search again with a different query", value="__search_again__"))
+        choices.append(questionary.Choice(title="Cancel", value="__cancel__"))
+        pick = ask_select("Select a MangaBaka entry to create on MangaDot:", choices)
+        if pick == "__cancel__":
+            return None
+        if pick == "__search_again__":
+            query = prompt("Search MangaBaka by title")
+            continue
+        m_url = pick.get("mangabaka_url")
+        if not m_url:
+            print_error("Selected entry has no MangaBaka URL.")
+            return None
+        # Fetch metadata via MangaDot's proxy endpoint
+        with console.status(f"[cyan]Fetching metadata for '{pick.get('title')}'...[/cyan]", spinner="dots"):
+            meta = fetch_mangabaka_metadata(m_url, session)
+        if meta.get("duplicate"):
+            dup_id = meta.get("id")
+            dup_title = meta.get("title") or pick.get("title")
+            print_success(f"That title already exists on MangaDot: '{dup_title}' (ID: {dup_id}) — using it.")
+            print_info(f"View it here: {BASE_URL}/manga/{dup_id}")
+            return dup_id
+        if not meta.get("ok"):
+            print_error(f"Could not fetch MangaBaka entry: {meta.get('error', 'Unknown error')}")
+            print_info(f"You can create it manually at: {BASE_URL}/add-manga")
+            return None
+        # Direct create — no metadata review/edit
+        with console.status(f"[cyan]Creating '{pick.get('title')}' on MangaDot...[/cyan]", spinner="dots"):
+            created = create_manga_from_mangabaka(meta.get("data"), session)
+        if created.get("ok"):
+            new_id = created.get("id")
+            new_title = created.get("title") or pick.get("title")
+            print_success(f"Created on MangaDot: '{new_title}' (ID: {new_id})")
+            print_info(f"View it here: {BASE_URL}/manga/{new_id}")
+            return new_id
+        print_error(f"Failed to create on MangaDot: {created.get('error', 'Unknown error')}")
+        print_info(f"You can create it manually at: {BASE_URL}/add-manga")
+        return None
 
 def _select_manga(req_session, guessed_title):
     manga_id = None
@@ -4183,7 +4844,27 @@ def _select_manga(req_session, guessed_title):
             results = search_manga(m_input, req_session)
 
         if not results:
-            print_warning("No matching manga titles found on MangaDot. Try another search query.")
+            print_warning(f"No matching manga titles found on MangaDot for '{m_input}'.")
+            if ask_confirm(f"Fetch this entry from MangaBaka and create it on MangaDot directly (no editing)?", default=False):
+                created_id = _create_manga_from_mangabaka_interactive(req_session, m_input)
+                if created_id:
+                    # Verify the newly created entry and confirm with user like the ID path does.
+                    with console.status(f"[cyan]Looking up manga ID {created_id}...[/cyan]", spinner="dots"):
+                        title, cover_url = fetch_manga_brief(created_id, req_session)
+                    title = title or f"ID {created_id}"
+                    console.print(f"\n  [bold]Title:[/bold] {title}  [cyan](ID: {created_id})[/cyan]")
+                    if cover_url:
+                        show_cover(cover_url, req_session)
+                    if ask_confirm(f"Use '{title}'?", default=True):
+                        manga_id = created_id
+                        print_success(f"Selected Manga: {title} (ID: {manga_id})")
+                    else:
+                        guessed_title = None
+                    continue
+                # Creation failed or was cancelled — fall through to manual hint below.
+            # Manual entry fallback — no metadata editing, just show the link.
+            print_info(f"To create this entry manually, open: [cyan]{BASE_URL}/add-manga[/cyan] in your browser, "
+                       f"create it, then come back here and enter its new ID.")
             guessed_title = None
             continue
 
@@ -4343,74 +5024,116 @@ def _setup_group_config(directory, req_session, upload_type="chapter"):
 def _run_upload_loop(files, req_session, manga_id, group_ids, upload_type,
                      language, scanlator_name, thread_count, per_file_group_map,
                      current_browser, verify_timeout=MAX_VERIFY_SECONDS, current_user_id=None,
-                     is_group_upload=None):
+                     is_group_upload=None, selected_group_name=None, skip_verification=True):
     current_files_to_upload = files
     upload_start    = time.time()
     failed_chapters = []
     failure_reasons = {}
+    batch_config = {
+        "manga_id": manga_id,
+        "upload_type": upload_type,
+        "language": language,
+        "group_ids": group_ids or [],
+        "scanlator_name": scanlator_name,
+        "per_file_group_map": per_file_group_map or {},
+        "thread_count": thread_count,
+        "verify_timeout": verify_timeout,
+        "current_user_id": current_user_id,
+        "is_group_upload": is_group_upload,
+        "selected_group_name": selected_group_name,
+        "skip_verification": skip_verification,
+    }
+    try:
+        while True:
+            failed_chapters, session_expired, failure_reasons = process_uploads(
+                current_files_to_upload, req_session, manga_id, group_ids, upload_type,
+                language, scanlator_name, thread_count,
+                per_file_group_map=per_file_group_map,
+                verify_timeout=verify_timeout,
+                current_user_id=current_user_id,
+                is_group_upload=is_group_upload,
+                skip_verification=skip_verification
+            )
 
-    while True:
-        failed_chapters, session_expired, failure_reasons = process_uploads(
-            current_files_to_upload, req_session, manga_id, group_ids, upload_type,
-            language, scanlator_name, thread_count,
-            per_file_group_map=per_file_group_map,
-            verify_timeout=verify_timeout,
-            current_user_id=current_user_id,
-            is_group_upload=is_group_upload
-        )
-
-        if session_expired:
-            console.print()
-            console.rule("[bold red]Session Expired[/bold red]")
+            if session_expired:
+                # Crash-safe: persist so closing the terminal now still allows resume.
+                save_paused_upload(batch_config, current_files_to_upload)
+                console.print()
+                console.rule("[bold red]Session Expired[/bold red]")
             print_warning("UPLOAD PAUSED: Session token expired or unauthorized.")
+            print_warning(f"Progress saved — you can close the script and resume later ({len(current_files_to_upload)} file(s) pending).")
             print_warning("Refresh your login/Cloudflare check in your browser, then return here.")
-
             time.sleep(1.5)
             flush_input_buffer()
-
-            input("\nPress Enter to re-authenticate and resume... ")
+            choice = ask_select("Session expired — what now?", [
+                questionary.Choice(title="Re-authenticate now and continue", value="reauth"),
+                questionary.Choice(title="Pause & exit — resume next run", value="pause"),
+            ])
+            if choice == "pause":
+                print_info(f"Paused {len(current_files_to_upload)} file(s) — run the script again to resume.")
+                sys.exit(0)
+            # Re-auth path: refresh browser session and continue with remaining files.
             current_browser, current_user_id = authenticate_session(req_session, current_browser)
+            batch_config["current_user_id"] = current_user_id
             failed_set = set(failed_chapters)
             current_files_to_upload = [f for f in current_files_to_upload if f["filename"] in failed_set]
-
+            # Update paused state to reflect the narrowed remaining set after re-auth.
+            if current_files_to_upload:
+                save_paused_upload(batch_config, current_files_to_upload)
             console.print()
             console.rule("[dim]Resuming Upload[/dim]")
             console.print()
             print_info(f"Resuming upload for {len(current_files_to_upload)} failed/paused chapter(s)...")
             continue
 
+            console.print()
+            console.rule("[bold cyan]🎉 All operations complete[/bold cyan]", style="green")
+            console.print()
+
+            if not failed_chapters:
+                print_success("All chapters were processed successfully!")
+                clear_paused_upload()
+                break
+
+            print_error(f"{len(failed_chapters)} chapter(s) failed after all retries.")
+            safe_id         = str(manga_id) if manga_id else "unknown"
+            log_dir         = "logs"
+            timestamp       = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            failed_log_name = os.path.join(log_dir, f"failed_manga_{safe_id}_{timestamp}.txt")
+            try:
+                os.makedirs(log_dir, exist_ok=True)
+                with open(failed_log_name, "w", encoding="utf-8") as f:
+                    f.write(f"# Failed uploads for manga {safe_id} — {timestamp}\n")
+                    f.write(f"# {BASE_URL}/manga/{safe_id}\n")
+                    f.write("# <filename>\t<reason>\n\n")
+                    for chap in sorted(failed_chapters, key=natural_sort_key):
+                        reason = failure_reasons.get(chap, "Unknown error")
+                        f.write(f"{chap}\t{reason}\n")
+                print_info(f"Failed list saved to [cyan]`{failed_log_name}`[/cyan].")
+            except OSError as e:
+                print_error(f"Could not write `{failed_log_name}`: {e}")
+                clear_paused_upload()
+                break
+
+            retry_choice = ask_confirm("Retry ONLY the failed chapters?", default=True)
+            if not retry_choice:
+                clear_paused_upload()
+                break
+            failed_set = set(failed_chapters)
+            current_files_to_upload = [f for f in current_files_to_upload if f["filename"] in failed_set]
+            # Persist the narrowed retry set so a crash during the retry is still resumable.
+            save_paused_upload(batch_config, current_files_to_upload)
+            print_info(f"\nRetrying {len(current_files_to_upload)} failed chapter(s)...")
+    except KeyboardInterrupt:
         console.print()
-        console.rule("[bold cyan]🎉 All operations complete[/bold cyan]", style="green")
-        console.print()
-
-        if not failed_chapters:
-            print_success("All chapters were processed successfully!")
-            break
-
-        print_error(f"{len(failed_chapters)} chapter(s) failed after all retries.")
-        safe_id         = str(manga_id) if manga_id else "unknown"
-        log_dir         = "logs"
-        timestamp       = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        failed_log_name = os.path.join(log_dir, f"failed_manga_{safe_id}_{timestamp}.txt")
-        try:
-            os.makedirs(log_dir, exist_ok=True)
-            with open(failed_log_name, "w", encoding="utf-8") as f:
-                f.write(f"# Failed uploads for manga {safe_id} — {timestamp}\n")
-                f.write(f"# {BASE_URL}/manga/{safe_id}\n")
-                f.write("# <filename>\t<reason>\n\n")
-                for chap in sorted(failed_chapters, key=natural_sort_key):
-                    reason = failure_reasons.get(chap, "Unknown error")
-                    f.write(f"{chap}\t{reason}\n")
-            print_info(f"Failed list saved to [cyan]`{failed_log_name}`[/cyan].")
-        except OSError as e:
-            print_error(f"Could not write `{failed_log_name}`: {e}")
-            break
-
-        retry_choice = ask_confirm("Retry ONLY the failed chapters?", default=True)
-        if not retry_choice: break
-        failed_set = set(failed_chapters)
-        current_files_to_upload = [f for f in current_files_to_upload if f["filename"] in failed_set]
-        print_info(f"\nRetrying {len(current_files_to_upload)} failed chapter(s)...")
+        print_warning("Upload interrupted by user (Ctrl+C).")
+        if ask_confirm("Pause this upload and save progress so you can resume next run?", default=True):
+            save_paused_upload(batch_config, current_files_to_upload)
+            print_success(f"Paused {len(current_files_to_upload)} file(s) — run the script again to resume.")
+        else:
+            clear_paused_upload()
+            print_info("Discarded paused state.")
+        sys.exit(0)
 
     return set(failed_chapters), time.time() - upload_start, current_browser
 
@@ -4461,9 +5184,11 @@ def build_arg_parser():
     parser.add_argument("--dry-run", action="store_true", help="Scan and parse chapter names without uploading.")
     parser.add_argument("--debug", action="store_true", help="Dump all HTTP traffic to api_requests.log.")
     parser.add_argument("--verify-timeout", type=_positive_int, default=MAX_VERIFY_SECONDS, metavar="SECONDS", help=f"How long to wait for validation confirmation (default: {MAX_VERIFY_SECONDS}s). Must be a positive integer.")
+    parser.add_argument("--skip-verification", action="store_true", default=True, help="Skip post-upload verification polling (default: True, recommended because server post-processing is asynchronous).")
+    parser.add_argument("--verify", dest="skip_verification", action="store_false", help="Enable post-upload verification polling.")
     parser.add_argument("--library", default=DEFAULT_LIBRARY_DIR or None, metavar="DIR", help="Parent folder of manga subfolders; pick one interactively instead of typing a path.")
     parser.add_argument("--proxy", default=None, help="Tunnel all HTTP/HTTPS requests through a specific proxy server.")
-    parser.add_argument("--proxy-no-verify", action="store_true", help="Disable SSL certificate verification when using a proxy (use only if the proxy does TLS interception).")
+    parser.add_argument("--proxy-no-verify", action="store_true", default=None, help="Disable SSL certificate verification when using a proxy (use only if the proxy does TLS interception). Remembered across runs when explicitly passed.")
     parser.add_argument("--optimize-only", nargs="?", const="__prompt__", default=None, metavar="DIR",
                          help="Losslessly re-compress images inside every .cbz/.zip in DIR, then exit (no "
                               "login, no upload). Omit DIR to pick a folder interactively. Pixel data is "
@@ -4473,26 +5198,25 @@ def build_arg_parser():
     parser.add_argument("--optimize", nargs="?", const="__prompt__", default=None, metavar="DIR",
                          help="Same as --optimize-only, but continues straight into the normal upload flow "
                               "on that folder afterward, so you can shrink and upload in one run.")
-    parser.add_argument("--optimize-lossy", action="store_true",
+    parser.add_argument("--optimize-lossy", action="store_true", default=None,
                          help="Opt-in ONLY: allow lossy JPEG/WEBP re-encoding (pixel data changes, quality "
                               "reduced) for larger size savings. Without this flag, optimization is always "
-                              "strictly lossless. This flag alone is what enables quality loss — nothing else does.")
-    parser.add_argument("--optimize-replace", action="store_true",
+                              "strictly lossless. Remembered across runs when explicitly passed.")
+    parser.add_argument("--optimize-replace", action="store_true", default=None,
                          help="Overwrite originals in-place instead of writing to an 'optimized' subfolder "
                               "(the default). You'll be asked to confirm before any originals are "
-                              "overwritten — declining falls back to the subfolder instead.")
-    parser.add_argument("--optimize-jpeg-quality", type=_positive_int, default=85, metavar="1-95",
-                         help="JPEG quality when --optimize-lossy is used (default: 85). Ignored in the default lossless mode.")
-    parser.add_argument("--optimize-webp-quality", type=_positive_int, default=85, metavar="1-100",
-                         help="WEBP quality when --optimize-lossy is used (default: 85). Ignored in the default lossless mode.")
-    parser.add_argument("--optimize-threads", type=_positive_int, default=4, metavar="N",
-                         help="Parallel archives to optimize at once (default: 4). Separate from the "
-                              "interactive upload thread-count prompt.")
-    parser.add_argument("--pingo", action="store_true",
+                              "overwritten — declining falls back to the subfolder instead. Remembered across runs when explicitly passed.")
+    parser.add_argument("--optimize-jpeg-quality", type=_positive_int, default=None, metavar="1-95",
+                         help="JPEG quality when --optimize-lossy is used (default: 85). Ignored in the default lossless mode. Remembered across runs when explicitly passed.")
+    parser.add_argument("--optimize-webp-quality", type=_positive_int, default=None, metavar="1-100",
+                         help="WEBP quality when --optimize-lossy is used (default: 85). Ignored in the default lossless mode. Remembered across runs when explicitly passed.")
+    parser.add_argument("--optimize-threads", type=_positive_int, default=None, metavar="N",
+                         help="Parallel archives to optimize at once (default: 4). Remembered across runs when explicitly passed. Separate from the interactive upload thread-count prompt.")
+    parser.add_argument("--pingo", action="store_true", default=None,
                          help="Modifier for --optimize/--optimize-only — has no effect on its own. "
                               "Use a local pingo binary (must sit next to mangadot.py) instead of the "
                               "built-in mozjpeg/Pillow optimizer — replaces that pipeline entirely for "
-                              "this run. Pingo has no official macOS build; on unsupported platforms or "
+                              "this run. Remembered across runs when explicitly passed. Pingo has no official macOS build; on unsupported platforms or "
                               "if the binary isn't found, this falls back to mozjpeg/Pillow with a "
                               "visible notice rather than failing silently.")
     parser.add_argument("--refresh-uv-cache", action="store_true",
@@ -4510,9 +5234,44 @@ def main():
     saved_config     = load_config()
     resolved_library = args.library or saved_config.get("library") or (DEFAULT_LIBRARY_DIR or None)
 
+    # Persist proxy/optimizer preferences across runs (except --debug, per user choice).
+    # Explicit CLI flags win over saved values; saved values win over built-in defaults.
+    # Only an explicit flag triggers a write — this avoids spamming the config on every run.
+    if args.proxy is not None:
+        _remember_setting("proxy", args.proxy)
+        resolved_proxy = args.proxy
+    else:
+        resolved_proxy = saved_config.get("proxy")
+    # proxy_no_verify is a boolean — None means "not passed".
+    if args.proxy_no_verify is not None:
+        _remember_setting_force("proxy_no_verify", bool(args.proxy_no_verify))
+        resolved_proxy_no_verify = bool(args.proxy_no_verify)
+    else:
+        resolved_proxy_no_verify = bool(saved_config.get("proxy_no_verify", False))
+    # Optimizer preferences
+    if args.optimize_lossy is not None:
+        _remember_setting_force("optimize_lossy", bool(args.optimize_lossy))
+    if args.optimize_replace is not None:
+        _remember_setting_force("optimize_replace", bool(args.optimize_replace))
+    if args.optimize_jpeg_quality is not None:
+        _remember_setting("optimize_jpeg_quality", args.optimize_jpeg_quality)
+    if args.optimize_webp_quality is not None:
+        _remember_setting("optimize_webp_quality", args.optimize_webp_quality)
+    if args.optimize_threads is not None:
+        _remember_setting("optimize_threads", args.optimize_threads)
+    if args.pingo is not None:
+        _remember_setting_force("pingo", bool(args.pingo))
+    # Resolve effective values for this run
+    resolved_optimize_lossy = args.optimize_lossy if args.optimize_lossy is not None else bool(saved_config.get("optimize_lossy", False))
+    resolved_optimize_replace = args.optimize_replace if args.optimize_replace is not None else bool(saved_config.get("optimize_replace", False))
+    resolved_optimize_jpeg = args.optimize_jpeg_quality if args.optimize_jpeg_quality is not None else int(saved_config.get("optimize_jpeg_quality", 85))
+    resolved_optimize_webp = args.optimize_webp_quality if args.optimize_webp_quality is not None else int(saved_config.get("optimize_webp_quality", 85))
+    resolved_optimize_threads = args.optimize_threads if args.optimize_threads is not None else int(saved_config.get("optimize_threads", 4))
+    resolved_pingo = args.pingo if args.pingo is not None else bool(saved_config.get("pingo", False))
+
     _check_for_updates()
 
-    resolved_proxy = args.proxy
+    # resolved_proxy already computed above
 
     if args.dry_run: 
         run_dry_run(resolved_library)
@@ -4529,13 +5288,13 @@ def main():
             sys.exit(1)
         run_optimize(
             target_dir,
-            replace=args.optimize_replace,
-            lossy=args.optimize_lossy,
-            jpeg_quality=args.optimize_jpeg_quality,
-            webp_quality=args.optimize_webp_quality,
-            thread_count=args.optimize_threads,
+            replace=resolved_optimize_replace,
+            lossy=resolved_optimize_lossy,
+            jpeg_quality=resolved_optimize_jpeg,
+            webp_quality=resolved_optimize_webp,
+            thread_count=resolved_optimize_threads,
             then_upload=False,
-            use_pingo=args.pingo,
+            use_pingo=resolved_pingo,
         )
         # run_optimize() calls sys.exit(0) itself once the summary is shown.
 
@@ -4560,13 +5319,13 @@ def main():
             sys.exit(1)
         upload_dir = run_optimize(
             target_dir,
-            replace=args.optimize_replace,
-            lossy=args.optimize_lossy,
-            jpeg_quality=args.optimize_jpeg_quality,
-            webp_quality=args.optimize_webp_quality,
-            thread_count=args.optimize_threads,
+            replace=resolved_optimize_replace,
+            lossy=resolved_optimize_lossy,
+            jpeg_quality=resolved_optimize_jpeg,
+            webp_quality=resolved_optimize_webp,
+            thread_count=resolved_optimize_threads,
             then_upload=True,
-            use_pingo=args.pingo,
+            use_pingo=resolved_pingo,
         )
         upload_desc = "this same folder" if upload_dir == target_dir else "the 'optimized' subfolder"
         if not ask_confirm(f"Optimization done. Continue into upload for {upload_desc}?", default=True):
@@ -4595,7 +5354,7 @@ def main():
     if args.debug: req_session.hooks['response'].append(log_request_response)
 
     if resolved_proxy:
-        proxy_no_verify = args.proxy_no_verify
+        proxy_no_verify = resolved_proxy_no_verify
         console.print(f"[yellow][PROXY] Routing all traffic through: {_redact_proxy_url(resolved_proxy)}[/yellow]")
         with console.status("[cyan]Checking proxy connectivity...[/cyan]", spinner="dots"):
             proxy_ok, proxy_err = _check_proxy(resolved_proxy, verify=not proxy_no_verify)
@@ -4618,6 +5377,127 @@ def main():
     req_session.mount("http://",  no_retry_adapter)
 
     current_browser, current_user_id = authenticate_session(req_session)
+    # --- Text-only profile status line (#4) — cheap, no images, just level/rank/series ---
+    try:
+        with console.status("[dim]Fetching profile info...[/dim]", spinner="dots"):
+            # Reuse the GUI's fetch_profile_stats scrapers if available; fall back to validate_session already did.
+            # We do a lightweight profile fetch here for the status line.
+            prof_res = req_session.get(f"{BASE_URL}/api/profile", timeout=(5, 15))
+            if prof_res.status_code == 200:
+                prof_data = prof_res.json().get("profile", {}) if isinstance(prof_res.json().get("profile"), dict) else prof_res.json()
+                _uname = prof_data.get("username") or prof_data.get("email") or current_browser
+                _lvl = prof_data.get("level")
+                _series = None
+                # Try to scrape series/chapters counts from /user/<name> like GUI does (best-effort, silent on fail).
+                try:
+                    _user_html = req_session.get(f"{BASE_URL}/user/{_uname}", timeout=(5, 15)).text if _uname else ""
+                    import re as _re
+                    _m_series = _re.search(r'<span class="pf-num[^"]*">([\d,]+)</span>\s*(?:<!--\s*-->)?\s*series', _user_html)
+                    if _m_series:
+                        _series = int(_m_series.group(1).replace(",", ""))
+                except Exception:
+                    pass
+                _status_parts = [f"[bold]{_uname}[/bold]"]
+                if _lvl is not None:
+                    _status_parts.append(f"Lv {_lvl}")
+                if _series is not None:
+                    _status_parts.append(f"{_series} series")
+                console.print(f"  [dim]👤 Logged in as[/dim] {' · '.join(_status_parts)}  [dim]({current_browser})[/dim]")
+    except Exception:
+        pass  # status line is cosmetic — never block startup
+
+    # --- Crash-safe resume (#2): offer to resume a previously paused batch ---
+    try:
+        paused_state = load_paused_upload()
+    except Exception:
+        paused_state = None
+    if paused_state and not args.dry_run and args.optimize is None and args.optimize_only is None:
+        bc = paused_state.get("batch_config", {}) or {}
+        paused_files = paused_state.get("files", []) or []
+        paused_at = paused_state.get("paused_at")
+        age_str = _format_paused_age(paused_at) if paused_at else "an unknown time ago"
+        console.print()
+        console.rule("[bold yellow]Paused upload found[/bold yellow]")
+        print_info(f"Found a paused upload from {age_str}: [bold]{len(paused_files)}[/bold] file(s), "
+                   f"manga ID [cyan]{bc.get('manga_id', '?')}[/cyan], {bc.get('upload_type', 'chapter')}, "
+                   f"language [cyan]{bc.get('language', '?')}[/cyan].")
+        if paused_files:
+            _preview = ", ".join(f.get("filename", "?") for f in paused_files[:3])
+            if len(paused_files) > 3:
+                _preview += f" +{len(paused_files)-3} more"
+            console.print(f"  [dim]{_preview}[/dim]")
+        _resume_now = ask_confirm("Resume this paused upload now? (No = discard it and start fresh)", default=True)
+        if _resume_now:
+            # Filter files that no longer exist on disk.
+            _valid = []
+            _missing = 0
+            for _f in paused_files:
+                _fp = _f.get("filepath") or ""
+                if _fp and os.path.isfile(_fp):
+                    _valid.append(_f)
+                else:
+                    _missing += 1
+            if _missing:
+                print_warning(f"{_missing} file(s) no longer found on disk and will be skipped.")
+            if not _valid:
+                print_warning("No paused files remain on disk — discarding paused state.")
+                clear_paused_upload()
+            else:
+                _manga_id = bc.get("manga_id")
+                _upload_type = bc.get("upload_type", "chapter")
+                _language = bc.get("language", "en")
+                _group_ids = bc.get("group_ids", []) or []
+                _scanlator_name = bc.get("scanlator_name")
+                _per_file_group_map = bc.get("per_file_group_map", {}) or {}
+                _thread_count = bc.get("thread_count", 5)
+                _verify_timeout = bc.get("verify_timeout", MAX_VERIFY_SECONDS)
+                _skip_verification = bc.get("skip_verification", args.skip_verification)
+                _is_group_upload = bc.get("is_group_upload")
+                _group_label = bc.get("selected_group_name") or (", ".join(map(str, _group_ids)) if _group_ids else (_scanlator_name or "-"))
+                req_session.headers.update({"Referer": f"{BASE_URL}/manga/{_manga_id}/upload"})
+                console.print()
+                print_info(f"Resuming {len(_valid)} file(s) for manga {_manga_id}...")
+                try:
+                    print_files_table(_valid, _upload_type, group_label=_group_label)
+                except Exception:
+                    pass
+                if not ask_confirm("Proceed with this resumed upload?", default=True):
+                    clear_paused_upload()
+                    print_info("Discarded paused upload.")
+                else:
+                    _final_failed, _upload_elapsed, _current_browser = _run_upload_loop(
+                        _valid, req_session, _manga_id, _group_ids, _upload_type,
+                        _language, _scanlator_name, _thread_count, _per_file_group_map,
+                        current_browser, _verify_timeout, current_user_id, _is_group_upload,
+                        selected_group_name=_group_label, skip_verification=_skip_verification
+                    )
+                    # Record successful uploads for DB history, then show summary and exit.
+                    _uploaded = [f for f in _valid if f["filename"] not in _final_failed]
+                    if _uploaded:
+                        try:
+                            _target_key = _make_target_key(_manga_id, _upload_type, _language, _group_ids, _scanlator_name)
+                            db_record_uploaded(_target_key, _uploaded)
+                        except Exception:
+                            pass
+                    _manga_url = f"{BASE_URL}/manga/{_manga_id}"
+                    console.print()
+                    console.rule("[dim]Summary[/dim]", style="green")
+                    console.print()
+                    if _uploaded:
+                        _uploaded_bytes = sum(f.get("size", 0) for f in _uploaded)
+                        _avg = _uploaded_bytes / _upload_elapsed if _upload_elapsed > 0 else 0
+                        print_info(f"Uploaded [bold]{len(_uploaded)}[/bold] file(s) · {fmt_size(_uploaded_bytes)} in {fmt_duration(_upload_elapsed)} · avg {fmt_size(_avg)}/s")
+                    if _final_failed:
+                        print_error(f"{len(_final_failed)} file(s) still failed.")
+                    else:
+                        print_success("All resumed chapters were processed successfully!")
+                    print_info(f"View your manga here: {_manga_url}")
+                    console.print()
+                    input("Press Enter to exit... ")
+                    sys.exit(0)
+        else:
+            clear_paused_upload()
+            print_info("Discarded paused upload — starting fresh.")
 
     console.print()
     console.rule("[dim]Setup[/dim]", style="green")
@@ -4745,7 +5625,8 @@ def main():
         files, req_session, manga_id, group_ids, upload_type,
         language, scanlator_name, thread_count, per_file_group_map, current_browser,
         verify_timeout=verify_timeout, current_user_id=current_user_id,
-        is_group_upload=is_group
+        is_group_upload=is_group, selected_group_name=selected_group_name,
+        skip_verification=args.skip_verification
     )
 
     manga_url = f"{BASE_URL}/manga/{manga_id}"
