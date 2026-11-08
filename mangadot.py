@@ -2615,6 +2615,111 @@ def db_record_uploaded(target_key, files):
     bucket.sort(key=_uploaded_sort_key)
     save_db(db)
 
+def fetch_remote_existing_numbers(session, manga_id, upload_type, language):
+    """Query MangaDot for existing chapters or volumes under this title and language.
+    Combines public published chapters (/api/manga/{id}/chapters/list) and the member's
+    moderation queue (/api/uploads/mine) to capture pending and processing files."""
+    existing_numbers = set()
+
+    # 1. Public published chapters list
+    try:
+        resp = session.get(
+            f"{BASE_URL}/api/manga/{manga_id}/chapters/list",
+            params={"lang": language},
+            headers={"Referer": f"{BASE_URL}/manga/{manga_id}"},
+            timeout=(10, 20)
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            ch_list = data if isinstance(data, list) else (data.get("chapters") or data.get("rows") or [])
+            for item in ch_list:
+                try:
+                    num_val = item.get("volume_number" if upload_type == "volume" else "chapter_number")
+                    if num_val is not None:
+                        key = _chapter_number_key(num_val)
+                        if key:
+                            existing_numbers.add(key)
+                except (ValueError, TypeError):
+                    pass
+    except Exception as e:
+        logging.debug("fetch_remote_existing_numbers chapters/list failed: %s", e)
+
+    # 2. Member's uploads queue (pending, processing, approved)
+    try:
+        resp = session.get(
+            f"{BASE_URL}/api/uploads/mine",
+            params={"manga_id": manga_id, "language": language, "limit": 100},
+            headers={"Referer": f"{BASE_URL}/upload"},
+            timeout=(10, 20)
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            uploads = data.get("uploads") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            for item in uploads:
+                try:
+                    if item.get("status") == "rejected":
+                        continue
+                    num_val = item.get("volume_number" if upload_type == "volume" else "chapter_number")
+                    if num_val is not None:
+                        key = _chapter_number_key(num_val)
+                        if key:
+                            existing_numbers.add(key)
+                except (ValueError, TypeError):
+                    pass
+    except Exception as e:
+        logging.debug("fetch_remote_existing_numbers uploads/mine failed: %s", e)
+
+    return existing_numbers
+
+def extract_first_image_from_archive(archive_path):
+    """Extracts the first image filename and raw bytes from a cbz/zip archive using natural sort."""
+    if not os.path.isfile(archive_path) or not zipfile.is_zipfile(archive_path):
+        return None, None, None
+    try:
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            valid_exts = (".jpg", ".jpeg", ".png", ".webp")
+            names = [
+                n for n in zf.namelist()
+                if not n.startswith("__MACOSX") and not os.path.basename(n).startswith(".")
+                and n.lower().endswith(valid_exts)
+            ]
+            if not names:
+                return None, None, None
+            names.sort(key=natural_sort_key)
+            first_name = names[0]
+            data = zf.read(first_name)
+            ext = os.path.splitext(first_name)[1].lower()
+            mime = "image/jpeg" if ext in (".jpg", ".jpeg") else ("image/png" if ext == ".png" else "image/webp")
+            return os.path.basename(first_name), data, mime
+    except Exception as e:
+        logging.debug("extract_first_image_from_archive failed on %s: %s", archive_path, e)
+        return None, None, None
+
+def upload_volume_cover(session, manga_id, volume_number, archive_path):
+    """Extracts page 1 from the volume archive and uploads it as the volume cover."""
+    fname, img_bytes, mime = extract_first_image_from_archive(archive_path)
+    if not img_bytes:
+        return False, "No valid image found in volume archive"
+
+    try:
+        vn_key = _chapter_number_key(volume_number)
+    except Exception:
+        vn_key = str(volume_number)
+
+    url = f"{BASE_URL}/api/manga/{manga_id}/volumes/{vn_key}/cover"
+    headers = {
+        "Origin": BASE_URL,
+        "Referer": f"{BASE_URL}/manga/{manga_id}/upload",
+    }
+    files = {"file": (fname, img_bytes, mime)}
+    try:
+        res = session.post(url, files=files, headers=headers, timeout=(15, 45))
+        if res.status_code == 200:
+            return True, None
+        return False, f"HTTP {res.status_code}: {res.text[:120]}"
+    except Exception as e:
+        return False, str(e)
+
 def _check_for_updates():
     """Once every 7 days, check PyPI for newer versions of our dependencies
     than the floors declared in REQUIRED_PACKAGES/OPTIMIZER_PACKAGES, and
@@ -4353,7 +4458,8 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
                            upload_type, batch_id, language, scanlator_name, abort_event,
                            verify_timeout=MAX_VERIFY_SECONDS, current_user_id=None,
                            is_group_upload=False, has_file_specific_group=True,
-                           upload_session=None, skip_verification=True):
+                           upload_session=None, skip_verification=True,
+                           stitch_spreads=False):
     filename = file_info["filename"]
     filepath = file_info["filepath"]
     size     = file_info["size"]
@@ -4388,6 +4494,8 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
         if file_info.get("title"):    tus_metadata["chapter_title"]  = file_info["title"]
         if scanlator_name:
             tus_metadata["scanlator_name"] = scanlator_name
+        if stitch_spreads:
+            tus_metadata["stitch_spreads"] = "1"
 
         encoded_metadata = encode_tus_metadata(tus_metadata)
         headers = {
@@ -4632,7 +4740,8 @@ def _pace_batch_complete(abort_event=None) -> bool:
 def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                     upload_type, language, scanlator_name, thread_count,
                     per_file_group_map=None, verify_timeout=MAX_VERIFY_SECONDS, current_user_id=None,
-                    is_group_upload=None, skip_verification=True):
+                    is_group_upload=None, skip_verification=True,
+                    stitch_spreads=False, auto_volume_cover=False):
     per_file_group_map = per_file_group_map or {}
     if is_group_upload is None:
         is_group_upload = bool(group_ids) or any(per_file_group_map.values())
@@ -4715,7 +4824,8 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                         upload_type, batch_id, language, scanlator_name, abort_event,
                         verify_timeout, current_user_id,
                         is_group_upload, has_file_specific_group,
-                        shared_upload_session, skip_verification
+                        shared_upload_session, skip_verification,
+                        stitch_spreads
                     )
                     futures[future] = f
                 chunk_had_success = False
@@ -4728,6 +4838,14 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                                 chunk_had_success = True
                                 if result.get('warning'):
                                     print_warning(f"'{f_info['filename']}': {result['warning']}")
+                                if upload_type == "volume" and auto_volume_cover:
+                                    cover_ok, cover_err = upload_volume_cover(
+                                        req_session, manga_id, f_info.get("number"), f_info["filepath"]
+                                    )
+                                    if cover_ok:
+                                        print_info(f"Auto-set volume cover for Vol. {_chapter_number_key(f_info.get('number'))}")
+                                    else:
+                                        logging.debug("Auto volume cover failed for Vol. %s: %s", f_info.get("number"), cover_err)
                             else:
                                 mark_failed(result['key'], result.get('error', 'Unknown error'), f"❌ {result['error']}")
                         except SessionExpiredError:
@@ -5078,7 +5196,8 @@ def _setup_group_config(directory, req_session, upload_type="chapter"):
 def _run_upload_loop(files, req_session, manga_id, group_ids, upload_type,
                      language, scanlator_name, thread_count, per_file_group_map,
                      current_browser, verify_timeout=MAX_VERIFY_SECONDS, current_user_id=None,
-                     is_group_upload=None, selected_group_name=None, skip_verification=True):
+                     is_group_upload=None, selected_group_name=None, skip_verification=True,
+                     stitch_spreads=False, auto_volume_cover=False):
     current_files_to_upload = files
     upload_start    = time.time()
     failed_chapters = []
@@ -5096,6 +5215,8 @@ def _run_upload_loop(files, req_session, manga_id, group_ids, upload_type,
         "is_group_upload": is_group_upload,
         "selected_group_name": selected_group_name,
         "skip_verification": skip_verification,
+        "stitch_spreads": stitch_spreads,
+        "auto_volume_cover": auto_volume_cover,
     }
     try:
         while True:
@@ -5106,7 +5227,9 @@ def _run_upload_loop(files, req_session, manga_id, group_ids, upload_type,
                 verify_timeout=verify_timeout,
                 current_user_id=current_user_id,
                 is_group_upload=is_group_upload,
-                skip_verification=skip_verification
+                skip_verification=skip_verification,
+                stitch_spreads=stitch_spreads,
+                auto_volume_cover=auto_volume_cover
             )
 
             if session_expired:
@@ -5279,6 +5402,18 @@ def build_arg_parser():
                               "dependency in the PEP 723 block to its newest version satisfying the "
                               "declared floor. Handled before any other startup logic, so it works even "
                               "if dependencies aren't installed yet.")
+    parser.add_argument("--stitch-spreads", dest="stitch_spreads", action="store_true", default=None,
+                         help="Attach stitch_spreads to TUS metadata to automatically stitch two-page spreads on MangaDot.")
+    parser.add_argument("--no-stitch-spreads", dest="stitch_spreads", action="store_false",
+                         help="Disable automatic two-page spread stitching.")
+    parser.add_argument("--volume-cover", dest="volume_cover", action="store_true", default=None,
+                         help="Auto-extract page 1 from each volume archive and upload it as the volume cover.")
+    parser.add_argument("--no-volume-cover", dest="volume_cover", action="store_false",
+                         help="Do not automatically upload page 1 as the volume cover.")
+    parser.add_argument("--skip-existing", dest="skip_existing", action="store_true", default=None,
+                         help="Automatically skip chapters or volumes that already exist on MangaDot.")
+    parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false",
+                         help="Do not skip existing chapters or volumes.")
     return parser
 
 def main():
@@ -5523,7 +5658,9 @@ def main():
                         _valid, req_session, _manga_id, _group_ids, _upload_type,
                         _language, _scanlator_name, _thread_count, _per_file_group_map,
                         current_browser, _verify_timeout, current_user_id, _is_group_upload,
-                        selected_group_name=_group_label, skip_verification=_skip_verification
+                        selected_group_name=_group_label, skip_verification=_skip_verification,
+                        stitch_spreads=bc.get("stitch_spreads", False),
+                        auto_volume_cover=bc.get("auto_volume_cover", False)
                     )
                     # Record successful uploads for DB history, then show summary and exit.
                     _uploaded = [f for f in _valid if f["filename"] not in _final_failed]
@@ -5577,6 +5714,13 @@ def main():
         questionary.Choice(title="Volume", value="volume"),
     ])
 
+    auto_volume_cover = False
+    if upload_type == "volume":
+        if getattr(args, "volume_cover", None) is not None:
+            auto_volume_cover = bool(args.volume_cover)
+        else:
+            auto_volume_cover = ask_confirm("Auto-set first page as volume cover?", default=True)
+
     chapter_naming = "extract"
     custom_regex   = None
     custom_renames = None
@@ -5601,6 +5745,13 @@ def main():
         meta_information=lang_meta,
     )
     _remember_setting("language", language)
+
+    if getattr(args, "stitch_spreads", None) is not None:
+        stitch_spreads = bool(args.stitch_spreads)
+    else:
+        saved_stitch = bool(saved_config.get("stitch_spreads", False))
+        stitch_spreads = ask_confirm("Stitch double-page spreads on MangaDot?", default=saved_stitch)
+    _remember_setting_force("stitch_spreads", stitch_spreads)
 
     is_group, group_ids, scanlator_name, per_file_group_map, selected_group_name, strip_bracket_groups = \
     _setup_group_config(directory, req_session, upload_type)
@@ -5640,23 +5791,30 @@ def main():
         f["_group_label"] = selected_group_name
 
     target_key = _make_target_key(manga_id, upload_type, language, group_ids, scanlator_name)
-    already_uploaded = db_uploaded_numbers(target_key)
+    already_uploaded = set(db_uploaded_numbers(target_key))
+    with console.status("[dim]Checking MangaDot for existing releases...[/dim]", spinner="dots"):
+        remote_uploaded = fetch_remote_existing_numbers(req_session, manga_id, upload_type, language)
+    already_uploaded.update(remote_uploaded)
+
     if already_uploaded:
         skip_candidates = [f for f in files if _chapter_number_key(f["number"]) in already_uploaded]
         if skip_candidates:
             console.print()
             print_info(
-                f"[cyan]{len(skip_candidates)}[/cyan] file(s) match numbers already recorded as "
-                f"uploaded to this exact target (manga/type/language/group) — from a previous run."
+                f"[cyan]{len(skip_candidates)}[/cyan] of {len(files)} file(s) match numbers already published or "
+                f"pending on MangaDot (or recorded from a previous run)."
             )
-            skip_them = ask_confirm(
-                f"Skip these {len(skip_candidates)} already-uploaded file(s)?", default=True
-            )
+            if getattr(args, "skip_existing", None) is not None:
+                skip_them = bool(args.skip_existing)
+            else:
+                skip_them = ask_confirm(
+                    f"Skip these {len(skip_candidates)} already-uploaded file(s)?", default=True
+                )
             if skip_them:
                 skip_names = {f["filename"] for f in skip_candidates}
                 files = [f for f in files if f["filename"] not in skip_names]
                 if not files:
-                    print_success("Nothing left to upload — everything in this batch was already recorded.")
+                    print_success("Nothing left to upload - everything in this batch already exists on MangaDot.")
                     sys.exit(0)
                 print_info(f"Skipped {len(skip_names)}; [bold]{len(files)}[/bold] file(s) remain to upload.")
 
@@ -5680,7 +5838,8 @@ def main():
         language, scanlator_name, thread_count, per_file_group_map, current_browser,
         verify_timeout=verify_timeout, current_user_id=current_user_id,
         is_group_upload=is_group, selected_group_name=selected_group_name,
-        skip_verification=args.skip_verification
+        skip_verification=args.skip_verification,
+        stitch_spreads=stitch_spreads, auto_volume_cover=auto_volume_cover
     )
 
     manga_url = f"{BASE_URL}/manga/{manga_id}"
