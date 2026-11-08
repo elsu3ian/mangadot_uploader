@@ -1142,3 +1142,54 @@ def fetch_my_uploads(session, manga_id=None, upload_type=None, language=None, li
             break
         page += 1
     return entries
+
+def fetch_remote_existing_numbers(session, manga_id, upload_type, language):
+    """Query MangaDot for existing chapters or volumes under this title and language.
+    Combines public published chapters and the member's moderation queue."""
+    existing_numbers = set()
+
+    # 1. Public published chapters
+    try:
+        base_url = (
+            f"{BASE_URL}/api/manga/{manga_id}/volumes"
+            if upload_type == "volume"
+            else f"{BASE_URL}/api/manga/{manga_id}/chapters/list"
+        )
+        res = session.get(
+            f"{base_url}?lang={language}",
+            headers={"Referer": f"{BASE_URL}/manga/{manga_id}"},
+            timeout=(10, 20)
+        )
+        if res.status_code == 200:
+            data = res.json()
+            items = data if isinstance(data, list) else (data.get("volumes") or data.get("chapters") or data.get("rows") or [])
+            for item in items:
+                if isinstance(item, dict):
+                    raw_num = item.get("volume_number" if upload_type == "volume" else "chapter_number")
+                    if raw_num is not None:
+                        try:
+                            f = float(raw_num)
+                            key = str(int(f)) if f.is_integer() else format(f, "g")
+                            existing_numbers.add(key)
+                        except (ValueError, TypeError):
+                            pass
+    except Exception as e:
+        logging.debug("fetch_remote_existing_numbers public check failed: %s", e)
+
+    # 2. Member's uploads (pending, processing, approved)
+    try:
+        mine_uploads = fetch_my_uploads(session, manga_id=manga_id, upload_type=upload_type, language=language, limit=100, max_pages=2)
+        for item in mine_uploads:
+            if isinstance(item, dict) and item.get("status") != "rejected":
+                raw_num = item.get("volume_number" if upload_type == "volume" else "chapter_number")
+                if raw_num is not None:
+                    try:
+                        f = float(raw_num)
+                        key = str(int(f)) if f.is_integer() else format(f, "g")
+                        existing_numbers.add(key)
+                    except (ValueError, TypeError):
+                        pass
+    except Exception as e:
+        logging.debug("fetch_remote_existing_numbers mine check failed: %s", e)
+
+    return existing_numbers

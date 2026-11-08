@@ -9,6 +9,7 @@ import time
 import math
 import random
 import logging
+import zipfile
 import threading
 import concurrent.futures
 
@@ -265,6 +266,58 @@ def build_shared_upload_session(session):
     return shared_session
 
 
+def extract_first_image_from_archive(archive_path):
+    """Extracts the first image filename and raw bytes from a cbz/zip archive using natural sort."""
+    if not os.path.isfile(archive_path) or not zipfile.is_zipfile(archive_path):
+        return None, None, None
+    try:
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            valid_exts = (".jpg", ".jpeg", ".png", ".webp")
+            names = [
+                n for n in zf.namelist()
+                if not n.startswith("__MACOSX") and not os.path.basename(n).startswith(".")
+                and n.lower().endswith(valid_exts)
+            ]
+            if not names:
+                return None, None, None
+            names.sort(key=parser_mod.natural_sort_key)
+            first_name = names[0]
+            data = zf.read(first_name)
+            ext = os.path.splitext(first_name)[1].lower()
+            mime = "image/jpeg" if ext in (".jpg", ".jpeg") else ("image/png" if ext == ".png" else "image/webp")
+            return os.path.basename(first_name), data, mime
+    except Exception as e:
+        logging.debug("extract_first_image_from_archive failed on %s: %s", archive_path, e)
+        return None, None, None
+
+
+def upload_volume_cover(session, manga_id, volume_number, archive_path):
+    """Extracts page 1 from the volume archive and uploads it as the volume cover."""
+    fname, img_bytes, mime = extract_first_image_from_archive(archive_path)
+    if not img_bytes:
+        return False, "No valid image found in volume archive"
+
+    try:
+        f = float(volume_number)
+        vn_key = str(int(f)) if f.is_integer() else format(f, "g")
+    except Exception:
+        vn_key = str(volume_number)
+
+    url = f"{BASE_URL}/api/manga/{manga_id}/volumes/{vn_key}/cover"
+    headers = {
+        "Origin": BASE_URL,
+        "Referer": f"{BASE_URL}/manga/{manga_id}/upload",
+    }
+    files = {"file": (fname, img_bytes, mime)}
+    try:
+        res = session.post(url, files=files, headers=headers, timeout=(15, 45))
+        if res.status_code == 200:
+            return True, None
+        return False, f"HTTP {res.status_code}: {res.text[:120]}"
+    except Exception as e:
+        return False, str(e)
+
+
 class _NoOpProgress:
     def __call__(self, filename, status, fraction, **kwargs):
         pass
@@ -276,7 +329,8 @@ def upload_file_tus(session, file_info, manga_id, group_ids,
                      is_group_upload=False, has_file_specific_group=True,
                      upload_session=None, progress_callback=None,
                      pause_event=None, resume_hint=None, file_control=None,
-                     skip_verification=True, thread_count=None):
+                     skip_verification=True, thread_count=None,
+                     stitch_spreads=False):
     """pause_event: an optional threading.Event, checked at the same
     chunk-boundary points as abort_event (never mid-PATCH-request - a
     chunk that's already in flight always finishes or fails on its own
@@ -380,6 +434,8 @@ def upload_file_tus(session, file_info, manga_id, group_ids,
                 tus_metadata["chapter_title"] = str(raw_title).strip()
             if scanlator_name:
                 tus_metadata["scanlator_name"] = scanlator_name
+            if stitch_spreads:
+                tus_metadata["stitch_spreads"] = "1"
 
             encoded_metadata = parser_mod.encode_tus_metadata(tus_metadata)
             headers = {
@@ -754,7 +810,8 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                      per_file_scanlator_map=None, abort_event=None,
                      pause_event=None, on_file_paused=None, resume_hints=None,
                      file_controls=None, on_file_cancelled=None,
-                     per_file_language_map=None, skip_verification=True):
+                     per_file_language_map=None, skip_verification=True,
+                     stitch_spreads=False, auto_volume_cover=False):
     """abort_event: an optional threading.Event the caller keeps a
     reference to. If provided, setting it from another thread (e.g. a
     GUI's "cancel"/"stop background work" handler) will interrupt this
@@ -1002,7 +1059,8 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                             is_group_upload, has_file_specific_group,
                             shared_upload_session, progress_callback,
                             pause_event, resume_hint, fc,
-                            skip_verification, thread_count
+                            skip_verification, thread_count,
+                            stitch_spreads
                         )
                         futures[future] = f
 
@@ -1022,6 +1080,14 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                             chunk_had_success = True
                             if result.get('warning'):
                                 on_batch_event("file_warning", filename=f_info['filename'], warning=result['warning'])
+                            if upload_type == "volume" and auto_volume_cover:
+                                cover_ok, cover_err = upload_volume_cover(
+                                    req_session, manga_id, f_info.get("number"), f_info["filepath"]
+                                )
+                                if cover_ok:
+                                    on_batch_event("volume_cover_set", filename=f_info['filename'], volume=f_info.get('number'))
+                                else:
+                                    logging.debug("Auto volume cover failed for Vol. %s: %s", f_info.get("number"), cover_err)
                         else:
                             # A per-file cancel (as opposed to a genuine
                             # upload failure) surfaces here as an
@@ -1256,6 +1322,8 @@ def resume_paused_upload(paused_state, req_session, progress_callback=None,
         file_controls=file_controls,
         on_file_cancelled=on_file_cancelled,
         skip_verification=batch_config.get("skip_verification", True),
+        stitch_spreads=batch_config.get("stitch_spreads", False),
+        auto_volume_cover=batch_config.get("auto_volume_cover", False),
     )
 
 

@@ -1,17 +1,21 @@
 """Title review/editing screen."""
+import threading
+import logging
+import shiboken6
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget,
     QTableWidgetItem, QMenu, QDialog, QDialogButtonBox, QLineEdit,
     QListWidget, QListWidgetItem, QMessageBox, QAbstractItemView,
     QInputDialog, QStyledItemDelegate, QHeaderView, QSizePolicy, QComboBox,
-    QFrame, QScrollArea
+    QFrame, QScrollArea, QCheckBox
 )
 from PySide6.QtGui import QColor, QAction, QFont
 from .widgets import Card, heading, section_label, hint_label, make_flat, GlassBox, make_flat_link, DialogSafeLineEdit, attach_combo_dots_overlay, GroupPillWidget
 from .. import parser as parser_mod
 from .. import util
 from .. import config as config_mod
+from .. import net
 from . import theme
 from .theme import Color
 from . import thread_is_running, workers
@@ -610,7 +614,7 @@ class TitleReviewScreen(QWidget):
     review_finished = Signal(list)
     back_requested = Signal()
 
-    def __init__(self, files, upload_type="chapter", group_label=None, session=None, parent=None, preview_only=False):
+    def __init__(self, files, upload_type="chapter", group_label=None, session=None, parent=None, preview_only=False, manga_id=None, language=None):
         """preview_only=True renders the same table/warnings but hides all
         editing tools and swaps the footer for a single 'Done' action that
         doesn't carry the files anywhere further — used by dry-run mode.
@@ -625,13 +629,76 @@ class TitleReviewScreen(QWidget):
         self.group_label = group_label
         self.session = session
         self.preview_only = preview_only
+        self.manga_id = manga_id
+        self.language = language
         self._build_ui()
         self._populate_table()
         self._apply_initial_column_widths()
 
         if not self.preview_only:
             self._restore_column_order()
+            self._start_remote_existing_check()
 
+        self._refresh_warnings()
+
+    @property
+    def stitch_spreads(self):
+        if hasattr(self, "stitch_spreads_check"):
+            return self.stitch_spreads_check.isChecked()
+        return False
+
+    @property
+    def auto_volume_cover(self):
+        if hasattr(self, "auto_volume_cover_check") and self.upload_type == "volume":
+            return self.auto_volume_cover_check.isChecked()
+        return False
+
+    def _start_remote_existing_check(self):
+        if not self.session or not self.manga_id or self.preview_only:
+            return
+
+        def _worker():
+            try:
+                remote_numbers = net.fetch_remote_existing_numbers(
+                    self.session, self.manga_id, self.upload_type, self.language
+                )
+                if not remote_numbers or not shiboken6.isValid(self):
+                    return
+                QTimer.singleShot(0, lambda: self._apply_remote_existing(remote_numbers))
+            except Exception as e:
+                logging.debug("_start_remote_existing_check error: %s", e)
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+
+    def _apply_remote_existing(self, remote_numbers):
+        if not shiboken6.isValid(self):
+            return
+        found_count = 0
+        for f in self.files:
+            try:
+                num = float(f.get("number", -1))
+                key = str(int(num)) if num.is_integer() else format(num, "g")
+                if key in remote_numbers:
+                    f["already_on_site"] = True
+                    found_count += 1
+            except Exception:
+                pass
+        if found_count > 0:
+            self._populate_table()
+            if hasattr(self, "skip_existing_button"):
+                self.skip_existing_button.setText(f"Skip {found_count} file(s) already on MangaDot")
+                self.skip_existing_button.setVisible(True)
+
+    def _on_skip_existing_clicked(self):
+        targets = [f for f in self.files if f.get("already_on_site")]
+        if not targets:
+            return
+        target_ids = {id(t) for t in targets}
+        self.files = [f for f in self.files if id(f) not in target_ids]
+        if hasattr(self, "skip_existing_button"):
+            self.skip_existing_button.setVisible(False)
+        self._populate_table()
         self._refresh_warnings()
 
     def _build_ui(self):
@@ -725,6 +792,50 @@ class TitleReviewScreen(QWidget):
             self.table.customContextMenuRequested.connect(self._on_context_menu)
 
         outer.addWidget(self.table, 1)
+
+        options_row = QHBoxLayout()
+        options_row.setSpacing(16)
+
+        if not self.preview_only:
+            self.stitch_spreads_check = QCheckBox("Stitch double-page spreads")
+            self.stitch_spreads_check.setCursor(Qt.PointingHandCursor)
+            saved_stitch = bool(config_mod.load_config().get("stitch_spreads", False))
+            self.stitch_spreads_check.setChecked(saved_stitch)
+            self.stitch_spreads_check.toggled.connect(lambda v: config_mod.remember_setting_force("stitch_spreads", bool(v)))
+            options_row.addWidget(self.stitch_spreads_check)
+
+            self.auto_volume_cover_check = QCheckBox("Auto-set first page as volume cover")
+            self.auto_volume_cover_check.setCursor(Qt.PointingHandCursor)
+            self.auto_volume_cover_check.setChecked(True)
+            if self.upload_type != "volume":
+                self.auto_volume_cover_check.setVisible(False)
+            options_row.addWidget(self.auto_volume_cover_check)
+
+            options_row.addStretch(1)
+
+            self.skip_existing_button = QPushButton("Skip files already on MangaDot")
+            self.skip_existing_button.setCursor(Qt.PointingHandCursor)
+            self.skip_existing_button.setAutoDefault(False)
+            self.skip_existing_button.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: rgba(251, 191, 36, 18);
+                    color: {Color.WARNING};
+                    border: 1px solid {Color.WARNING};
+                    border-radius: {theme.RADIUS_SM}px;
+                    padding: 5px 14px;
+                    font-weight: 600;
+                }}
+                QPushButton:hover {{
+                    background-color: rgba(251, 191, 36, 35);
+                }}
+            """)
+            self.skip_existing_button.setVisible(False)
+            self.skip_existing_button.clicked.connect(self._on_skip_existing_clicked)
+            options_row.addWidget(self.skip_existing_button)
+        else:
+            options_row.addStretch(1)
+
+        outer.addLayout(options_row)
 
         bottom_row = QHBoxLayout()
         if not self.preview_only:
@@ -835,9 +946,14 @@ class TitleReviewScreen(QWidget):
             mono.setStyleHint(QFont.Monospace)
 
             for row, f in enumerate(self.files):
-                filename_item = QTableWidgetItem(f["filename"])
+                display_name = f"[On MangaDot] {f['filename']}" if f.get("already_on_site") else f["filename"]
+                filename_item = QTableWidgetItem(display_name)
                 filename_item.setFlags(filename_item.flags() & ~Qt.ItemIsEditable)
-                filename_item.setForeground(QColor(Color.TEXT_SECONDARY))
+                if f.get("already_on_site"):
+                    filename_item.setForeground(QColor(Color.WARNING))
+                    filename_item.setToolTip("This chapter or volume is already published or pending on MangaDot.")
+                else:
+                    filename_item.setForeground(QColor(Color.TEXT_SECONDARY))
                 self.table.setItem(row, COL_FILENAME, filename_item)
 
                 number_item = QTableWidgetItem(parser_mod.fmt_num(f["number"]))

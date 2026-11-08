@@ -124,7 +124,7 @@ class _UploadWorker(workers.AbortableWorker):
                  language, scanlator_name, thread_count, per_file_group_map,
                  verify_timeout, current_user_id, is_group_upload, per_file_scanlator_map,
                  resume_paused_state=None, only_filenames=None, per_file_language_map=None,
-                 skip_verification=True):
+                 skip_verification=True, stitch_spreads=False, auto_volume_cover=False):
         super().__init__()
         self.files = files
         self.session = session
@@ -138,6 +138,8 @@ class _UploadWorker(workers.AbortableWorker):
         self.verify_timeout = verify_timeout
         self.current_user_id = current_user_id
         self.is_group_upload = is_group_upload
+        self.stitch_spreads = stitch_spreads
+        self.auto_volume_cover = auto_volume_cover
         self.per_file_scanlator_map = per_file_scanlator_map
         # When True, uploaded files skip the post-upload verification
         # poll entirely (see uploader.upload_file_tus) and are marked
@@ -262,6 +264,8 @@ class _UploadWorker(workers.AbortableWorker):
                     on_file_cancelled=file_cancelled_cb,
                     per_file_language_map=self.per_file_language_map,
                     skip_verification=self.skip_verification,
+                    stitch_spreads=self.stitch_spreads,
+                    auto_volume_cover=self.auto_volume_cover,
                 )
                 logging.debug("_UploadWorker.run(): process_uploads RETURNED failed=%s session_expired=%s", failed, session_expired)
         except uploader.SessionExpiredError:
@@ -300,7 +304,8 @@ class UploadProgressScreen(QWidget):
                  verify_timeout=uploader.MAX_VERIFY_SECONDS, current_user_id=None,
                  is_group_upload=None, per_file_scanlator_map=None,
                  resume_paused_state=None, already_done_files=None, manga_title=None, parent=None,
-                 per_file_language_map=None, skip_verification=True):
+                 per_file_language_map=None, skip_verification=True,
+                 stitch_spreads=False, auto_volume_cover=False):
         super().__init__(parent)
         self.all_files = files
         self.session = session
@@ -317,6 +322,8 @@ class UploadProgressScreen(QWidget):
         self.is_group_upload = is_group_upload
         self.per_file_scanlator_map = per_file_scanlator_map or {}
         self.per_file_language_map = per_file_language_map or {}
+        self.stitch_spreads = stitch_spreads
+        self.auto_volume_cover = auto_volume_cover
         # See _UploadWorker.skip_verification / uploader.upload_file_tus -
         # when True, uploaded files bypass the post-upload verification
         # poll entirely and are marked done as soon as the transfer
@@ -1070,6 +1077,8 @@ class UploadProgressScreen(QWidget):
             only_filenames=only_filenames,
             per_file_language_map=self.per_file_language_map,
             skip_verification=self.skip_verification,
+            stitch_spreads=self.stitch_spreads,
+            auto_volume_cover=self.auto_volume_cover,
         )
         self.resume_paused_state = None  # one-shot: only the first _start_upload() call resumes
         self._worker.moveToThread(self._thread)
@@ -1988,6 +1997,8 @@ class UploadProgressScreen(QWidget):
             "current_user_id": self.current_user_id,
             "is_group_upload": self.is_group_upload,
             "skip_verification": self.skip_verification,
+            "stitch_spreads": getattr(self, "stitch_spreads", False),
+            "auto_volume_cover": getattr(self, "auto_volume_cover", False),
         }
 
     def _not_yet_reported_files(self):

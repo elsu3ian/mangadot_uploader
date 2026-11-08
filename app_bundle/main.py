@@ -204,6 +204,7 @@ class MainWindow(QMainWindow):
         self._last_per_file_scanlator_map = {}
         self._last_per_file_language_map = {}
         self._manga_title = None
+        self._manga_id = None
         # Populated by the mixed-language popup in _scan_and_pick_subset
         # when the user chooses "Use detected languages" - maps
         # norm_filepath -> detected language code for files that got a
@@ -890,7 +891,7 @@ class MainWindow(QMainWindow):
 
         self.title_review_screen = TitleReviewScreen(
             files, upload_type=self._upload_type, group_label=self._group_label, session=self.session,
-            preview_only=self._is_dry_run
+            preview_only=self._is_dry_run, manga_id=self._manga_id, language=self._lang
         )
         self.title_review_screen.review_finished.connect(self._on_review_finished)
         self.title_review_screen.back_requested.connect(self._back_to_subset_or_group)
@@ -918,6 +919,9 @@ class MainWindow(QMainWindow):
         self._last_per_file_scanlator_map = per_file_scanlator_map
         self._last_per_file_language_map = per_file_language_map
 
+        stitch_spreads = getattr(self.title_review_screen, "stitch_spreads", False)
+        auto_volume_cover = getattr(self.title_review_screen, "auto_volume_cover", False)
+
         self.upload_progress_screen = UploadProgressScreen(
             files, self.session, self._manga_id, gc.get("group_ids") or [], self._upload_type,
             self._lang, gc.get("scanlator_name"), self._threads,
@@ -929,6 +933,8 @@ class MainWindow(QMainWindow):
             per_file_language_map=per_file_language_map,
             manga_title=self._manga_title,
             skip_verification=self._skip_verification,
+            stitch_spreads=stitch_spreads,
+            auto_volume_cover=auto_volume_cover,
         )
         self.upload_progress_screen.upload_finished.connect(self._on_upload_finished)
         self.upload_progress_screen.back_requested.connect(self._on_upload_back_requested)
