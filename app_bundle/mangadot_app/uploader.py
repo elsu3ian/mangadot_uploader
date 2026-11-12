@@ -15,6 +15,7 @@ import concurrent.futures
 
 import requests
 from requests.adapters import HTTPAdapter
+from urllib.parse import urljoin
 
 from . import parser as parser_mod
 from . import util
@@ -318,6 +319,57 @@ def upload_volume_cover(session, manga_id, volume_number, archive_path):
         return False, str(e)
 
 
+def _init_batch(req_session, init_payload, abort_event):
+    """POST batch/init with retries on 429/5xx/network errors. It used to
+    fail the whole chunk (up to 100 files) on a single rate-limit response -
+    and a 429 is most likely right here, because the previous chunk's
+    background /complete call fires at the same moment.
+    Returns (batch_id, None) or (None, error_text); raises SessionExpiredError."""
+    last_err = "unknown error"
+    for attempt in range(MAX_RETRIES):
+        try:
+            res = req_session.post(BATCH_INIT_ENDPOINT, json=init_payload, timeout=(10, 30))
+            if res.status_code in (401, 403):
+                raise SessionExpiredError()
+            if res.status_code in RETRYABLE_STATUSES and attempt < MAX_RETRIES - 1:
+                last_err = f"HTTP {res.status_code}"
+                if not _interruptible_sleep(_compute_retry_delay(res, attempt), abort_event):
+                    return None, "Aborted"
+                continue
+            res.raise_for_status()
+            batch_data = res.json()
+            batch_id = batch_data.get("batch_id")
+            if not batch_id and isinstance(batch_data.get("data"), dict):
+                batch_id = batch_data["data"].get("batch_id")
+            if not batch_id:
+                raise BatchInitError(f"Missing batch_id in response: {str(batch_data)[:200]}")
+            return batch_id, None
+        except SessionExpiredError:
+            raise
+        except (requests.exceptions.RequestException, json.JSONDecodeError, BatchInitError, KeyError, AttributeError) as e:
+            last_err = str(e)
+            if attempt < MAX_RETRIES - 1 and not isinstance(e, BatchInitError):
+                if not _interruptible_sleep(_compute_retry_delay(None, attempt), abort_event):
+                    return None, "Aborted"
+                continue
+            break
+    return None, last_err
+
+
+def _upload_volume_cover_with_retry(req_session, manga_id, f_info, attempts=3, delay=5.0):
+    """The volume may not exist server-side the instant its archive finishes
+    uploading (processing is asynchronous), so retry a 404 a few times."""
+    err = None
+    for attempt in range(attempts):
+        ok, err = upload_volume_cover(req_session, manga_id, f_info.get("number"), f_info["filepath"])
+        if ok:
+            return True, None
+        if not (err and err.startswith("HTTP 404")) or attempt == attempts - 1:
+            break
+        time.sleep(delay)
+    return False, err
+
+
 class _NoOpProgress:
     def __call__(self, filename, status, fraction, **kwargs):
         pass
@@ -330,8 +382,14 @@ def upload_file_tus(session, file_info, manga_id, group_ids,
                      upload_session=None, progress_callback=None,
                      pause_event=None, resume_hint=None, file_control=None,
                      skip_verification=True, thread_count=None,
-                     stitch_spreads=False):
-    """pause_event: an optional threading.Event, checked at the same
+                     stitch_spreads=False, on_offset=None):
+    """on_offset: optional on_offset(file_info, upload_location, offset),
+    called each time the server confirms a new offset (right after the
+    TUS upload is created, and after every chunk). The progress screen
+    persists it so a crash or killed app can still resume byte-exact,
+    not only an explicit Pause.
+
+    pause_event: an optional threading.Event, checked at the same
     chunk-boundary points as abort_event (never mid-PATCH-request - a
     chunk that's already in flight always finishes or fails on its own
     terms before a pause takes effect, so the server never sees a
@@ -460,6 +518,8 @@ def upload_file_tus(session, file_info, manga_id, group_ids,
                     res.raise_for_status()
                     upload_location = res.headers.get("Location")
                     if not upload_location: raise ValueError("No Location header in TUS response")
+                    # TUS allows a relative Location; resolve it against the endpoint.
+                    upload_location = urljoin(TUS_ENDPOINT, upload_location)
                     break
                 except SessionExpiredError: raise
                 except (requests.exceptions.RequestException, ValueError) as e:
@@ -471,6 +531,8 @@ def upload_file_tus(session, file_info, manga_id, group_ids,
 
             offset = size if already_exists else 0
             start_time = time.time()
+            if upload_location and on_offset:
+                on_offset(file_info, upload_location, 0)
 
         # Speed/ETA must be computed from bytes moved DURING THIS RUN,
         # not from `offset` itself - offset already includes bytes
@@ -546,6 +608,8 @@ def upload_file_tus(session, file_info, manga_id, group_ids,
                                     if actual_off is None:
                                         return {"key": filename, "success": False, "error": "Server dropped offset and HEAD failed"}
                                     offset = actual_off
+                                if on_offset:
+                                    on_offset(file_info, upload_location, offset)
                                 chunk_done = True
                                 break
                             elif patch_res.status_code in FATAL_SIZE_STATUSES:
@@ -586,6 +650,8 @@ def upload_file_tus(session, file_info, manga_id, group_ids,
                                     break
                             else: return {"key": filename, "success": False, "error": f"Network Err: {str(e)[:30]}"}
                     if resynced:
+                        if on_offset:
+                            on_offset(file_info, upload_location, offset)
                         continue
                     if not chunk_done: return {"key": filename, "success": False, "error": "Chunk upload failed"}
         except SessionExpiredError: raise
@@ -609,6 +675,7 @@ def upload_file_tus(session, file_info, manga_id, group_ids,
             return {
                 "key": filename,
                 "success": True,
+                "already_exists": already_exists,
                 "warning": None if already_exists else "Uploaded without verification: verification was skipped by user setting.",
             }
 
@@ -619,11 +686,12 @@ def upload_file_tus(session, file_info, manga_id, group_ids,
                 return {
                     "key": filename,
                     "success": True,
+                    "already_exists": already_exists,
                     "warning": "Uploaded without attribution verification: no resolved group/scanlator for this file."
                 }
             label = "✅ Already Exists" if already_exists else "✅ Uploaded"
             progress_callback(filename, label, 1.0, current=size, total=size, speed=0.0, eta=0.0)
-            return {"key": filename, "success": True}
+            return {"key": filename, "success": True, "already_exists": already_exists}
 
         last_reported_elapsed = -RETRY_DELAY  # force an immediate first report
         while not found:
@@ -658,6 +726,7 @@ def upload_file_tus(session, file_info, manga_id, group_ids,
                 return {
                     "key": filename,
                     "success": True,
+                    "already_exists": already_exists,
                     "warning": None if already_exists else "Upload completed via TUS; awaiting server indexing in /api/uploads/mine."
                 }
 
@@ -796,7 +865,7 @@ def upload_file_tus(session, file_info, manga_id, group_ids,
         else:
             label = "✅ Uploaded"
         progress_callback(filename, label, 1.0, current=size, total=size, speed=0.0, eta=0.0)
-        return {"key": filename, "success": True}
+        return {"key": filename, "success": True, "already_exists": already_exists}
     finally:
         if owns_session:
             worker_session.close()
@@ -811,8 +880,12 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                      pause_event=None, on_file_paused=None, resume_hints=None,
                      file_controls=None, on_file_cancelled=None,
                      per_file_language_map=None, skip_verification=True,
-                     stitch_spreads=False, auto_volume_cover=False):
-    """abort_event: an optional threading.Event the caller keeps a
+                     stitch_spreads=False, auto_volume_cover=False,
+                     on_file_offset=None):
+    """on_file_offset: optional on_file_offset(file_info, upload_location,
+    offset), passed to upload_file_tus as on_offset - see there.
+
+    abort_event: an optional threading.Event the caller keeps a
     reference to. If provided, setting it from another thread (e.g. a
     GUI's "cancel"/"stop background work" handler) will interrupt this
     batch at the next retry/chunk/verify-poll boundary - the same
@@ -971,25 +1044,19 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                         chunk_group_ids.update(f_groups)
                 init_payload = {"manga_id": manga_id, "language": language, "group_ids": list(chunk_group_ids),
                                  "type": upload_type, "scanlator_name": scanlator_name, "chapters": chapters_payload}
-                batch_id = None
                 try:
-                    res = req_session.post(BATCH_INIT_ENDPOINT, json=init_payload, timeout=(10, 30))
-                    if res.status_code in (401, 403):
-                        session_expired = True
-                        abort_event.set()
-                        on_batch_event("session_expired")
-                        for f in chunk:
-                            mark_failed(f["filename"], "Paused — authentication expired", "⏸️ Paused (Auth)")
-                        continue
-                    res.raise_for_status()
-                    batch_data = res.json()
-                    batch_id = batch_data.get("batch_id")
-                    if not batch_id and not batch_data.get("success"):
-                        raise BatchInitError(str(batch_data)[:200])
-                except (requests.exceptions.RequestException, json.JSONDecodeError, BatchInitError, KeyError) as e:
-                    on_batch_event("batch_init_failed", error=str(e)[:80])
+                    batch_id, init_err = _init_batch(req_session, init_payload, abort_event)
+                except SessionExpiredError:
+                    session_expired = True
+                    abort_event.set()
+                    on_batch_event("session_expired")
                     for f in chunk:
-                        mark_failed(f["filename"], f"Batch init failed: {str(e)[:80]}", "❌ Batch Init Failed")
+                        mark_failed(f["filename"], "Paused — authentication expired", "⏸️ Paused (Auth)")
+                    continue
+                if not batch_id:
+                    on_batch_event("batch_init_failed", error=str(init_err)[:80])
+                    for f in chunk:
+                        mark_failed(f["filename"], f"Batch init failed: {str(init_err)[:80]}", "❌ Batch Init Failed")
                     continue
 
                 # Sliding-window submission instead of "submit the whole
@@ -1010,6 +1077,7 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                 pending = list(chunk)
                 futures = {}
                 chunk_had_success = False
+                covers_to_set = []
 
                 def _submit_next():
                     """Pops and submits files from `pending` until either
@@ -1060,7 +1128,7 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                             shared_upload_session, progress_callback,
                             pause_event, resume_hint, fc,
                             skip_verification, thread_count,
-                            stitch_spreads
+                            stitch_spreads, on_offset=on_file_offset,
                         )
                         futures[future] = f
 
@@ -1080,14 +1148,10 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                             chunk_had_success = True
                             if result.get('warning'):
                                 on_batch_event("file_warning", filename=f_info['filename'], warning=result['warning'])
-                            if upload_type == "volume" and auto_volume_cover:
-                                cover_ok, cover_err = upload_volume_cover(
-                                    req_session, manga_id, f_info.get("number"), f_info["filepath"]
-                                )
-                                if cover_ok:
-                                    on_batch_event("volume_cover_set", filename=f_info['filename'], volume=f_info.get('number'))
-                                else:
-                                    logging.debug("Auto volume cover failed for Vol. %s: %s", f_info.get("number"), cover_err)
+                            if upload_type == "volume" and auto_volume_cover and not result.get("already_exists"):
+                                # Done after the chunk's uploads finish (not here, which
+                                # would stall result handling for up to ~45s per cover).
+                                covers_to_set.append(f_info)
                         else:
                             # A per-file cancel (as opposed to a genuine
                             # upload failure) surfaces here as an
@@ -1128,6 +1192,15 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                     for f in futures:
                         f.cancel()
                     raise
+
+                for f_info in covers_to_set:
+                    cover_ok, cover_err = _upload_volume_cover_with_retry(req_session, manga_id, f_info)
+                    if cover_ok:
+                        on_batch_event("volume_cover_set", filename=f_info['filename'], volume=f_info.get('number'))
+                    else:
+                        logging.warning("Auto volume cover failed for Vol. %s: %s", f_info.get("number"), cover_err)
+                        on_batch_event("volume_cover_failed", filename=f_info['filename'],
+                                       volume=f_info.get('number'), error=cover_err)
 
                 if batch_id and not session_expired and chunk_had_success:
                     def _send_complete_worker(b_id, cookies_snap, headers_snap, proxies_snap, verify_opt, a_event, ev_cb):
@@ -1191,7 +1264,7 @@ def resume_paused_upload(paused_state, req_session, progress_callback=None,
                           on_batch_event=None, abort_event=None,
                           pause_event=None, on_file_paused=None,
                           file_controls=None, on_file_cancelled=None,
-                          only_filenames=None):
+                          only_filenames=None, on_file_offset=None):
     """Resumes a previously-paused upload batch from persisted state
     (see config.load_paused_upload()/save_paused_upload()).
 
@@ -1315,6 +1388,10 @@ def resume_paused_upload(paused_state, req_session, progress_callback=None,
         progress_callback=progress_callback,
         on_batch_event=on_batch_event,
         per_file_scanlator_map=batch_config.get("per_file_scanlator_map"),
+        # Was missing: a resumed batch silently uploaded every file in the
+        # batch-wide language, dropping per-file language choices.
+        per_file_language_map=batch_config.get("per_file_language_map"),
+        on_file_offset=on_file_offset,
         abort_event=abort_event,
         pause_event=pause_event,
         on_file_paused=on_file_paused,

@@ -58,6 +58,10 @@ _PROGRESS_DRAIN_MAX_PER_TICK = 20
 _RELAYOUT_DEBOUNCE_MS = 120
 
 
+# How often the running batch's resume state is written to disk.
+_AUTOSAVE_INTERVAL_MS = 5000
+
+
 def _status_kind(status: str) -> str:
     if status.startswith("\u2705"):
         return "success"
@@ -118,6 +122,9 @@ class _UploadWorker(workers.AbortableWorker):
     batch_event = Signal(str, dict)
     file_paused = Signal(dict, object, int, bool)
     file_cancelled = Signal(dict)
+    # (file_info, upload_location, offset) - offset is `object`, not int:
+    # Qt's int is 32-bit and archives can exceed 2 GB.
+    file_offset = Signal(dict, str, object)
     finished = Signal(list, bool, dict)
 
     def __init__(self, files, session, manga_id, group_ids, upload_type,
@@ -219,6 +226,9 @@ class _UploadWorker(workers.AbortableWorker):
         def file_cancelled_cb(file_info):
             self.file_cancelled.emit(file_info)
 
+        def file_offset_cb(file_info, upload_location, offset):
+            self.file_offset.emit(file_info, upload_location or "", offset)
+
         # Every path below MUST reach self.finished.emit(...) no matter
         # what - a row's status (e.g. "Resuming...") is only ever
         # updated in response to a signal from this worker, so if this
@@ -243,6 +253,7 @@ class _UploadWorker(workers.AbortableWorker):
                     file_controls=self.file_controls,
                     on_file_cancelled=file_cancelled_cb,
                     only_filenames=self.only_filenames,
+                    on_file_offset=file_offset_cb,
                 )
                 logging.debug("_UploadWorker.run(): resume_paused_upload RETURNED failed=%s session_expired=%s", failed, session_expired)
             else:
@@ -266,6 +277,7 @@ class _UploadWorker(workers.AbortableWorker):
                     skip_verification=self.skip_verification,
                     stitch_spreads=self.stitch_spreads,
                     auto_volume_cover=self.auto_volume_cover,
+                    on_file_offset=file_offset_cb,
                 )
                 logging.debug("_UploadWorker.run(): process_uploads RETURNED failed=%s session_expired=%s", failed, session_expired)
         except uploader.SessionExpiredError:
@@ -355,6 +367,15 @@ class UploadProgressScreen(QWidget):
         self._is_paused_state = False  # True once _handle_paused fires; drives the pause/resume icon toggle
         self._last_clicked_row = None  # anchor row for right-click "Select range to here"
         self._inline_resume_threads = set()  # keeps per-row resume QThreads alive; see _on_resume_one_clicked
+        # Continuous saving: filename -> {"upload_location", "offset"} for the
+        # last offset the server confirmed, so the on-disk resume state is
+        # kept current WHILE uploading - not only when Pause is pressed. A
+        # crash, a killed process or a power cut can then still resume
+        # byte-exact. See _autosave_running_state().
+        self._live_hints = {}
+        self._cancelled_filenames = set()
+        self._upload_running = False
+        self._autosaved = False
 
         # filename -> wall-clock time.time() the row's current verify
         # attempt began, used by _tick_verifying_timers to render a
@@ -395,6 +416,11 @@ class UploadProgressScreen(QWidget):
 
         self._build_ui()
         self._start_upload(self.all_files, already_done_files=already_done_files)
+
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(_AUTOSAVE_INTERVAL_MS)
+        self._autosave_timer.timeout.connect(self._autosave_running_state)
+        self._autosave_timer.start()
 
         self._verify_timer = QTimer(self)
         self._verify_timer.setInterval(1000)
@@ -459,6 +485,12 @@ class UploadProgressScreen(QWidget):
             already_done_files=paused_state.get("completed_files"),
             manga_title=bc.get("manga_title"),
             skip_verification=bc.get("skip_verification", True),
+            # These were dropped before: a resumed screen then retried or
+            # re-logged-in with spread stitching / auto volume covers off and
+            # every file in the batch-wide language.
+            per_file_language_map=bc.get("per_file_language_map"),
+            stitch_spreads=bc.get("stitch_spreads", False),
+            auto_volume_cover=bc.get("auto_volume_cover", False),
             parent=parent,
         )
 
@@ -1068,6 +1100,17 @@ class UploadProgressScreen(QWidget):
         self.status_label.setText(f"Uploading {len(files_to_upload)} file(s)\u2026")
         self._upload_start = time.time()
 
+        if self.resume_paused_state is not None:
+            # Seed from the saved state so the first autosave below can't
+            # overwrite saved offsets with zeros before the worker reports in.
+            for f in self.resume_paused_state.get("files") or []:
+                if f.get("upload_location") or f.get("fully_uploaded"):
+                    self._live_hints[f["filename"]] = {
+                        "upload_location": f.get("upload_location"),
+                        "offset": int(f.get("offset") or 0),
+                        "fully_uploaded": bool(f.get("fully_uploaded")),
+                    }
+
         self._thread = QThread()
         self._worker = _UploadWorker(
             files_to_upload, self.session, self.manga_id, self.group_ids, self.upload_type,
@@ -1088,12 +1131,17 @@ class UploadProgressScreen(QWidget):
         self._worker.batch_event.connect(self._on_batch_event)
         self._worker.file_paused.connect(self._on_file_paused)
         self._worker.file_cancelled.connect(self._on_file_cancelled)
+        self._worker.file_offset.connect(self._on_file_offset)
         self._worker.finished.connect(self._on_upload_finished)
         self._worker.finished.connect(self._thread.quit)
         self._worker.finished.connect(self._worker.deleteLater)
         self._thread.finished.connect(self._thread.deleteLater)
 
+        self._upload_running = True
         self._thread.start()
+        # Saved from the very first moment, so even a crash before the first
+        # chunk finishes leaves something to resume.
+        self._autosave_running_state()
 
     def _queue_file_progress(self, filename, status, fraction, speed_str="", eta_str="",
                               current=None, total=None):
@@ -1519,8 +1567,16 @@ class UploadProgressScreen(QWidget):
             )
         elif event == "file_warning":
             self.status_label.setText(f"{kwargs.get('filename')}: {kwargs.get('warning')}")
+        elif event == "volume_cover_failed":
+            self.status_label.setText(
+                f"Couldn't auto-set the cover for Vol. {kwargs.get('volume')} "
+                f"({kwargs.get('error')}). You can set it on the manga page instead."
+            )
 
     def _on_upload_finished(self, failed, session_expired, reasons):
+        # Stop continuous saving before anything below decides whether to
+        # keep or clear the saved state (a late autosave would undo a clear).
+        self._upload_running = False
         # Flush any progress updates still buffered by
         # _queue_file_progress() - the worker's `finished` signal is
         # itself queued the same way as file_progress, so by the time
@@ -1554,14 +1610,18 @@ class UploadProgressScreen(QWidget):
             return
 
         if self._cancel_requested:
-            if self._was_resuming:
+            if self._was_resuming or self._autosaved:
                 config_mod.clear_paused_upload()
             self._handle_cancelled(failed)
             return
 
         if session_expired:
-            if self._was_resuming:
+            # Keep the saved state now: it holds each file's confirmed offset,
+            # so closing the app here (or re-logging in) resumes byte-exact.
+            if self._was_resuming and not self._autosaved:
                 config_mod.clear_paused_upload()
+            else:
+                self._persist_paused_state()
             self.overall_progress.setProperty("state", "danger")
             self.overall_progress.style().unpolish(self.overall_progress)
             self.overall_progress.style().polish(self.overall_progress)
@@ -1570,7 +1630,7 @@ class UploadProgressScreen(QWidget):
 
         elapsed = time.time() - self._upload_start
         if not failed:
-            if self._was_resuming:
+            if self._was_resuming or self._autosaved:
                 config_mod.clear_paused_upload()
             self.status_label.setText("\u2705 All files were processed successfully!")
             self.status_label.setProperty("role", "success")
@@ -1695,6 +1755,7 @@ class UploadProgressScreen(QWidget):
         failed_set = set(self._last_failed)
         remaining = [f for f in self.all_files if f["filename"] in failed_set]
         self.status_label.setText(f"Resuming upload for {len(remaining)} paused chapter(s)\u2026")
+        self.resume_paused_state = self._resume_state_for(remaining)
         self._start_upload(remaining)
 
     def _offer_retry(self, failed, reasons, elapsed):
@@ -1713,9 +1774,10 @@ class UploadProgressScreen(QWidget):
             failed_set = set(failed)
             remaining = [f for f in self.all_files if f["filename"] in failed_set]
             self.status_label.setText(f"Retrying {len(remaining)} failed chapter(s)\u2026")
+            self.resume_paused_state = self._resume_state_for(remaining)
             self._start_upload(remaining)
         else:
-            if self._was_resuming:
+            if self._was_resuming or self._autosaved:
                 config_mod.clear_paused_upload()
             self.status_label.setText(f"{len(failed)} file(s) left unresolved.")
             self.done_button.setEnabled(True)
@@ -1993,6 +2055,7 @@ class UploadProgressScreen(QWidget):
             "thread_count": self.thread_count,
             "per_file_group_map": self.per_file_group_map,
             "per_file_scanlator_map": self.per_file_scanlator_map,
+            "per_file_language_map": self.per_file_language_map,
             "verify_timeout": self.verify_timeout,
             "current_user_id": self.current_user_id,
             "is_group_upload": self.is_group_upload,
@@ -2016,12 +2079,56 @@ class UploadProgressScreen(QWidget):
         for f in self.all_files:
             if f["filename"] in succeeded_filenames or f["filename"] in paused_filenames:
                 continue
+            if f["filename"] in self._cancelled_filenames:
+                continue  # an explicit per-file cancel is not resumable
+            hint = self._live_hints.get(f["filename"]) or {}
+            fully = bool(hint.get("fully_uploaded"))
             result.append({
                 "filename": f["filename"], "filepath": f["filepath"],
                 "number": f["number"], "title": f.get("title"), "size": f["size"],
-                "upload_location": None, "offset": 0, "fully_uploaded": False,
+                "upload_location": hint.get("upload_location"),
+                "offset": f["size"] if fully else (hint.get("offset", 0) if hint.get("upload_location") else 0),
+                "fully_uploaded": fully,
             })
         return result
+
+    def _on_file_offset(self, file_info, upload_location, offset):
+        if upload_location:
+            self._live_hints[file_info["filename"]] = {"upload_location": upload_location,
+                                                       "offset": int(offset or 0), "fully_uploaded": False}
+
+    def _autosave_running_state(self):
+        """Persist the running batch's resume state (timer-driven, every
+        _AUTOSAVE_INTERVAL_MS). Before this, the GUI only saved when Pause
+        was pressed or the window was closed normally, so a crash, a killed
+        process or a power cut mid-upload lost all progress."""
+        if not self._upload_running or self._cancel_requested:
+            return
+        try:
+            self._persist_paused_state()
+            self._autosaved = True
+        except Exception:
+            logging.exception("autosave of upload progress failed")
+
+    def _resume_state_for(self, files):
+        """A paused_state dict for `files` that carries each one's last
+        confirmed TUS offset, so a re-login or retry continues those uploads
+        (HEAD-verified by uploader.resume_paused_upload) instead of
+        restarting them from 0%. None when nothing has an offset to reuse."""
+        names = {f["filename"] for f in files}
+        if not any(n in self._live_hints for n in names):
+            return None
+        entries = []
+        for f in files:
+            hint = self._live_hints.get(f["filename"]) or {}
+            entries.append({
+                "filename": f["filename"], "filepath": f["filepath"],
+                "number": f["number"], "title": f.get("title"), "size": f["size"],
+                "upload_location": hint.get("upload_location"),
+                "offset": hint.get("offset", 0),
+                "fully_uploaded": bool(hint.get("fully_uploaded")),
+            })
+        return {"batch_config": self._build_batch_config(), "files": entries, "completed_files": []}
 
     def _persist_paused_state(self):
         """Merges the current batch's best-known paused files into
@@ -2173,6 +2280,8 @@ class UploadProgressScreen(QWidget):
         explicitly cancelled."""
         filename = file_info["filename"]
         self._paused_files = [f for f in self._paused_files if f["filename"] != filename]
+        self._cancelled_filenames.add(filename)
+        self._live_hints.pop(filename, None)
         self._persist_paused_state()
         self._on_file_progress(filename, "\u274c Cancelled", 1.0)
 
