@@ -11,8 +11,15 @@
 # ///
 """
 ==============================================================================
-🚀 MANGADOT UPLOADER v2.1.0: ADVANCED FEATURES & USAGE
+🚀 MANGADOT UPLOADER v2.2.0: ADVANCED FEATURES & USAGE
 ==============================================================================
+[v2.2.0: Group subfolders - one subfolder per group, each credited to its
+  own group, with folder language tags ('Asura Scans [EN]') and a language
+  question for untagged folders. Auto volume covers, double-page spread
+  stitching, skip chapters already on MangaDot, live pause/resume/cancel,
+  crash-safe byte-exact resume, and a fix for the false "Session Expired"
+  prompt after every upload. See CHANGELOG.md for full details.]
+
 [Public Release: Full Site Update Compatibility, 20MB Native TUS Chunks,
   Authoritative Fast Verification via /api/uploads/mine, Decoupled Paced
   Background Batch Complete, and Modular Desktop GUI (app_bundle v3).

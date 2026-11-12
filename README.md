@@ -13,13 +13,13 @@ Both frontends automatically extract active login cookies from your browser, han
 | **Interface** | Native multi-screen Qt windows, tables, and dialogs | Interactive terminal dashboard with live meters and spinners |
 | **Automation** | Visual review grid, history viewer, settings dialog | Scriptable CLI flags (`--dry-run`, `--optimize`, `--library`) |
 
-Both share the exact same authentication, parsing, optimization, and TUS upload engine underneath. Pick whichever interface you prefer, or use both.
+Both offer the same login, parsing, optimization, and resumable TUS upload features, so pick whichever interface you prefer, or use both.
 
 ## Key Features
 
 - **Browser Session Auto-Login**: Automatically scans and extracts active MangaDot session cookies from Chrome, Firefox, Brave, Edge, Opera, Vivaldi, or Zen (no manual cookie copying required).
 - **CDP Fallback for Chromium Browsers**: When Windows encrypted cookie stores block direct extraction on Chromium browsers (Chrome, Edge, Brave, Opera, Vivaldi), CDP mode launches an isolated debug profile to retrieve the session over WebSocket without administrator privileges.
-- **20MB Native TUS Resumable Uploads**: Streams archives in 20MB chunks matching MangaDot's official web uploader (73% fewer requests than legacy 5MB chunks). If a connection drops, it automatically resyncs the server offset (`HEAD`) and resumes where it left off without re-uploading completed chunks.
+- **20MB Native TUS Resumable Uploads**: Streams archives in 20MB chunks matching MangaDot's official web uploader (73% fewer requests than legacy 5MB chunks). If a connection drops, it automatically resyncs the server offset (`HEAD`) and resumes where it left off without re-uploading completed chunks. Rate limits and server errors when starting a batch are retried automatically.
 - **Multi-Threaded Parallel Uploads**: Upload multiple chapters concurrently (up to 12 threads safe zone, with an optional toggle up to 90 threads in the GUI for fast connections, and up to 30 threads in the CLI).
 - **Fast Upload Verification**: Verifies uploaded chapters against your member upload queue (`/api/uploads/mine`) in ~1 second, supporting `pending`, `processing`, and `approved` states without slow public chapter list pagination.
 - **Asynchronous Batch Completion**: Batch closing calls execute in a background daemon thread with rate-limit pacing (2.5s minimum interval), keeping the upload queue and UI responsive.
@@ -27,9 +27,13 @@ Both share the exact same authentication, parsing, optimization, and TUS upload 
 - **Built-in CBZ & Image Optimizer**: Re-compresses images inside `.cbz`/`.zip` archives before uploading (or standalone via `--optimize-only`). Uses lossless mozjpeg/Pillow or bundled `pingo.exe` on Windows to reduce archive sizes by 10-40% without touching visual quality. Optional lossy modes are also available.
 - **MangaBaka Integration**: Search and create new titles on MangaDot directly from MangaBaka URLs or slugs without leaving the uploader (available in both the GUI creation dialog and the CLI prompt).
 - **Bracket Tag & Scanlator Attribution**: Automatically extracts group names from filename `[Bracket]` tags, filters out technical tags (e.g. `[1080p]`), maps mixed groups in a single folder, and includes a group directory search with manual ID fallback.
-- **Group Subfolders**: Pick a manga folder that holds one subfolder per group (e.g. `Solo Leveling/Asura Scans/`, `Solo Leveling/Official/`) and each subfolder is credited to its own group. Exact name matches are applied automatically; any other folder can be matched by search, credited to a scanlator name, or skipped. A language tag in the folder name sets that folder's language (`Asura Scans [EN]`, `Asura Scans (French)`, `Asura Scans - es`); for group folders without one, you're asked which language each is in (a popup in the GUI). Subfolders named only after a language (`EN`, `French`) are language folders, not groups, and the same chapter number in two group folders isn't treated as a duplicate.
+- **Group Subfolders**: Pick a manga folder that holds one subfolder per group (e.g. `Solo Leveling/Asura Scans/`, `Solo Leveling/Official/`) and each subfolder's chapters are credited to that group. Exact name matches are applied automatically; any other folder can be matched by search, credited to a scanlator name, or skipped. See [Uploading Several Groups at Once](#uploading-several-groups-at-once).
+- **Folder & Per-File Languages**: A language tag in a folder name (`Asura Scans [EN]`, `Asura Scans (French)`, `Asura Scans - es`) sets that folder's language. Folders without one, and the loose chapters next to them, are asked about (a popup in the GUI). Individual files can also be switched to another language or credited to a scanlator during review.
+- **Skip Chapters Already on MangaDot**: Checks which chapter/volume numbers already exist on MangaDot (published, pending, or in your upload queue) and offers to skip them before uploading.
+- **Auto Volume Covers**: For volume uploads, page 1 of each archive can be set as that volume's cover automatically.
+- **Double-Page Spread Stitching**: Optionally asks MangaDot to stitch two-page spreads into a single page.
 - **Subset & Range Selection**: Upload specific chapters instead of whole folders using interactive checkbox pickers or numeric range syntax (e.g. `1-10, 15, 20-25`).
-- **Upload History & Interrupted Batch Recovery**: Tracks previous uploads with direct links to MangaDot, and automatically prompts to resume paused or interrupted upload batches on launch.
+- **Upload History & Crash-Safe Resume**: Tracks previous uploads with direct links to MangaDot. Progress is saved continuously while uploading, down to each file's exact byte position, so a paused batch, a crash, a closed window, or a power cut resumes mid-file on the next launch instead of starting over.
 - **Homoglyph Normalization**: Automatically normalizes look-alike Cyrillic or Greek characters in filenames so titles and numbers parse correctly.
 - **Custom Proxy Support**: Tunnel traffic through HTTP/SOCKS proxies with optional SSL verification bypass for restricted networks.
 
@@ -42,6 +46,7 @@ Both share the exact same authentication, parsing, optimization, and TUS upload 
 
 ### CLI-Specific Features
 - **Rich Terminal Dashboard**: Live multi-bar progress display, animated spinners, real-time speed/ETA meters, and inline cover art display via `chafa`.
+- **Live Upload Controls**: While uploading, press `P` to pause everything and save progress, or `:` to type a command for specific files: `p 3` pauses file #3, `r 3` resumes it (`r all` resumes every paused file), `c 3` cancels it. Ranges work too (`c 4-6,9`).
 - **Flexible File Picker Modes**: Choose between range-syntax input (`1-10, 15`) or an interactive checkbox list.
 - **Scriptable Automation**: Comprehensive command-line arguments for automated pipelines, dry-runs, and directory scanning.
 
@@ -109,6 +114,25 @@ If you do not have Python installed, you do not need administrator privileges or
 4. Both frontends scan installed browsers for an active MangaDot session automatically.
 5. Assign scanlator groups, review and clean detected titles and numbers in the review table, and begin uploading.
 
+### Uploading Several Groups at Once
+
+Put each group's chapters in a subfolder named after the group, then select the manga folder itself:
+
+```
+Solo Leveling/
+├── Asura Scans [EN]/      → group "Asura Scans", English
+├── Toomics [es]/          → group "Toomics", Spanish
+├── Official/              → group "Official", you're asked the language
+├── EN/                    → a language folder, not a group
+├── ch0001.cbz             → loose chapters: you pick their group, and are asked the language
+└── ch0003.cbz
+```
+
+- **Group matching**: a folder whose name exactly matches a MangaDot group is credited automatically. For any other folder you can search for the right group, credit it to a scanlator name instead, or skip it. The language tag is ignored when searching, so `Asura Scans [EN]` matches the group "Asura Scans".
+- **Language**: tags can be written as `[EN]`, `(French)`, or ` - es`. Folders without one, and loose chapters next to the group folders, are asked about, with your upload language pre-selected. A file's own tag (e.g. `Chapter 5 [fr].cbz`) beats its folder's.
+- **Duplicates**: the same chapter number in two different group folders is not a duplicate; two copies inside one folder still are.
+- **Optimization**: `--optimize` and the GUI's chained optimizer skip folders laid out this way and only show a notice. Run the optimizer on each group folder first if you want them optimized.
+
 ## Complete CLI Options Table
 
 | Flag | Description |
@@ -124,6 +148,9 @@ If you do not have Python installed, you do not need administrator privileges or
 | `--optimize-webp-quality <1-100>`| WebP quality for lossy mode (default: 85). |
 | `--optimize-threads <N>` | Number of archives to optimize in parallel (default: 4). |
 | `--pingo` | Use bundled `pingo.exe` on Windows instead of Python/mozjpeg for faster optimization. |
+| `--skip-existing` / `--no-skip-existing` | Skip (or keep) chapters/volumes that already exist on MangaDot without asking. |
+| `--stitch-spreads` / `--no-stitch-spreads` | Turn MangaDot's double-page spread stitching on or off without asking (remembered across runs). |
+| `--volume-cover` / `--no-volume-cover` | For volume uploads, set (or don't set) page 1 of each archive as the volume cover without asking. |
 | `--verify-timeout <SECONDS>` | Timeout for server verification confirmation (default: 60s). |
 | `--skip-verification` | Skip post-upload verification polling (default: True, recommended for high concurrency). |
 | `--verify` | Enable post-upload verification polling. |

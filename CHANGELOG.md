@@ -2,6 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.2.0] - 2026-11-13
+
+### Added
+- **Group Subfolders (GUI & CLI):** Select a manga folder that holds one subfolder per group (e.g. `Solo Leveling/Asura Scans/`, `Solo Leveling/Official/`) and each subfolder's chapters are credited to that group.
+  - Folders whose name exactly matches a MangaDot group are assigned automatically.
+  - Any other folder can be matched by search, credited to a scanlator name instead, or skipped (CLI: a per-folder menu; GUI: folder buttons on the group screen).
+  - Chapters sitting directly in the manga folder, next to the group folders, go through the usual "untagged files" group step.
+  - The same chapter number in two different group folders is no longer flagged as a duplicate.
+- **Folder Language Tags:** A language tag in a group folder's name sets that folder's language: `Asura Scans [EN]`, `Asura Scans (French)`, `Asura Scans - es`. The tag is left out of the group search, so `Asura Scans [EN]` still matches the group "Asura Scans". A file's own tag (e.g. `Chapter 5 [fr].cbz`) still wins over its folder's.
+- **Folder Language Question:** When group folders, or the loose chapters next to them, have no language tag, you're asked which language they're in: a menu in the CLI ("All in the upload language" or one per folder) and a popup with a dropdown per folder in the GUI. Folders whose name has a language tag aren't asked about.
+- **Auto Volume Cover (GUI & CLI):** Volume uploads can set page 1 of each archive as the volume's cover automatically. The cover is uploaded after the volume is created, retried while MangaDot is still preparing the volume, skipped for volumes that already exist, and a failure is shown instead of being hidden in the debug log. CLI: `--volume-cover` / `--no-volume-cover`.
+- **Double-Page Spread Stitching (GUI & CLI):** Ask MangaDot to stitch two-page spreads automatically. The choice is remembered across runs. CLI: `--stitch-spreads` / `--no-stitch-spreads`.
+- **Skip Chapters Already on MangaDot (GUI & CLI):** Before uploading, the uploader checks which chapter/volume numbers already exist on MangaDot (published, pending or in your upload queue) and offers to skip them. CLI: `--skip-existing` / `--no-skip-existing`.
+- **Live Upload Controls (CLI):** Pause, resume or cancel individual files or the whole batch while it uploads.
+- **Per-File Language and Scanlator Overrides (CLI):** The review menu can now upload chosen files in a different language or credit them to a scanlator name instead of the group.
+
+### Changed
+- **CLI Upload Engine Brought to GUI Parity:** Progress is now shown per byte instead of per 20MB chunk, verification slots scale with the thread count, and `/api/uploads/mine` is read across all pages.
+- **Crash-Safe Resume (GUI & CLI):** Upload progress is now saved continuously while uploading (the GUI saves every 5 seconds), including each file's exact byte position. A crash, a closed window or a power cut now resumes mid-file instead of restarting files from 0%. Re-logging in or retrying failed files also continues saved uploads. Resumed batches keep their per-file language, spread stitching and volume cover settings.
+- **Batch Start Retries (GUI & CLI):** Starting a batch is retried on rate limits (HTTP 429), server errors and network drops instead of failing the whole group of files.
+
+### Fixed
+- **False "Session Expired" Prompt (CLI):** The CLI asked you to log in again after every upload, successful or not, and never reached the upload summary.
+- **Crash When Closing a Batch (GUI & CLI):** Fixed a `CookieConflictError` that could abort the batch-complete call when the browser had the same cookie name on two domains.
+- **Uncredited Untagged Files (CLI):** In mixed-group batches, files without a group tag could upload with no group credit.
+- **Stale User-Agent (CLI):** The cached browser User-Agent now refreshes every 24 hours instead of never expiring.
+- **Proxy Check (CLI):** Working proxies were sometimes reported as unreachable.
+- **Episode Drift Ordering (CLI):** Files are re-sorted after episode-number drift is corrected.
+- **Optimizer Safety (CLI):** Archives with paths that try to escape the extraction folder ("zip-slip") are rejected, and `--optimize` on a folder with nothing to optimize now stops with an error instead of continuing.
+- **Volume Titles (CLI):** Volume uploads now send the volume title to MangaDot.
+- **Closed Input (CLI):** The CLI exits cleanly instead of crashing when input is closed (Ctrl+Z / Ctrl+D).
+- **Relative Upload URLs (GUI):** Uploads no longer fail when the server answers with a relative upload location.
+
+### Notes
+- Folders with group subfolders aren't optimized by `--optimize` or the GUI's chained optimizer, because the optimizer only processes archives directly inside the selected folder; you'll see a notice and the upload continues. Optimize each group folder on its own first if you want them optimized.
+
+---
+
 ## [2.1.0] - 2026-11-08
 
 ### Added
