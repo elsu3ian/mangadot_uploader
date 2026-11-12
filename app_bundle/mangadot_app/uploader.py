@@ -1169,7 +1169,7 @@ def process_uploads(files_to_upload, req_session, manga_id, group_ids,
                         target=_send_complete_worker,
                         args=(
                             batch_id,
-                            dict(req_session.cookies),
+                            req_session.cookies.copy(),  # dict() raises CookieConflictError on duplicate names
                             dict(req_session.headers),
                             dict(req_session.proxies) if req_session.proxies else {},
                             req_session.verify,
