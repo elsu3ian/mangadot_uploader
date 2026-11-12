@@ -1661,6 +1661,92 @@ def validate_archive(filepath):
         return f"unreadable archive ({str(e)[:40]})"
     return None
 
+# Folder names never treated as group folders: the optimizer's own output.
+GROUP_FOLDER_IGNORE = {"optimized"}
+
+def find_group_subfolders(directory):
+    """Immediate subfolders of `directory` that directly contain .cbz/.zip
+    archives, e.g. 'Solo Leveling/Asura Scans/ch001.cbz'. A folder's name is
+    the group that released the archives inside it — unless the name is a
+    language ('EN', 'French'), which makes it a language folder instead.
+    Returns [(folder_name, folder_path, archive_count)], natural-sorted;
+    hidden folders and the optimizer's 'optimized' output are skipped."""
+    found = []
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return []
+    for e in entries:
+        try:
+            if not e.is_dir() or e.name.startswith(".") or e.name.lower() in GROUP_FOLDER_IGNORE:
+                continue
+            count = sum(1 for c in os.scandir(e.path) if c.is_file() and c.name.lower().endswith(('.cbz', '.zip')))
+        except OSError:
+            continue
+        if count:
+            found.append((e.name, e.path, count))
+    found.sort(key=lambda t: natural_sort_key(t[0]))
+    return found
+
+_FOLDER_TAG_RE = re.compile(r"[\[(]\s*([^\])]+?)\s*[\])]")
+_FOLDER_LANG_SUFFIX_RE = re.compile(r"^(.*\S)\s+[-|]\s+([A-Za-z][A-Za-z-]*)$")
+
+def split_group_folder_name(folder_name):
+    """Splits a subfolder name into (group_name, language_code):
+      'Asura Scans [EN]'      -> ('Asura Scans', 'en')
+      'Asura Scans (French)'  -> ('Asura Scans', 'fr')
+      'Asura Scans - es'      -> ('Asura Scans', 'es')
+      'EN' / 'Spanish'        -> (None, 'en') / (None, 'es')   a pure language folder
+      'Official [HQ]'         -> ('Official [HQ]', None)        no language tag
+    Only a bracket/paren tag (or a ' - xx' suffix) that is a known language
+    is taken out; any other tag stays part of the group name."""
+    lookup = {}
+    for code, lname in LANGUAGES:
+        lookup[code.lower()] = code
+        lookup[lname.lower()] = code
+    name = (folder_name or "").strip()
+    if not name:
+        return None, None
+    if name.lower() in lookup:
+        return None, lookup[name.lower()]
+    lang = None
+
+    def _take(m):
+        nonlocal lang
+        code = lookup.get(m.group(1).strip().lower())
+        if code and lang is None:
+            lang = code
+            return " "
+        return m.group(0)
+
+    rest = _FOLDER_TAG_RE.sub(_take, name)
+    if lang is None:
+        m = _FOLDER_LANG_SUFFIX_RE.match(name)
+        if m and m.group(2).strip().lower() in lookup:
+            rest, lang = m.group(1), lookup[m.group(2).strip().lower()]
+    if lang is None:
+        return name, None
+    rest = re.sub(r"\s+", " ", rest).strip(" -_|.,")
+    return (rest or None), lang
+
+def group_folder_names(directory):
+    """Subfolders that are group folders (named after a group, optionally
+    with a language tag) rather than pure language folders."""
+    return [n for n, _, _ in find_group_subfolders(directory) if split_group_folder_name(n)[0]]
+
+def list_upload_archives(directory):
+    """Normalized paths of every archive an upload of `directory` covers: the
+    ones directly inside it plus those in its group/language subfolders."""
+    paths = []
+    for folder in [directory] + [fp for _, fp, _ in find_group_subfolders(directory)]:
+        try:
+            for e in os.scandir(folder):
+                if e.is_file() and e.name.lower().endswith(('.cbz', '.zip')):
+                    paths.append(_norm_filepath(e.path))
+        except OSError:
+            continue
+    return paths
+
 def _correct_episode_drift(parsed):
     drift_detected = any(
         item.get("episode_label_num") is not None and item["episode_label_num"] != item["number"]
@@ -1769,32 +1855,52 @@ def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_re
         print_error(f"Invalid or missing directory: {directory}")
         return []
 
-    try:
-        with os.scandir(directory) as it:
-            for entry in it:
-                if not entry.is_file() or not entry.name.lower().endswith(valid_extensions):
-                    continue
+    # The folder itself, then any group/language subfolders inside it.
+    scan_targets = [(directory, "", None, None, None)]
+    for folder_name, folder_path, _ in find_group_subfolders(directory):
+        group_name, lang = split_group_folder_name(folder_name)
+        # folder_group is the folder's own name (unique per folder, so
+        # 'Asura Scans [EN]' and 'Asura Scans [FR]' stay apart); the displayed
+        # group is the name without its language tag.
+        scan_targets.append((folder_path, f"{folder_name}/", folder_name if group_name else None,
+                             group_name, lang))
 
-                filepath = entry.path
-                filename = entry.name
+    for folder, prefix, folder_group, folder_group_name, folder_lang in scan_targets:
+        try:
+            with os.scandir(folder) as it:
+                for entry in it:
+                    if not entry.is_file() or not entry.name.lower().endswith(valid_extensions):
+                        continue
 
-                num, candidates, file_groups, shape_key, num_source, episode_label_num = parse_filename_details(
-                    filename, upload_type, chapter_naming, custom_regex, strip_groups, custom_renames
-                )
+                    filepath = entry.path
+                    # Display/key name carries the folder, so 'Asura Scans/ch001.cbz' and
+                    # 'Official/ch001.cbz' never collide; the bare name is what gets parsed.
+                    filename = prefix + entry.name
 
-                if num is None:
-                    print_warning(f"Could not detect {upload_type} number from '{filename}'. Skipping.")
-                    continue
+                    num, candidates, file_groups, shape_key, num_source, episode_label_num = parse_filename_details(
+                        entry.name, upload_type, chapter_naming, custom_regex, strip_groups, custom_renames
+                    )
 
-                parsed.append({
-                    "entry": entry, "filepath": filepath, "filename": filename,
-                    "number": num, "candidates": candidates, "groups": file_groups,
-                    "shape_key": shape_key, "num_source": num_source,
-                    "episode_label_num": episode_label_num,
-                })
-    except OSError as e:
-        print_error(f"Error scanning directory {directory}: {e}")
-        return []
+                    if num is None:
+                        print_warning(f"Could not detect {upload_type} number from '{filename}'. Skipping.")
+                        continue
+
+                    item = {
+                        "entry": entry, "filepath": filepath, "filename": filename,
+                        "number": num, "candidates": candidates, "groups": file_groups,
+                        "shape_key": shape_key, "num_source": num_source,
+                        "episode_label_num": episode_label_num,
+                    }
+                    if folder_group:
+                        item["folder_group"] = folder_group
+                        item["groups"] = [folder_group_name or folder_group]
+                    if folder_lang:
+                        item["language_override"] = folder_lang
+                    parsed.append(item)
+        except OSError as e:
+            print_error(f"Error scanning directory {folder}: {e}")
+            if folder == directory:
+                return []
 
     if upload_type == "chapter":
         _correct_episode_drift(parsed)
@@ -2003,12 +2109,16 @@ def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_re
             print_warning(f"Skipping '{filename}': Could not read file size ({e}).")
             continue
 
-        files_data.append({
+        entry_out = {
             "filepath": filepath, "filename": filename,
             "norm_filepath": _norm_filepath(filepath),
             "number": num, "title": final_title, "size": file_size,
             "groups": file_groups, "shape_key": shape_key, "candidates": candidates,
-        })
+        }
+        for key in ("folder_group", "language_override"):
+            if item.get(key):
+                entry_out[key] = item[key]
+        files_data.append(entry_out)
 
     files_data.sort(key=lambda x: x["number"])
     return files_data
@@ -2413,10 +2523,15 @@ def _check_duplicates(files, upload_type):
     term = "chapter" if upload_type == "chapter" else "volume"
 
     while True:
-        by_number = {}
+        # Chapter 5 in 'Asura Scans/' and in 'Official/' are two groups' releases
+        # of the same chapter, not a duplicate — compare within each group folder.
+        by_key = {}
         for f in files:
-            by_number.setdefault(f["number"], []).append(f)
-        dups = {n: flist for n, flist in by_number.items() if len(flist) > 1}
+            by_key.setdefault((f.get("folder_group"), f["number"]), []).append(f)
+        dups = {}
+        for (_, number), flist in by_key.items():
+            if len(flist) > 1:
+                dups.setdefault(number, []).extend(flist)
         if not dups:
             return files
 
@@ -2706,6 +2821,18 @@ def _make_target_key(manga_id, upload_type, language, group_ids, scanlator_name)
         group_key = "none"
     return f"{manga_id}|{upload_type}|{language}|{group_key}"
 
+def _file_target_key(manga_id, upload_type, language, group_ids, scanlator_name, f,
+                     per_file_group_map=None, per_file_scanlator_map=None, per_file_language_map=None):
+    """Upload-history target for one file, honoring its per-file group,
+    scanlator and language (overrides or folder credits)."""
+    norm = f.get("norm_filepath") or _norm_filepath(f["filepath"])
+    lang = f.get("language_override") or (per_file_language_map or {}).get(norm) or language
+    scan = f.get("scanlator_override") or (per_file_scanlator_map or {}).get(norm)
+    if scan:
+        return _make_target_key(manga_id, upload_type, lang, [], scan)
+    return _make_target_key(manga_id, upload_type, lang,
+                            (per_file_group_map or {}).get(norm) or group_ids, scanlator_name)
+
 def db_record_uploaded_files(manga_id, upload_type, language, group_ids, scanlator_name,
                               files, per_file_group_map=None, per_file_scanlator_map=None,
                               per_file_language_map=None):
@@ -2715,14 +2842,8 @@ def db_record_uploaded_files(manga_id, upload_type, language, group_ids, scanlat
     per_file_language_map  = per_file_language_map or {}
     by_target = {}
     for f in files:
-        norm = f.get("norm_filepath") or _norm_filepath(f["filepath"])
-        lang = f.get("language_override") or per_file_language_map.get(norm) or language
-        scan = f.get("scanlator_override") or per_file_scanlator_map.get(norm)
-        if scan:
-            key = _make_target_key(manga_id, upload_type, lang, [], scan)
-        else:
-            key = _make_target_key(manga_id, upload_type, lang,
-                                   per_file_group_map.get(norm) or group_ids, scanlator_name)
+        key = _file_target_key(manga_id, upload_type, language, group_ids, scanlator_name, f,
+                               per_file_group_map, per_file_scanlator_map, per_file_language_map)
         by_target.setdefault(key, []).append(f)
     for key, group in by_target.items():
         db_record_uploaded(key, group)
@@ -2795,12 +2916,25 @@ def fetch_my_uploads(session, manga_id=None, upload_type=None, language=None, li
         page += 1
     return entries
 
-def fetch_remote_existing_numbers(session, manga_id, upload_type, language):
+def fetch_remote_existing_numbers(session, manga_id, upload_type, language, with_groups=False):
     """Numbers of chapters/volumes that already exist for this title + language:
     published ones (the volumes endpoint for volumes, the chapter list for
     chapters) plus the member's own pending/processing/approved uploads."""
-    existing_numbers = set()
+    existing = {}   # number key -> set of group ids it exists under (empty = unknown)
     num_field = "volume_number" if upload_type == "volume" else "chapter_number"
+
+    def _add(item):
+        key = _chapter_number_key(item.get(num_field))
+        if not key:
+            return
+        ids = existing.setdefault(key, set())
+        if item.get("group_id"):
+            ids.add(item["group_id"])
+        for g in item.get("groups") or []:
+            if isinstance(g, dict) and g.get("id"):
+                ids.add(g["id"])
+            elif isinstance(g, int):
+                ids.add(g)
 
     # 1. Published releases. Volumes have their own endpoint — the chapter list
     #    does not reliably report published volumes, which let duplicates through.
@@ -2819,9 +2953,7 @@ def fetch_remote_existing_numbers(session, manga_id, upload_type, language):
                 data.get("volumes") or data.get("chapters") or data.get("rows") or [])
             for item in items:
                 if isinstance(item, dict) and item.get(num_field) is not None:
-                    key = _chapter_number_key(item.get(num_field))
-                    if key:
-                        existing_numbers.add(key)
+                    _add(item)
     except Exception as e:
         logging.debug("fetch_remote_existing_numbers published check failed: %s", e)
 
@@ -2830,13 +2962,11 @@ def fetch_remote_existing_numbers(session, manga_id, upload_type, language):
         for item in fetch_my_uploads(session, manga_id=manga_id, upload_type=upload_type,
                                      language=language, limit=100, max_pages=2):
             if isinstance(item, dict) and item.get("status") != "rejected" and item.get(num_field) is not None:
-                key = _chapter_number_key(item.get(num_field))
-                if key:
-                    existing_numbers.add(key)
+                _add(item)
     except Exception as e:
         logging.debug("fetch_remote_existing_numbers uploads/mine failed: %s", e)
 
-    return existing_numbers
+    return existing if with_groups else set(existing)
 
 def extract_first_image_from_archive(archive_path):
     """Extracts the first image filename and raw bytes from a cbz/zip archive using natural sort."""
@@ -3793,6 +3923,10 @@ def create_manga_from_mangabaka(metadata, session):
         return {"ok": False, "error": "Couldn't reach MangaDot."}
 
 def _group_search_queries(name):
+    # 'Asura Scans [EN]' (a group folder with a language tag) searches as 'Asura Scans' first.
+    group_part, _lang = split_group_folder_name(name)
+    if group_part and group_part != name:
+        return _group_search_queries(group_part) + [name]
     queries = [name]
     if not re.search(r'\s', name):
         camel = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', name)
@@ -4750,10 +4884,10 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids,
                 "group_id":       group_ids[0] if group_ids else 0,
                 "upload_type":    upload_type,
                 "batch_id":       batch_id,
-                "name":           filename,
+                "name":           os.path.basename(filepath),
                 "type":           "application/zip",
                 "filetype":       "application/zip",
-                "filename":       filename,
+                "filename":       os.path.basename(filepath),
             }
             raw_title = str(file_info.get("title") or "").strip()
             if upload_type == "volume":
@@ -5912,16 +6046,15 @@ def _search_group_interactive(req_session, prompt_text="Search Group by Name, or
             return None, None
         return selection["id"], selection.get("name") or f"ID: {selection['id']}"
 
-def _credit_uncredited_files(directory, req_session, per_file_group_map, per_file_scanlator_map):
+def _credit_uncredited_files(directory, req_session, per_file_group_map, per_file_scanlator_map,
+                             skipped_paths=frozenset()):
     """In a mixed-group batch every file is credited from its own [Group] tag.
     Files with no tag (or a tag that couldn't be resolved) used to be uploaded
     with no attribution at all. Ask how to credit them instead."""
-    try:
-        all_paths = [_norm_filepath(os.path.join(directory, n)) for n in os.listdir(directory)
-                     if n.lower().endswith(('.cbz', '.zip')) and os.path.isfile(os.path.join(directory, n))]
-    except OSError:
-        return
-    uncredited = sorted((p for p in all_paths if not per_file_group_map.get(p)), key=natural_sort_key)
+    all_paths = list_upload_archives(directory)
+    uncredited = sorted((p for p in all_paths
+                         if not per_file_group_map.get(p) and p not in per_file_scanlator_map
+                         and p not in skipped_paths), key=natural_sort_key)
     if not uncredited:
         return
     console.print()
@@ -5946,14 +6079,163 @@ def _credit_uncredited_files(directory, req_session, per_file_group_map, per_fil
                 per_file_scanlator_map[path] = name
             print_success(f"{len(uncredited)} file(s) will be credited to scanlator '{name}'.")
 
+def _resolve_group_folders(directory, req_session, folders, per_file_group_map,
+                           per_file_scanlator_map, skipped_paths):
+    """Credits each group subfolder ('Solo Leveling/Asura Scans/...') to a
+    MangaDot group: an exact name match is applied automatically; otherwise
+    you pick a candidate, search for another group, credit the folder to a
+    scanlator name, or skip the folder."""
+    console.print(f"  [bold]Detected {len(folders)} group folder(s):[/bold] "
+                  + ", ".join(f"[cyan]{rich_escape(n)}[/cyan]" for n in folders))
+    resolved_names = []
+    for name in folders:
+        folder_path = os.path.join(directory, name)
+        group_part, folder_lang = split_group_folder_name(name)
+        group_part = group_part or name
+        lang_note = f" [dim](language: {folder_lang})[/dim]" if folder_lang else ""
+        try:
+            paths = [_norm_filepath(os.path.join(folder_path, f)) for f in os.listdir(folder_path)
+                     if f.lower().endswith(('.cbz', '.zip')) and os.path.isfile(os.path.join(folder_path, f))]
+        except OSError:
+            continue
+
+        results, clean = [], name
+        for q in _group_search_queries(name):
+            with console.status(f"[cyan]Looking up group '{q}'...[/cyan]", spinner="dots"):
+                results = search_groups(q, req_session)
+            if results:
+                clean = q
+                break
+
+        exact = [g for g in results
+                 if (g.get("name") or "").lower() in (name.lower(), clean.lower(), group_part.lower())]
+        if len(exact) == 1:
+            gid = exact[0]["id"]
+            for p in paths:
+                per_file_group_map[p] = [gid]
+            resolved_names.append(exact[0].get("name") or name)
+            console.print(f"[green]✔[/green] 📁 {rich_escape(name)} → {rich_escape(exact[0].get('name') or '')} "
+                          f"(ID: {gid}) — {len(paths)} file(s){lang_note}")
+            continue
+
+        choices = [questionary.Choice(title=f"{g.get('name', '?')} (ID: {g['id']})", value=("group", g)) for g in results]
+        choices += [
+            questionary.Choice(title="🔍 Search for a different group...", value=("search", None)),
+            questionary.Choice(title="Credit these files to a scanlator name instead", value=("scanlator", None)),
+            questionary.Choice(title=f"Skip this folder (don't upload its {len(paths)} file(s))", value=("skip", None)),
+        ]
+        question = (f"📁 '{name}' ({len(paths)} file(s)) — several possible groups, pick one:" if results
+                    else f"📁 '{name}' ({len(paths)} file(s)) — no matching group found. What should it be credited to?")
+        console.print()
+        while True:
+            kind, g = ask_select(question, choices)
+            if kind == "group":
+                gid, gname = g["id"], g.get("name") or name
+            elif kind == "search":
+                gid, gname = _search_group_interactive(req_session)
+                if gid is None:
+                    continue
+            elif kind == "scanlator":
+                scan = prompt("Scanlator name for this folder", default=group_part).strip()
+                if not scan:
+                    continue
+                for p in paths:
+                    per_file_scanlator_map[p] = scan
+                print_success(f"📁 {name} → scanlator '{scan}' — {len(paths)} file(s)")
+                break
+            else:
+                skipped_paths.update(paths)
+                print_info(f"📁 {name} skipped — its {len(paths)} file(s) won't be uploaded.")
+                break
+            for p in paths:
+                per_file_group_map[p] = [gid]
+            resolved_names.append(gname)
+            print_success(f"📁 {name} → {gname} (ID: {gid}) — {len(paths)} file(s)")
+            break
+    return resolved_names
+
+# Key for "the archives directly inside the selected folder, outside any
+# group folder" in the folder-language answers (loose files have no folder_group).
+LOOSE_FILES_KEY = None
+
+def _ask_group_folder_languages(directory, language, skipped_paths=frozenset()):
+    """Group folders whose name has no language tag ('Asura Scans', not
+    'Asura Scans [EN]') get asked about: all in the upload language (one
+    Enter), or a language per folder. When the folder has group folders,
+    the loose files next to them are asked about too, as 'Files outside
+    folders'. Returns {folder_name or LOOSE_FILES_KEY: language_code}."""
+    untagged = []
+    has_group_folders = False
+    for name, path, count in find_group_subfolders(directory):
+        group_part, folder_lang = split_group_folder_name(name)
+        if not group_part:
+            continue
+        has_group_folders = True
+        if folder_lang:
+            continue
+        try:
+            paths = [_norm_filepath(os.path.join(path, f)) for f in os.listdir(path)
+                     if f.lower().endswith(('.cbz', '.zip'))]
+        except OSError:
+            continue
+        if paths and all(p in skipped_paths for p in paths):
+            continue  # skipped folder: nothing of it gets uploaded
+        untagged.append((name, count))
+    if has_group_folders:
+        try:
+            loose = sum(1 for f in os.listdir(directory)
+                        if f.lower().endswith(('.cbz', '.zip')) and os.path.isfile(os.path.join(directory, f)))
+        except OSError:
+            loose = 0
+        if loose:
+            untagged.append((LOOSE_FILES_KEY, loose))
+    if not untagged:
+        return {}
+
+    def label(n):
+        return "Files outside folders" if n is LOOSE_FILES_KEY else n
+
+    console.print()
+    console.print("  [bold]No language tag for:[/bold] "
+                  + ", ".join(f"[cyan]{rich_escape(label(n))}[/cyan] ({c})" for n, c in untagged))
+    console.print("  [dim]Tip: name a folder like 'Asura Scans [EN]' and it won't be asked.[/dim]")
+    how = ask_select("Which language are they in?", choices=[
+        questionary.Choice(title=f"All in '{language}' (the upload language)", value="all"),
+        questionary.Choice(title="Choose a language for each folder", value="each"),
+    ])
+    if how == "all":
+        return {n: language for n, _ in untagged}
+    lang_codes = [code for code, _name in LANGUAGES]
+    lang_meta = {code: lname for code, lname in LANGUAGES}
+    chosen = {}
+    for n, c in untagged:
+        icon = "📄" if n is LOOSE_FILES_KEY else "📁"
+        chosen[n] = ask_autocomplete(
+            f"Language for {icon} {label(n)} ({c} file(s))", choices=lang_codes,
+            default=language, meta_information=lang_meta,
+        )
+    return chosen
+
 def _setup_group_config(directory, req_session, upload_type="chapter"):
     is_group             = ask_confirm("Upload as a Group?", default=True)
     group_ids            = []
     scanlator_name       = None
     per_file_group_map   = {}
     per_file_scanlator_map = {}
+    skipped_paths        = set()
     selected_group_name  = None
     strip_bracket_groups = False
+
+    folders = group_folder_names(directory) if is_group else []
+    if folders:
+        # Group-subfolder layout: every subfolder is credited on its own.
+        resolved = _resolve_group_folders(directory, req_session, folders, per_file_group_map,
+                                          per_file_scanlator_map, skipped_paths)
+        _credit_uncredited_files(directory, req_session, per_file_group_map, per_file_scanlator_map,
+                                 skipped_paths)
+        selected_group_name = ", ".join(dict.fromkeys(resolved)) or "Multiple (group folders)"
+        return (is_group, group_ids, scanlator_name, per_file_group_map, selected_group_name,
+                strip_bracket_groups, per_file_scanlator_map, skipped_paths)
 
     if is_group:
         detected_names, per_file_names = detect_groups_from_filenames(directory, upload_type)
@@ -6056,7 +6338,7 @@ def _setup_group_config(directory, req_session, upload_type="chapter"):
         scanlator_name = prompt("Enter your individual Scanlator Name")
 
     return (is_group, group_ids, scanlator_name, per_file_group_map, selected_group_name,
-            strip_bracket_groups, per_file_scanlator_map)
+            strip_bracket_groups, per_file_scanlator_map, skipped_paths)
 
 def _write_failed_log(manga_id, failed_chapters, failure_reasons):
     safe_id         = str(manga_id) if manga_id else "unknown"
@@ -6418,6 +6700,13 @@ def main():
         elif not os.path.isdir(target_dir):
             print_error(f"Directory does not exist: {target_dir}")
             sys.exit(1)
+    if args.optimize is not None and find_group_subfolders(target_dir):
+        print_warning("This folder has group subfolders. --optimize only processes archives directly inside "
+                      "the folder, so optimization is skipped and the folder is uploaded as-is. "
+                      "Run --optimize-only on each group folder first if you want them optimized.")
+        preselected_dir = target_dir
+        preselected_title_source = Path(target_dir).name
+    elif args.optimize is not None:
         upload_dir = run_optimize(
             target_dir,
             replace=resolved_optimize_replace,
@@ -6674,9 +6963,10 @@ def main():
     _remember_setting_force("stitch_spreads", stitch_spreads)
 
     (is_group, group_ids, scanlator_name, per_file_group_map, selected_group_name,
-     strip_bracket_groups, per_file_scanlator_map) = _setup_group_config(directory, req_session, upload_type)
+     strip_bracket_groups, per_file_scanlator_map, skipped_paths) = _setup_group_config(directory, req_session, upload_type)
     strip_bracket_groups = strip_bracket_groups or advanced_strip_groups
-    
+    folder_languages = _ask_group_folder_languages(directory, language, skipped_paths)
+
     print_warning(
     "Recommended: 5 to 10 threads. But sure, slap it to 30 if you want.\n"
     "Cloudflare's banhammer is feeling lonely today, and I'm sure the admins\n"
@@ -6702,41 +6992,75 @@ def main():
         print_error("No valid .cbz or .zip files found.")
         sys.exit(1)
 
-    if not strip_bracket_groups:
-        for f in files:
-            f["groups"] = []
+    if skipped_paths:
+        files = [f for f in files if f["norm_filepath"] not in skipped_paths]
+        if not files:
+            print_warning("Every folder was skipped — nothing left to upload.")
+            sys.exit(0)
 
     for f in files:
+        # Loose files (no folder_group) answer to LOOSE_FILES_KEY; files in a
+        # language or tagged folder already carry their language_override.
+        folder_key = f.get("folder_group") or LOOSE_FILES_KEY
+        if folder_key in folder_languages and not f.get("language_override"):
+            if folder_languages[folder_key] != language:
+                f["language_override"] = folder_languages[folder_key]
+        if not strip_bracket_groups and not f.get("folder_group"):
+            f["groups"] = []
+        if per_file_scanlator_map.get(f["norm_filepath"]):
+            f["scanlator_override"] = per_file_scanlator_map[f["norm_filepath"]]
+            f["groups"] = []
         f["_upload_type"] = upload_type
         f["_group_label"] = selected_group_name
 
-    target_key = _make_target_key(manga_id, upload_type, language, group_ids, scanlator_name)
-    already_uploaded = set(db_uploaded_numbers(target_key))
+    folder_mode = any(f.get("folder_group") for f in files)
     with console.status("[dim]Checking MangaDot for existing releases...[/dim]", spinner="dots"):
-        remote_uploaded = fetch_remote_existing_numbers(req_session, manga_id, upload_type, language)
-    already_uploaded.update(remote_uploaded)
+        remote_by_number = fetch_remote_existing_numbers(req_session, manga_id, upload_type, language,
+                                                         with_groups=True)
 
-    if already_uploaded:
-        skip_candidates = [f for f in files if _chapter_number_key(f["number"]) in already_uploaded]
-        if skip_candidates:
-            console.print()
-            print_info(
-                f"[cyan]{len(skip_candidates)}[/cyan] of {len(files)} file(s) match numbers already published or "
-                f"pending on MangaDot (or recorded from a previous run)."
+    # Already uploaded = recorded in this file's own upload history target, or on
+    # MangaDot. With group folders, a site match only counts when it's the same
+    # group (or the site doesn't say which group) — another group's chapter 5
+    # doesn't make yours a duplicate.
+    history_cache = {}
+    def _already_uploaded(f):
+        key = _file_target_key(manga_id, upload_type, language, group_ids, scanlator_name, f,
+                               per_file_group_map, per_file_scanlator_map)
+        if key not in history_cache:
+            history_cache[key] = db_uploaded_numbers(key)
+        num_key = _chapter_number_key(f["number"])
+        if num_key in history_cache[key]:
+            return True
+        if num_key not in remote_by_number:
+            return False
+        if (f.get("language_override") or language) != language:
+            return False  # the site check above only looked at the batch language
+        if not folder_mode:
+            return True
+        remote_groups = remote_by_number[num_key]
+        file_groups = set(per_file_group_map.get(f["norm_filepath"]) or group_ids or [])
+        return not remote_groups or not file_groups or bool(remote_groups & file_groups)
+
+    skip_candidates = [f for f in files if _already_uploaded(f)]
+    if skip_candidates:
+        console.print()
+        print_info(
+            f"[cyan]{len(skip_candidates)}[/cyan] of {len(files)} file(s) match numbers already published or "
+            f"pending on MangaDot (or recorded from a previous run)."
+        )
+        if getattr(args, "skip_existing", None) is not None:
+            skip_them = bool(args.skip_existing)
+        else:
+            skip_them = ask_confirm(
+                f"Skip these {len(skip_candidates)} already-uploaded file(s)?", default=True
             )
-            if getattr(args, "skip_existing", None) is not None:
-                skip_them = bool(args.skip_existing)
-            else:
-                skip_them = ask_confirm(
-                    f"Skip these {len(skip_candidates)} already-uploaded file(s)?", default=True
-                )
-            if skip_them:
-                skip_names = {f["filename"] for f in skip_candidates}
-                files = [f for f in files if f["filename"] not in skip_names]
-                if not files:
-                    print_success("Nothing left to upload - everything in this batch already exists on MangaDot.")
-                    sys.exit(0)
-                print_info(f"Skipped {len(skip_names)}; [bold]{len(files)}[/bold] file(s) remain to upload.")
+        if skip_them:
+            skip_names = {f["filename"] for f in skip_candidates}
+            files = [f for f in files if f["filename"] not in skip_names]
+            if not files:
+                print_success("Nothing left to upload - everything in this batch already exists on MangaDot.")
+                sys.exit(0)
+            print_info(f"Skipped {len(skip_names)}; [bold]{len(files)}[/bold] file(s) remain to upload.")
 
     print_files_table(files, upload_type, group_label=selected_group_name)
     _check_missing(files, upload_type)
@@ -6753,6 +7077,18 @@ def main():
     console.rule("[dim]Upload[/dim]", style="green")
     console.print()
 
+    # The files' own overrides (folder language/scanlator credits, edits from the
+    # review menu) are the final word; write them into the per-file maps so a
+    # resumed upload keeps them too.
+    per_file_language_map = {}
+    for f in files:
+        if f.get("language_override"):
+            per_file_language_map[f["norm_filepath"]] = f["language_override"]
+        if f.get("scanlator_override"):
+            per_file_scanlator_map[f["norm_filepath"]] = f["scanlator_override"]
+        else:
+            per_file_scanlator_map.pop(f["norm_filepath"], None)
+
     final_failed, upload_elapsed, current_browser = _run_upload_loop(
         files, req_session, manga_id, group_ids, upload_type,
         language, scanlator_name, thread_count, per_file_group_map, current_browser,
@@ -6761,6 +7097,7 @@ def main():
         skip_verification=args.skip_verification,
         stitch_spreads=stitch_spreads, auto_volume_cover=auto_volume_cover,
         per_file_scanlator_map=per_file_scanlator_map,
+        per_file_language_map=per_file_language_map,
     )
 
     manga_url = f"{BASE_URL}/manga/{manga_id}"
@@ -6774,7 +7111,8 @@ def main():
     # Record confirmed uploads so future runs on this same target can skip them.
     if uploaded_files:
         db_record_uploaded_files(manga_id, upload_type, language, group_ids, scanlator_name,
-                                 uploaded_files, per_file_group_map, per_file_scanlator_map)
+                                 uploaded_files, per_file_group_map, per_file_scanlator_map,
+                                 per_file_language_map)
 
     if uploaded_files:
         avg = uploaded_bytes / upload_elapsed if upload_elapsed > 0 else 0

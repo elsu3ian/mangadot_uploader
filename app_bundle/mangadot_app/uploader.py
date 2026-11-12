@@ -473,10 +473,10 @@ def upload_file_tus(session, file_info, manga_id, group_ids,
                 "group_id":       group_ids[0] if group_ids else 0,
                 "upload_type":    upload_type,
                 "batch_id":       batch_id,
-                "name":           filename,
+                "name":           os.path.basename(filepath),
                 "type":           "application/zip",
                 "filetype":       "application/zip",
-                "filename":       filename,
+                "filename":       os.path.basename(filepath),
             }
             if upload_type == "volume":
                 tus_metadata["volume_number"] = file_info["number"]

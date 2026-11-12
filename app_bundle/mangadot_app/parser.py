@@ -130,11 +130,62 @@ def detect_languages_from_files(files):
     result = {}
     for f in files:
         norm_path = f.get("norm_filepath") or norm_filepath(f["filepath"])
-        lang = guess_language_from_filename(f.get("filename", ""))
+        # The file's own name (not the '<folder>/' display prefix) first, so
+        # 'Asura Scans [EN]/Chapter 5 [fr].cbz' is French.
+        lang = guess_language_from_filename(os.path.basename(f.get("filename", "")))
+        if lang is None:
+            lang = f.get("folder_language")
         if lang is None:
             lang = guess_language_from_path(os.path.dirname(f["filepath"]))
         result[norm_path] = lang
     return result
+
+
+# Key for "the archives directly inside the selected folder, outside any group
+# folder" in untagged_group_folders()/apply_folder_languages().
+LOOSE_FILES_KEY = ""
+
+
+def _has_own_language_tag(f):
+    return guess_language_from_filename(os.path.basename(f.get("filename", ""))) is not None
+
+
+def untagged_group_folders(files):
+    """[(folder_name, file_count)] for group folders among `files` whose
+    folder name carries no language tag, in folder order. When there are
+    group folders, the loose files next to them that have no language tag
+    of their own are listed last under LOOSE_FILES_KEY."""
+    counts = {}
+    loose = 0
+    has_group_folders = False
+    for f in files:
+        if f.get("folder_group"):
+            has_group_folders = True
+            if not f.get("folder_language"):
+                counts[f["folder_group"]] = counts.get(f["folder_group"], 0) + 1
+        elif not f.get("folder_language") and not _has_own_language_tag(f):
+            loose += 1
+    result = sorted(counts.items(), key=lambda t: natural_sort_key(t[0]))
+    if has_group_folders and loose:
+        result.append((LOOSE_FILES_KEY, loose))
+    return result
+
+
+def apply_folder_languages(files, folder_languages):
+    """Applies {folder_name: lang} chosen for untagged group folders: each
+    file in such a folder gets 'folder_language' unless its own filename
+    has a language tag (that tag wins). Returns {norm_filepath: lang} for
+    the files the choice applied to."""
+    applied = {}
+    for f in files:
+        lang = folder_languages.get(f.get("folder_group") or LOOSE_FILES_KEY)
+        if not lang or f.get("folder_language"):
+            continue  # folder_language: a tagged group folder or a language folder
+        if _has_own_language_tag(f):
+            continue
+        f["folder_language"] = lang
+        applied[f.get("norm_filepath") or norm_filepath(f["filepath"])] = lang
+    return applied
 
 
 def is_languages_mixed(per_file_language_map, dropdown_default=None):
@@ -776,8 +827,147 @@ def apply_episode_drift_correction(parsed, mode):
             item["candidates"] = updated_candidates
 
 
+# Folder names never treated as group folders: the optimizer's own output.
+GROUP_FOLDER_IGNORE = {"optimized"}
+
+
+def find_group_subfolders(directory):
+    """Immediate subfolders of `directory` that directly contain .cbz/.zip
+    archives, e.g. 'Solo Leveling/Asura Scans/ch001.cbz'. Each such folder's
+    name is treated as the group that released the archives inside it -
+    unless the name is a language ('EN', 'French'), in which case it's a
+    language folder (see is_language_folder).
+
+    Returns [(folder_name, folder_path, archive_count)], natural-sorted.
+    Hidden folders and the optimizer's 'optimized' output are skipped."""
+    found = []
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return []
+    for e in entries:
+        try:
+            if not e.is_dir() or e.name.startswith(".") or e.name.lower() in GROUP_FOLDER_IGNORE:
+                continue
+            count = sum(1 for c in os.scandir(e.path)
+                        if c.is_file() and c.name.lower().endswith(VALID_ARCHIVE_EXTENSIONS))
+        except OSError:
+            continue
+        if count:
+            found.append((e.name, e.path, count))
+    found.sort(key=lambda t: natural_sort_key(t[0]))
+    return found
+
+
+_FOLDER_TAG_RE = re.compile(r"[\[(]\s*([^\])]+?)\s*[\])]")
+_FOLDER_LANG_SUFFIX_RE = re.compile(r"^(.*\S)\s+[-|]\s+([A-Za-z][A-Za-z-]*)$")
+
+
+def split_group_folder_name(folder_name):
+    """Splits a subfolder name into (group_name, language_code):
+      'Asura Scans [EN]'      -> ('Asura Scans', 'en')
+      'Asura Scans (French)'  -> ('Asura Scans', 'fr')
+      'Asura Scans - es'      -> ('Asura Scans', 'es')
+      'EN' / 'Spanish'        -> (None, 'en') / (None, 'es')   a pure language folder
+      'Official [HQ]'         -> ('Official [HQ]', None)        no language tag
+    Only a bracket/paren tag (or a ' - xx' suffix) that is a known language
+    is taken out; any other tag stays part of the group name."""
+    lookup = _language_lookup()
+    name = (folder_name or "").strip()
+    if not name:
+        return None, None
+    if name.lower() in lookup:
+        return None, lookup[name.lower()]
+    lang = None
+
+    def _take(m):
+        nonlocal lang
+        code = lookup.get(m.group(1).strip().lower())
+        if code and lang is None:
+            lang = code
+            return " "
+        return m.group(0)
+
+    rest = _FOLDER_TAG_RE.sub(_take, name)
+    if lang is None:
+        m = _FOLDER_LANG_SUFFIX_RE.match(name)
+        if m and m.group(2).strip().lower() in lookup:
+            rest, lang = m.group(1), lookup[m.group(2).strip().lower()]
+    if lang is None:
+        return name, None
+    rest = re.sub(r"\s+", " ", rest).strip(" -_|.,")
+    return (rest or None), lang
+
+
+def is_language_folder(folder_name):
+    """'EN', 'fr', 'Spanish'... - a subfolder named only after a language
+    holds that language's files rather than one group's."""
+    return split_group_folder_name(folder_name)[0] is None
+
+
+def group_folder_names(directory):
+    """Names of the subfolders that count as group folders (not language folders)."""
+    return [name for name, _, _ in find_group_subfolders(directory) if not is_language_folder(name)]
+
+
+def list_upload_archives(directory):
+    """Every archive an upload of `directory` covers: the ones directly inside
+    it plus the ones in its group/language subfolders (normalized paths)."""
+    paths = []
+    folders = [directory] + [p for _, p, _ in find_group_subfolders(directory)]
+    for folder in folders:
+        try:
+            for e in os.scandir(folder):
+                if e.is_file() and e.name.lower().endswith(VALID_ARCHIVE_EXTENSIONS):
+                    paths.append(norm_filepath(e.path))
+        except OSError:
+            continue
+    return paths
+
+
+def _scan_one_folder(folder, upload_type, chapter_naming, custom_regex, strip_groups, custom_renames,
+                     parsed, errors, display_prefix="", folder_group=None, folder_group_name=None,
+                     folder_language=None):
+    with os.scandir(folder) as it:
+        for entry in it:
+            if not entry.is_file() or not entry.name.lower().endswith(VALID_ARCHIVE_EXTENSIONS):
+                continue
+
+            # Parse the bare filename; the display/key name carries the folder so
+            # 'Asura Scans/ch001.cbz' and 'Official/ch001.cbz' never collide.
+            filename = display_prefix + entry.name
+
+            num, candidates, file_groups, shape_key, num_source, episode_label_num = parse_filename_details(
+                entry.name, upload_type, chapter_naming, custom_regex, strip_groups, custom_renames
+            )
+
+            if num is None:
+                errors.append(f"Could not detect {upload_type} number from '{filename}'. Skipping.")
+                continue
+
+            item = {
+                "entry": entry, "filepath": entry.path, "filename": filename,
+                "number": num, "candidates": candidates, "groups": file_groups,
+                "shape_key": shape_key, "num_source": num_source,
+                "episode_label_num": episode_label_num,
+            }
+            if folder_group:
+                # The folder is the attribution; bracket tags inside it don't apply.
+                # folder_group is the folder's own name (unique per folder, so
+                # 'Asura Scans [EN]' and 'Asura Scans [FR]' stay apart); the
+                # displayed group drops the language tag.
+                item["folder_group"] = folder_group
+                item["groups"] = [folder_group_name or folder_group]
+            if folder_language:
+                item["folder_language"] = folder_language
+            parsed.append(item)
+
+
 def scan_directory_files(directory, upload_type, chapter_naming="extract",
                           custom_regex=None, strip_groups=False, custom_renames=None):
+    """Scans the archives directly inside `directory`, plus those inside its
+    group subfolders (see find_group_subfolders). Files from a subfolder get
+    filename '<folder>/<name>' and, for a group folder, 'folder_group'."""
     parsed = []
     errors = []
 
@@ -785,30 +975,20 @@ def scan_directory_files(directory, upload_type, chapter_naming="extract",
         return [], [f"Invalid or missing directory: {directory}"]
 
     try:
-        with os.scandir(directory) as it:
-            for entry in it:
-                if not entry.is_file() or not entry.name.lower().endswith(VALID_ARCHIVE_EXTENSIONS):
-                    continue
-
-                filepath = entry.path
-                filename = entry.name
-
-                num, candidates, file_groups, shape_key, num_source, episode_label_num = parse_filename_details(
-                    filename, upload_type, chapter_naming, custom_regex, strip_groups, custom_renames
-                )
-
-                if num is None:
-                    errors.append(f"Could not detect {upload_type} number from '{filename}'. Skipping.")
-                    continue
-
-                parsed.append({
-                    "entry": entry, "filepath": filepath, "filename": filename,
-                    "number": num, "candidates": candidates, "groups": file_groups,
-                    "shape_key": shape_key, "num_source": num_source,
-                    "episode_label_num": episode_label_num,
-                })
+        _scan_one_folder(directory, upload_type, chapter_naming, custom_regex, strip_groups,
+                         custom_renames, parsed, errors)
     except OSError as e:
         return [], [f"Error scanning directory {directory}: {e}"]
+
+    for folder_name, folder_path, _ in find_group_subfolders(directory):
+        group_name, folder_lang = split_group_folder_name(folder_name)
+        try:
+            _scan_one_folder(folder_path, upload_type, chapter_naming, custom_regex, strip_groups,
+                             custom_renames, parsed, errors, display_prefix=f"{folder_name}/",
+                             folder_group=folder_name if group_name else None,
+                             folder_group_name=group_name, folder_language=folder_lang)
+        except OSError as e:
+            errors.append(f"Error scanning folder '{folder_name}': {e}")
 
     parsed.sort(key=lambda x: x["number"])
     return parsed, errors
@@ -873,6 +1053,10 @@ def list_archive_targets(directory):
 
 
 def group_search_queries(name):
+    # 'Asura Scans [EN]' (a group folder with a language tag) searches as 'Asura Scans' first.
+    group_part, _lang = split_group_folder_name(name)
+    if group_part and group_part != name:
+        return group_search_queries(group_part) + [name]
     queries = [name]
     if not re.search(r'\s', name):
         camel = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', name)
@@ -903,6 +1087,21 @@ def detect_groups_from_filenames(directory, upload_type="chapter"):
             key = frozenset(n.lower() for n in found)
             prev_count, prev_names = counter.get(key, (0, found))
             counter[key] = (prev_count + 1, prev_names)
+
+    # Group subfolders: every archive inside 'Asura Scans/' is credited to
+    # 'Asura Scans' (bracket tags inside a group folder are not used).
+    for folder_name, folder_path, _ in find_group_subfolders(directory):
+        if is_language_folder(folder_name):
+            continue
+        try:
+            names_in_folder = [f for f in os.listdir(folder_path) if f.lower().endswith(valid_ext)]
+        except OSError:
+            continue
+        for filename in names_in_folder:
+            per_file[norm_filepath(os.path.join(folder_path, filename))] = [folder_name]
+        key = frozenset([folder_name.lower()])
+        prev_count, prev_names = counter.get(key, (0, [folder_name]))
+        counter[key] = (prev_count + len(names_in_folder), prev_names)
 
     if not counter:
         return [], {}
@@ -1005,10 +1204,17 @@ def find_missing_numbers(files):
 
 
 def find_duplicate_numbers(files):
-    by_number = {}
+    """Numbers used by more than one file *for the same group*. Chapter 5 in
+    'Asura Scans/' and chapter 5 in 'Official/' are two groups' releases of
+    the same chapter, not a duplicate."""
+    by_key = {}
     for f in files:
-        by_number.setdefault(f["number"], []).append(f)
-    return {n: flist for n, flist in by_number.items() if len(flist) > 1}
+        by_key.setdefault((f.get("folder_group"), f["number"]), []).append(f)
+    dups = {}
+    for (_, number), flist in by_key.items():
+        if len(flist) > 1:
+            dups.setdefault(number, []).extend(flist)
+    return dups
 
 def filter_detected_groups(per_file_names, approved_tags):
     """Filters the raw filename group map to only include user-approved tags."""

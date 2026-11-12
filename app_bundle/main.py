@@ -11,7 +11,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, QThread, QObject, Signal
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QStackedWidget, QMessageBox, QWidget,
-    QVBoxLayout, QFileDialog, QSpacerItem, QSizePolicy
+    QVBoxLayout, QFileDialog, QSpacerItem, QSizePolicy, QDialog
 )
 
 from mangadot_app.gui import theme
@@ -21,6 +21,7 @@ from mangadot_app.gui.picker_screen import PickerScreen
 from mangadot_app.gui.subset_picker_screen import SubsetPickerScreen
 from mangadot_app.gui.login_screen import LoginScreen
 from mangadot_app.gui.group_config_dialog import GroupConfigScreen
+from mangadot_app.gui.folder_language_dialog import FolderLanguageDialog
 from mangadot_app.gui.title_review_screen import TitleReviewScreen
 from mangadot_app.gui.upload_progress_screen import UploadProgressScreen
 from mangadot_app.gui.settings_dialog import StartupSettingsDialog
@@ -620,7 +621,16 @@ class MainWindow(QMainWindow):
         self._group_config = group_config
         self._group_label = group_config.get("group_name", "-")
 
-        if self.settings.opt_mode == "chained" and not self._is_dry_run:
+        if (self.settings.opt_mode == "chained" and not self._is_dry_run
+                and parser_mod.find_group_subfolders(self._folder)):
+            QMessageBox.information(
+                self, "Optimization skipped",
+                "This folder has group subfolders. The optimizer only processes archives directly "
+                "inside the selected folder, so it was skipped for this upload. You can run the "
+                "standalone optimizer on each group folder first if you want them optimized."
+            )
+            self._scan_and_pick_subset()
+        elif self.settings.opt_mode == "chained" and not self._is_dry_run:
             self.optimizer_screen = OptimizerProgressScreen(self._folder, self.settings)
             if getattr(self.optimizer_screen, "_declined", False):
                 self._show(self.group_config_screen)
@@ -681,12 +691,42 @@ class MainWindow(QMainWindow):
 
         parser_mod.finalize_file_entries(files)
 
+        # --- GROUP FOLDERS: skipped folders and folders credited to a scanlator ---
+        skipped_paths = {parser_mod.norm_filepath(p) for p in (self._group_config.get("skipped_paths") or [])}
+        if skipped_paths:
+            files = [f for f in files if (f.get("norm_filepath") or parser_mod.norm_filepath(f["filepath"])) not in skipped_paths]
+            if not files:
+                QMessageBox.information(self, "Nothing left", "Every folder was skipped, so there is nothing to upload.")
+                self._show(self.group_config_screen)
+                return
+        folder_scanlators = self._group_config.get("per_file_scanlator_map") or {}
+        for f in files:
+            scan = folder_scanlators.get(f.get("norm_filepath") or parser_mod.norm_filepath(f["filepath"]))
+            if scan:
+                f["scanlator"] = scan
+                f["groups"] = []
+
         # --- LANGUAGE DETECTION ---
         # Reset per-run: a previous folder's choice must not leak into this
         # scan if the user went Back and picked a different folder.
         self._per_file_language_map = {}
 
-        detected_lang_map = parser_mod.detect_languages_from_files(files)
+        # Group folders with no language tag in their name ('Asura Scans', not
+        # 'Asura Scans [EN]'): ask the uploader which language each one is.
+        # Those answers are explicit, so they skip the detection popup below.
+        folder_chosen_langs = {}
+        untagged_folders = parser_mod.untagged_group_folders(files)
+        if untagged_folders:
+            dlg = FolderLanguageDialog(untagged_folders, self._lang, self)
+            if dlg.exec() != QDialog.Accepted:
+                self._show(self.group_config_screen)
+                return
+            folder_chosen_langs = parser_mod.apply_folder_languages(files, dlg.languages)
+
+        detected_lang_map = parser_mod.detect_languages_from_files(
+            [f for f in files
+             if (f.get("norm_filepath") or parser_mod.norm_filepath(f["filepath"])) not in folder_chosen_langs]
+        )
         if parser_mod.is_languages_mixed(detected_lang_map, dropdown_default=self._lang):
             tagged = {k: v for k, v in detected_lang_map.items() if v}
             untagged_paths = {k for k, v in detected_lang_map.items() if v is None}
@@ -757,6 +797,9 @@ class MainWindow(QMainWindow):
                 self._per_file_language_map = tagged
             # else use_default_btn: leave _per_file_language_map empty,
             # every file uses self._lang exactly like before this feature.
+        self._per_file_language_map.update(
+            {p: lang for p, lang in folder_chosen_langs.items() if lang and lang != self._lang}
+        )
         # --- END LANGUAGE DETECTION ---
 
         # --- SMART DB SKIPPING LOGIC ---

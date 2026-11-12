@@ -91,6 +91,12 @@ class GroupConfigScreen(QWidget):
         # detected tags aren't real group credits, or they just don't
         # want the hassle of resolving each one).
         self._force_single_group = False
+        # Group subfolders (e.g. 'Solo Leveling/Asura Scans/'): their names are
+        # detected like bracket tags. A folder that doesn't match a real group
+        # can instead be credited to a scanlator name, or left out entirely.
+        self._folder_names = set()
+        self._folder_scanlator = {}   # folder name -> scanlator name
+        self._skipped_folders = set()
 
         self._build_ui()
         self._detect_groups()
@@ -244,6 +250,27 @@ class GroupConfigScreen(QWidget):
         )
         self.detected_list.itemClicked.connect(self._on_detected_name_clicked)
         left_col.addWidget(self.detected_list, 1)
+
+        # Shown only while a group *folder* is the active target.
+        self.folder_actions = QWidget()
+        folder_actions_layout = QHBoxLayout(self.folder_actions)
+        folder_actions_layout.setContentsMargins(0, 2, 0, 0)
+        folder_actions_layout.setSpacing(6)
+        self.folder_scanlator_btn = QPushButton("Credit as scanlator")
+        self.folder_scanlator_btn.setToolTip("Upload this folder's files credited to a scanlator name instead of a group")
+        self.folder_scanlator_btn.clicked.connect(self._on_folder_as_scanlator)
+        self.folder_skip_btn = QPushButton("Skip folder")
+        self.folder_skip_btn.setToolTip("Leave this folder's files out of the upload")
+        self.folder_skip_btn.clicked.connect(self._on_folder_skip)
+        self.folder_reset_btn = QPushButton("Reset")
+        self.folder_reset_btn.setToolTip("Undo the scanlator/skip choice for this folder")
+        self.folder_reset_btn.clicked.connect(self._on_folder_reset)
+        for b in (self.folder_scanlator_btn, self.folder_skip_btn, self.folder_reset_btn):
+            b.setCursor(Qt.PointingHandCursor)
+            folder_actions_layout.addWidget(b)
+        folder_actions_layout.addStretch(1)
+        self.folder_actions.setVisible(False)
+        left_col.addWidget(self.folder_actions)
         left_col.addStretch(0)
 
         self.search_target_label = QLabel("")
@@ -369,7 +396,11 @@ class GroupConfigScreen(QWidget):
     def _detect_groups(self):
         names, per_file = parser_mod.detect_groups_from_filenames(self.directory, self.upload_type)
         self._per_file_names = per_file
-        self._detected_names = list(names)
+        folder_names = parser_mod.group_folder_names(self.directory) if self.upload_type != "folder" else []
+        self._folder_names = set(folder_names)
+        # Folders first (in folder order), then bracket tags.
+        self._detected_names = folder_names + sorted(n for n in names if n not in self._folder_names)
+        names = list(self._detected_names)
 
         if self.upload_type == "folder":
             try:
@@ -381,14 +412,8 @@ class GroupConfigScreen(QWidget):
             except OSError:
                 all_files = []
         else:
-            try:
-                all_files = [
-                    parser_mod.norm_filepath(os.path.join(self.directory, f))
-                    for f in os.listdir(self.directory)
-                    if f.lower().endswith(parser_mod.VALID_ARCHIVE_EXTENSIONS)
-                ]
-            except OSError:
-                all_files = []
+            # Includes archives inside group/language subfolders.
+            all_files = parser_mod.list_upload_archives(self.directory)
 
         norm_tagged = {parser_mod.norm_filepath(p) for p in per_file.keys()}
         self._untagged_files = [f for f in all_files if parser_mod.norm_filepath(f) not in norm_tagged]
@@ -398,6 +423,34 @@ class GroupConfigScreen(QWidget):
                 "No group tags detected in filenames. Search for your group below, "
                 "or switch to individual scanlator mode."
             )
+            return
+
+        if self._folder_names:
+            untagged_count = len(self._untagged_files)
+            loose = f" (+ {untagged_count} file(s) outside them)" if untagged_count else ""
+            self.detection_label.setText(
+                f"Detected {len(self._folder_names)} group folder(s): {', '.join(folder_names)}{loose}. "
+                f"Click a folder to fix its match, credit it to a scanlator, or skip it."
+            )
+            self.force_single_group_box.setVisible(True)
+            for name in names:
+                item = QListWidgetItem()
+                item.setData(Qt.UserRole, name)
+                self.detected_list.addItem(item)
+                self._refresh_detected_list_item(name)
+            if self._untagged_files:
+                item = QListWidgetItem()
+                item.setData(Qt.UserRole, _UNTAGGED_TARGET)
+                self.detected_list.addItem(item)
+                self._refresh_detected_list_item(_UNTAGGED_TARGET)
+            self._update_search_target_label()
+            self._pending_resolutions = len(names)
+            workers.prune_finished(self._threads, self._workers)
+            for name in names:
+                worker = _GroupSearchWorker(self.session, name)
+                thread, worker = workers.run_worker(worker, on_finished=self._on_group_resolved)
+                self._threads.append(thread)
+                self._workers.append(worker)
             return
 
         is_mixed = parser_mod.is_groups_mixed(per_file) or bool(self._untagged_files)
@@ -482,6 +535,18 @@ class GroupConfigScreen(QWidget):
             item.setForeground(QColor(Color.TEXT_PRIMARY))
             return
 
+        folder_prefix = "\U0001F4C1 " if name in self._folder_names else ""
+        if name in self._skipped_folders and not self._force_single_group:
+            item.setText(f"\u2014 {folder_prefix}{name}  (skipped \u2014 not uploaded)"
+                         + ("   \u2190 editing this" if name == self._active_target_name else ""))
+            item.setForeground(QColor(Color.TEXT_MUTED))
+            return
+        if name in self._folder_scanlator and not self._force_single_group:
+            item.setText(f"\u2713 {folder_prefix}{name}  \u2192  scanlator '{self._folder_scanlator[name]}'"
+                         + ("   \u2190 editing this" if name == self._active_target_name else ""))
+            item.setForeground(QColor(Color.TEXT_PRIMARY))
+            return
+
         if self._force_single_group:
             # Background resolution keeps running even while the override
             # is active (there's no cheap way to cancel an in-flight
@@ -496,9 +561,11 @@ class GroupConfigScreen(QWidget):
         if name in self._name_to_groups and self._name_to_groups[name]:
             groups = self._name_to_groups[name]
             names_str = " + ".join(g.get("name") or f"ID {g.get('id')}" for g in groups)
-            status = f"✓ {name}  →  {names_str}"
+            status = f"✓ {folder_prefix}{name}  →  {names_str}"
         elif self._pending_resolutions > 0 and (name not in self._name_to_groups or not self._name_to_groups[name]):
-            status = f"⏳ {name}  (searching…)"
+            status = f"⏳ {folder_prefix}{name}  (searching…)"
+        elif folder_prefix:
+            status = f"⚠ {folder_prefix}{name}  (no matching group — click to search, credit as scanlator, or skip)"
         else:
             status = f"⚠ {name}  (unresolved — click to search a match)"
         if name == self._active_target_name:
@@ -564,7 +631,67 @@ class GroupConfigScreen(QWidget):
 
         self._refresh_assigned_pills()
 
+    def _update_folder_actions(self):
+        name = self._active_target_name
+        is_folder = bool(name) and name in self._folder_names and not self._force_single_group
+        self.folder_actions.setVisible(is_folder)
+        if is_folder:
+            customized = name in self._folder_scanlator or name in self._skipped_folders
+            self.folder_reset_btn.setVisible(customized)
+
+    def _on_folder_as_scanlator(self):
+        from PySide6.QtWidgets import QInputDialog
+        name = self._active_target_name
+        if not name or name not in self._folder_names:
+            return
+        text, ok = QInputDialog.getText(
+            self, "Credit folder to a scanlator",
+            f"Scanlator name for the files in '{name}':",
+            text=self._folder_scanlator.get(name) or parser_mod.split_group_folder_name(name)[0] or name,
+        )
+        text = (text or "").strip()
+        if not ok or not text:
+            return
+        self._folder_scanlator[name] = text
+        self._skipped_folders.discard(name)
+        self._name_to_groups.pop(name, None)
+        self._name_to_group.pop(name, None)
+        self._refresh_detected_list_item(name)
+        self._finalize_auto_detection()
+        self._update_folder_actions()
+        self._refresh_assigned_pills()
+
+    def _on_folder_skip(self):
+        name = self._active_target_name
+        if not name or name not in self._folder_names:
+            return
+        self._skipped_folders.add(name)
+        self._folder_scanlator.pop(name, None)
+        self._name_to_groups.pop(name, None)
+        self._name_to_group.pop(name, None)
+        self._refresh_detected_list_item(name)
+        self._finalize_auto_detection()
+        self._update_folder_actions()
+        self._refresh_assigned_pills()
+
+    def _on_folder_reset(self):
+        name = self._active_target_name
+        if not name:
+            return
+        self._skipped_folders.discard(name)
+        self._folder_scanlator.pop(name, None)
+        self._refresh_detected_list_item(name)
+        self._update_folder_actions()
+
+    def _folder_paths(self, folder_name):
+        # Only files physically inside the folder - a loose top-level file
+        # tagged '[Official]' is not part of the 'Official/' folder.
+        folder_dir = parser_mod.norm_filepath(os.path.join(self.directory, folder_name))
+        return [p for p, names in self._per_file_names.items()
+                if names == [folder_name] and os.path.dirname(p) == folder_dir]
+
     def _update_search_target_label(self):
+        self._update_folder_actions()
         if self._active_target_name == _UNTAGGED_TARGET:
             count = len(self._untagged_files)
             self.search_target_label.setText(
@@ -845,6 +972,8 @@ class GroupConfigScreen(QWidget):
         """
         name = target_name if target_name is not None else self._active_target_name
         if name:
+            self._skipped_folders.discard(name)
+            self._folder_scanlator.pop(name, None)
             if name not in self._name_to_groups:
                 self._name_to_groups[name] = []
             gid = group.get("id")
@@ -897,11 +1026,12 @@ class GroupConfigScreen(QWidget):
         if not self._per_file_names:
             return [], []
 
+        handled = self._skipped_folders | set(self._folder_scanlator)
         unresolved_names = sorted({
             name
             for names in self._per_file_names.values()
             for name in names
-            if name not in self._name_to_groups or not self._name_to_groups[name]
+            if (name not in self._name_to_groups or not self._name_to_groups[name]) and name not in handled
         }, key=str.lower)
 
         if not unresolved_names:
@@ -935,7 +1065,17 @@ class GroupConfigScreen(QWidget):
             and _UNTAGGED_TARGET in self._name_to_groups
             and self._name_to_groups[_UNTAGGED_TARGET]
         )
-        if not self._resolved_group_ids and not any(self._per_file_group_map_result.values()) and not has_untagged_assigned:
+        folder_scanlator_map = {}
+        skipped_paths = []
+        if not self._force_single_group:
+            for folder, scan_name in self._folder_scanlator.items():
+                for p in self._folder_paths(folder):
+                    folder_scanlator_map[p] = scan_name
+            for folder in self._skipped_folders:
+                skipped_paths.extend(self._folder_paths(folder))
+
+        if (not self._resolved_group_ids and not any(self._per_file_group_map_result.values())
+                and not has_untagged_assigned and not folder_scanlator_map and not skipped_paths):
             QMessageBox.warning(
                 self, "No group selected",
                 "Please search for and select a group (or enter its ID) before continuing."
@@ -1019,6 +1159,9 @@ class GroupConfigScreen(QWidget):
         per_file_names = parser_mod.resolve_per_file_group_names(
             self._per_file_names, self._name_to_groups
         )
+        for p in list(folder_scanlator_map) + skipped_paths:
+            per_file_map.pop(p, None)
+            per_file_names.pop(p, None)
 
         if has_untagged_assigned:
             untagged_groups = self._name_to_groups[_UNTAGGED_TARGET]
@@ -1041,6 +1184,8 @@ class GroupConfigScreen(QWidget):
             "scanlator_name": None,
             "per_file_group_map": per_file_map,
             "per_file_group_names": per_file_names,
+            "per_file_scanlator_map": folder_scanlator_map,
+            "skipped_paths": skipped_paths,
             "strip_bracket_groups": self._strip_bracket_groups,
             "group_name": self._resolved_group_name, 
         })
